@@ -1,0 +1,56 @@
+# .dockerignore — 排除不必要和敏感的文件进入 Docker build context
+#
+# 引入动机：design/05-OPERATIONS.md 要求安全的容器构建。
+# 防止 .env、Git 元数据、IDE 输出、测试输出、密钥等进入镜像层。
+
+# 版本控制
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# 环境变量和密钥（绝不可进入镜像）
+.env
+.env.*
+!.env.example
+
+# NarraFork 内部文件
+.narrafork
+
+# 设计文档（不需要进入镜像）
+design
+
+# MCP 客户端（独立构建，不参与 server/web 镜像）
+mcp
+
+# Web 依赖和构建缓存
+web/node_modules
+web/.nuxt
+web/.output
+web/dist
+web/.yarn/cache
+web/.yarn/install-state.gz
+
+# Go 测试输出和覆盖率
+server/**/*.out
+server/coverage.*
+server/**/*.test
+
+# Go 构建产物（本地编译的二进制，不应进入镜像）
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+server/server
+server/server.exe
+mcp/knowledge-mcp
+mcp/knowledge-mcp.exe
+
+# 临时文件
+*.tmp
+*.log

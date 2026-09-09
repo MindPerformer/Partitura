@@ -1,0 +1,170 @@
+# docker-compose.yml — Partitura 单机 Docker Compose
+#
+# 默认从 MindPerformer GHCR 拉取 server/web 镜像；发布镜像由 GitHub Actions 构建。
+# 可通过 SERVER_IMAGE、WEB_IMAGE 和 IMAGE_TAG 覆盖镜像来源与版本。
+#
+# 引入动机：design/05-OPERATIONS.md §Docker Compose 要求：
+#   - 默认服务：server、web、postgres、elasticsearch
+#   - 不部署本地 Embedding/Reranker 模型
+#   - PG/ES 不暴露宿主端口
+#   - web 仅对外，server 仅内部
+#   - named volumes、isolated network、healthcheck、depends_on、restart
+#
+# 安全原则：
+#   - 不包含真实 secret 或弱默认生产密码
+#   - 所有凭据从 .env 文件读取
+#   - PG/ES 端口不映射到宿主机
+
+services:
+  # === PostgreSQL — 业务真相源 ===
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    # 不映射端口 — 仅内部网络可达
+
+  # === Elasticsearch — 可重建搜索索引 ===
+  elasticsearch:
+    # 固定安全可用的 8.x 版本
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      # 单节点模式（Compose V1 单机）
+      discovery.type: single-node
+      # 禁用安全认证（内部网络，不暴露端口）
+      xpack.security.enabled: "false"
+      # 资源参数
+      ES_JAVA_OPTS: "-Xms512m -Xmx512m"
+      # 禁用机器学习功能以减少资源占用
+      xpack.ml.enabled: "false"
+    volumes:
+      - esdata:/usr/share/elasticsearch/data
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    # 不映射端口 — 仅内部网络可达
+
+  # === Go 后端 Server ===
+  server:
+    image: ${SERVER_IMAGE:-ghcr.io/mindperformer/partitura-server}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    stop_grace_period: 50s
+    depends_on:
+      postgres:
+        condition: service_healthy
+      elasticsearch:
+        condition: service_healthy
+    environment:
+      # 数据库
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SSLMODE: ${DB_SSLMODE}
+      # ES
+      ES_URL: http://elasticsearch:9200
+      # HTTP
+      HTTP_ADDR: ":8080"
+      LOG_LEVEL: ${LOG_LEVEL}
+      SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT}
+      # 公开服务可信 origin，用于 device authorization verification_url
+      PUBLIC_ORIGIN: ${PUBLIC_ORIGIN}
+      # 认证
+      COOKIE_SECURE: ${COOKIE_SECURE}
+      COOKIE_DOMAIN: ${COOKIE_DOMAIN}
+      COOKIE_PATH: ${COOKIE_PATH}
+      COOKIE_NAME: ${COOKIE_NAME}
+      CSRF_COOKIE_NAME: ${CSRF_COOKIE_NAME}
+      CSRF_HEADER_NAME: ${CSRF_HEADER_NAME}
+      SESSION_DURATION: ${SESSION_DURATION}
+      DEVICE_ACCESS_TOKEN_DURATION: ${DEVICE_ACCESS_TOKEN_DURATION}
+      DEVICE_REFRESH_TOKEN_DURATION: ${DEVICE_REFRESH_TOKEN_DURATION}
+      ARGON2_MEMORY: ${ARGON2_MEMORY}
+      ARGON2_ITERATIONS: ${ARGON2_ITERATIONS}
+      ARGON2_PARALLELISM: ${ARGON2_PARALLELISM}
+      ARGON2_SALT_LENGTH: ${ARGON2_SALT_LENGTH}
+      ARGON2_KEY_LENGTH: ${ARGON2_KEY_LENGTH}
+      # 根加密密钥——由部署方通过环境变量注入 base64 编码的 32 字节密钥。
+      # 引入动机：Provider API Key 使用 AES-256-GCM 加密后存储于 PostgreSQL，
+      # 此密钥为基础设施密钥，不进入 Web 管理接口、审计详情或日志。
+      # 可为空——表示尚未配置，此时若数据库有 Provider 密文则 fail-fast 拒绝启动。
+      MASTER_ENCRYPTION_KEY: ${MASTER_ENCRYPTION_KEY}
+      # Job Worker
+      JOB_WORKER_ENABLED: ${JOB_WORKER_ENABLED}
+      JOB_WORKER_POLL_INTERVAL: ${JOB_WORKER_POLL_INTERVAL}
+      # Scheduler
+      SCHEDULER_ENABLED: ${SCHEDULER_ENABLED}
+      SCHEDULER_TICK_INTERVAL: ${SCHEDULER_TICK_INTERVAL}
+      # 迁移文件目录
+      MIGRATIONS_DIR: /app/migrations
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz | grep -q '\"status\"' || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    # 不映射端口 — 仅内部网络可达，由 web 反代
+
+  # === Nuxt 前端 Web（Nginx runtime）===
+  web:
+    image: ${WEB_IMAGE:-ghcr.io/mindperformer/partitura-web}:${IMAGE_TAG:-latest}
+    restart: unless-stopped
+    stop_grace_period: 15s
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      # Nginx 反向代理 upstream：将 /api 请求转发到内部 server
+      # 通过 entrypoint.sh 的 envsubst 在运行时注入 nginx.conf，
+      # 而非在构建阶段烘焙内部地址。
+      # SERVER_UPSTREAM 格式为 host:port，与 nginx upstream server 指令匹配。
+      SERVER_UPSTREAM: "server:8080"
+    networks:
+      - internal
+      - external
+    ports:
+      # 仅 web 对外暴露，端口可配置以支持隔离测试
+      - "${WEB_PORT:-80}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+      start_period: 10s
+
+networks:
+  # 内部网络 — server/pg/es 通信
+  internal:
+    driver: bridge
+  # 外部网络 — web 对外暴露
+  external:
+    driver: bridge
+
+volumes:
+  pgdata:
+    name: ${POSTGRES_DATA_VOLUME:-partitura_pgdata}
+  esdata:
+    name: ${ES_DATA_VOLUME:-partitura_esdata}

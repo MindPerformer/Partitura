@@ -1,0 +1,118 @@
+# web/nginx.conf.template — Nginx 配置模板
+#
+# 引入动机：生产 Web 改为 Nuxt CSR 静态构建 + Nginx runtime。
+# Nginx 提供静态文件服务、SPA fallback 和 /api 反向代理。
+#
+# 运行时通过 entrypoint.sh 的 envsubst 注入 SERVER_UPSTREAM 环境变量，
+# 使同一镜像可在不同部署环境中使用不同的内部 server 地址，
+# 不在 Nuxt 构建阶段烘焙内部地址。
+#
+# 安全原则：
+# - 非 root 运行
+# - pid/temp 路径在非 root 用户可写目录
+# - 不暴露内部 hostname 给浏览器
+# - /api 反向代理精确保留原始 URI 和 query string
+
+# 运行时 envsubst 替换的变量：${SERVER_UPSTREAM}
+# 默认值在 entrypoint.sh 中设置
+
+worker_processes auto;
+pid /tmp/nginx.pid;
+
+events {
+    worker_connections 1024;
+}
+
+http {
+    # 日志输出到 stdout/stderr，供 docker logs 查看
+    access_log /dev/stdout;
+    error_log /dev/stderr warn;
+
+    # MIME 类型
+    include /etc/nginx/mime.types;
+    default_type application/octet-stream;
+
+    # 传输优化
+    sendfile on;
+    keepalive_timeout 65;
+
+    # 临时路径（非 root 用户可写）
+    client_body_temp_path /tmp/client_body;
+    proxy_temp_path /tmp/proxy;
+    fastcgi_temp_path /tmp/fastcgi;
+    uwsgi_temp_path /tmp/uwsgi;
+    scgi_temp_path /tmp/scgi;
+
+    # 上游 Go 后端 — 运行时从环境变量注入
+    upstream backend {
+        server ${SERVER_UPSTREAM};
+    }
+
+    server {
+        listen 8080;
+        server_name _;
+
+        # 静态文件根目录 — Nuxt generate 产物
+        root /app/dist;
+        index index.html;
+
+        # SPA fallback：所有非文件请求回退到 index.html
+        # 引入动机：CSR 模式下路由由前端处理，Nginx 需要将未知路径回退到 index.html
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+
+        # API 反向代理
+        # 引入动机：design/05-OPERATIONS.md 要求 web 代理 /api 到内部 server。
+        # 关键修复：精确保留原始 URI 和 query string，不做任何改写。
+        #
+        # 错误根因：旧 Nitro 代理 handler 使用 getQuery(event) 重新构建 query string，
+        # 当 event.path 已包含 query 时导致 query 被拼接到 path 参数中，
+        # 后端收到 offset="0?limit=20" 而非 offset="0"。
+        #
+        # Nginx proxy_pass 行为：
+        # - 当 proxy_pass URL 不含 URI 部分（只有 host:port）时，
+        #   Nginx 将完整的原始 URI（含 query string）原样转发。
+        # - 不使用 $request_uri 或 $args 拼接，避免双重编码或丢失参数。
+        location /api/ {
+            proxy_pass http://backend;
+
+            # 保留原始 Host 不需要——使用后端地址作为 Host
+            # 设置必要的代理头
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+
+            # 透传 Cookie
+            proxy_pass_request_headers on;
+
+            # 透传 method 和 body — Nginx 默认行为，无需额外配置
+            # 透传 Content-Type — Nginx 默认透传所有请求头
+
+            # 透传响应状态码和 headers
+            proxy_pass_header Set-Cookie;
+            proxy_pass_header Content-Type;
+            proxy_pass_header WWW-Authenticate;
+
+            # 超时设置
+            # 修复说明：AI/embedding/rerank 等服务端调用真实第三方 Provider 耗时可超过 60s，
+            # 60s read 超时会把仍正常的慢请求误判为 504。统一放宽到 10 分钟（与后端
+            # embedding/reranker 客户端 5~10 分钟超时匹配），避免长任务被网关中断。
+            proxy_connect_timeout 10s;
+            proxy_send_timeout 600s;
+            proxy_read_timeout 600s;
+            # 请求体上限：embedding/rerank 批量文本可能较大，默认 1m 过小
+            client_max_body_size 16m;
+        }
+
+        # 健康检查端点 — 供 Docker healthcheck 使用
+        # 引入动机：compose.yaml 中 web 容器需要 healthcheck，
+        # Nginx 自身提供简单的 200 响应即可。
+        location = /healthz {
+            access_log off;
+            add_header Content-Type text/plain;
+            return 200 "ok";
+        }
+    }
+}

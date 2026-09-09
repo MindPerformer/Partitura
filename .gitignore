@@ -1,0 +1,67 @@
+# .gitignore — Partitura 项目根级忽略规则
+#
+# 引入动机：项目无 .gitignore，导致 30k+ 构建产物/依赖进入版本控制。
+# design/05-OPERATIONS.md 要求安全的构建和部署上下文。
+# 本文件排除：环境变量、构建产物、依赖、IDE/OS 生成文件、NarraFork 内部文件。
+
+# --- 环境变量和密钥（绝不可进入版本控制） ---
+.env
+.env.*
+!.env.example
+
+# --- Go 构建产物 ---
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+server/server
+server/server.exe
+mcp/knowledge-mcp
+mcp/knowledge-mcp.exe
+
+# --- Go 覆盖率/测试输出 ---
+coverage.*
+*.coverprofile
+
+# --- Node.js / Nuxt 依赖和构建输出 ---
+node_modules/
+.nuxt/
+.output/
+.yarn/cache/
+.yarn/install-state.gz
+
+# --- Web 子目录构建产物（显式路径，防止遗漏） ---
+web/node_modules/
+web/.nuxt/
+web/.output/
+web/dist/
+web/.yarn/cache/
+web/.yarn/install-state.gz
+
+# --- IDE / 编辑器 ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# --- 操作系统生成文件 ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- NarraFork 内部文件 ---
+.narrafork/
+spec_tasks.json
+
+# --- 临时文件 ---
+*.tmp
+*.log
+
+# --- E2E 本地凭据（绝不可提交；真实密钥放仓库外 ~/.config/partitura/e2e.env） ---
+scripts/e2e/.secrets.env
+.partitura-e2e.env
+e2e.env
