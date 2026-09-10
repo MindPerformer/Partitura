@@ -30,7 +30,7 @@ func NewMockStoreWithError(err error) *MockStore {
 // Save 将 token 保存到内存。
 func (m *MockStore) Save(serverURL string, tokens *Tokens) error {
 	if m.err != nil {
-		return failFastLog("保存凭据", serverURL, m.err)
+		return failFastLog("save credentials", serverURL, m.err)
 	}
 	m.data[serverURL] = tokens
 	return nil
@@ -39,7 +39,7 @@ func (m *MockStore) Save(serverURL string, tokens *Tokens) error {
 // Load 从内存读取 token。
 func (m *MockStore) Load(serverURL string) (*Tokens, error) {
 	if m.err != nil {
-		return nil, failFastLog("读取凭据", serverURL, m.err)
+		return nil, failFastLog("read credentials", serverURL, m.err)
 	}
 	if t, ok := m.data[serverURL]; ok {
 		return t, nil
@@ -50,7 +50,7 @@ func (m *MockStore) Load(serverURL string) (*Tokens, error) {
 // Delete 从内存删除 token。
 func (m *MockStore) Delete(serverURL string) error {
 	if m.err != nil {
-		return failFastLog("删除凭据", serverURL, m.err)
+		return failFastLog("delete credentials", serverURL, m.err)
 	}
 	delete(m.data, serverURL)
 	return nil

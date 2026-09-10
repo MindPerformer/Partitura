@@ -10,6 +10,7 @@
 package tool
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,13 +19,17 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
+	"unicode"
 
 	"partitura/mcp/internal/cache"
 	"partitura/mcp/internal/client"
 	"partitura/mcp/internal/credential"
+	"partitura/mcp/internal/guidance"
 	"partitura/mcp/internal/protocol"
 	"partitura/mcp/internal/workspace"
 )
@@ -165,10 +170,10 @@ func TestProjectToolsRejectWithoutSwitch(t *testing.T) {
 			if !result.IsError {
 				t.Errorf("工具 %s 在未 switch 时应返回错误", toolName)
 			}
-			// 验证错误消息包含"未切换 workspace"
+			// 验证错误消息包含 "no active workspace"
 			if len(result.Content) > 0 {
 				text := result.Content[0].Text
-				if !strings.Contains(text, "未切换 workspace") {
+				if !strings.Contains(text, "no active workspace") {
 					t.Errorf("工具 %s 错误消息应包含'未切换 workspace', 得到: %s", toolName, text)
 				}
 			}
@@ -339,7 +344,7 @@ func TestDocumentPatchZeroMatch(t *testing.T) {
 	if !result.IsError {
 		t.Error("old_text 不存在时应返回错误")
 	}
-	if !strings.Contains(result.Content[0].Text, "未找到") {
+	if !strings.Contains(result.Content[0].Text, "not found") {
 		t.Errorf("错误消息应包含'未找到': %s", result.Content[0].Text)
 	}
 	if patchCalled {
@@ -380,7 +385,7 @@ func TestDocumentPatchMultipleMatch(t *testing.T) {
 	if !result.IsError {
 		t.Error("old_text 多次匹配时应返回错误")
 	}
-	if !strings.Contains(result.Content[0].Text, "3 次") {
+	if !strings.Contains(result.Content[0].Text, "matches 3 times") {
 		t.Errorf("错误消息应包含匹配次数: %s", result.Content[0].Text)
 	}
 	if patchCalled {
@@ -622,7 +627,7 @@ func TestBootstrapContextLimit(t *testing.T) {
 
 	// 验证结果包含截断标记
 	text := result.Content[0].Text
-	if !strings.Contains(text, "已截断") {
+	if !strings.Contains(text, "truncated") {
 		t.Errorf("bootstrap 结果应包含截断标记: %s", text[:min(200, len(text))])
 	}
 }
@@ -750,11 +755,434 @@ func TestUploadDocumentFileRejectsExistingDestination(t *testing.T) {
 	if err != nil {
 		t.Fatalf("意外错误: %v", err)
 	}
-	if !result.IsError || !strings.Contains(result.Content[0].Text, "never overwrites") {
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "set overwrite to true") {
 		t.Fatalf("已存在目标错误结果 = %#v", result)
 	}
 	if len(fs.requests) != 1 || fs.requests[0].Method != http.MethodPost {
 		t.Fatalf("目标冲突应只调用创建接口: %#v", fs.requests)
+	}
+}
+
+// TestUploadDocumentFileOverwriteReplacesExistingDocument 验证 overwrite=true 时
+// 先读取目标文档的 revision/hash，再用 PUT 覆盖，且不调用创建接口。
+func TestUploadDocumentFileOverwriteReplacesExistingDocument(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+
+	var replaceBody map[string]interface{}
+	fs.mux.HandleFunc("GET /api/workspaces/ws-1/documents/read", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"title":"Existing title","type":"guide","content_hash":"old-hash","revision_number":4}`))
+	}))
+	fs.mux.HandleFunc("PUT /api/workspaces/ws-1/documents", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&replaceBody); err != nil {
+			t.Fatalf("解析覆盖请求失败: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"path":"notes/existing.md","revision_number":5}`))
+	}))
+
+	localPath := filepath.Join(t.TempDir(), "overwrite.md")
+	content := "# Replaced\n"
+	if err := os.WriteFile(localPath, []byte(content), 0644); err != nil {
+		t.Fatalf("写入测试文件失败: %v", err)
+	}
+
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	args, err := json.Marshal(map[string]interface{}{
+		"path":      "notes/existing.md",
+		"file_path": localPath,
+		"overwrite": true,
+	})
+	if err != nil {
+		t.Fatalf("序列化参数失败: %v", err)
+	}
+
+	result, err := callToolByName(r, "upload_document_file", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("覆盖上传失败: %s", result.Content[0].Text)
+	}
+	if replaceBody["title"] != "Existing title" || replaceBody["type"] != "guide" {
+		t.Fatalf("未保留已有文档元数据: %#v", replaceBody)
+	}
+	if replaceBody["content_markdown"] != content {
+		t.Fatalf("覆盖正文 = %#v, 期望 %#v", replaceBody["content_markdown"], content)
+	}
+	if replaceBody["expected_revision"] != float64(4) || replaceBody["expected_hash"] != "old-hash" {
+		t.Fatalf("覆盖请求缺少乐观并发控制参数: %#v", replaceBody)
+	}
+	if len(fs.requests) != 2 || fs.requests[0].Method != http.MethodGet || fs.requests[1].Method != http.MethodPut {
+		t.Fatalf("overwrite 应为 GET + PUT 两个请求: %#v", fs.requests)
+	}
+}
+
+// TestUploadDocumentFileOverwriteRequiresExistingDocument 验证 overwrite=true 时
+// 目标文档不存在会失败，且不会退化为创建。
+func TestUploadDocumentFileOverwriteRequiresExistingDocument(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	fs.mux.HandleFunc("GET /api/workspaces/ws-1/documents/read", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"文档不存在"}`))
+	}))
+
+	localPath := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(localPath, []byte("# Content\n"), 0644); err != nil {
+		t.Fatalf("写入测试文件失败: %v", err)
+	}
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	args, _ := json.Marshal(map[string]interface{}{
+		"path":      "notes/missing.md",
+		"file_path": localPath,
+		"overwrite": true,
+	})
+	result, err := callToolByName(r, "upload_document_file", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "requires an existing destination document") {
+		t.Fatalf("overwrite 缺失目标错误结果 = %#v", result)
+	}
+	for _, request := range fs.requests {
+		if request.Method == http.MethodPost || request.Method == http.MethodPut {
+			t.Fatalf("overwrite 目标缺失时不应写文档: %#v", fs.requests)
+		}
+	}
+}
+
+// TestUploadDocumentFileRejectsRelativePath 验证 file_path 必须是绝对路径，
+// 避免 MCP 进程工作目录与用户预期不一致导致读错文件。
+func TestUploadDocumentFileRejectsRelativePath(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+
+	args, _ := json.Marshal(map[string]string{"path": "notes/existing.md", "file_path": filepath.Join("relative", "dir", "file.md")})
+	result, err := callToolByName(r, "upload_document_file", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "must be an absolute path") {
+		t.Fatalf("相对路径错误结果 = %#v", result)
+	}
+	if len(fs.requests) != 0 {
+		t.Fatalf("相对路径应在本地拒绝，不发请求: %#v", fs.requests)
+	}
+}
+
+// --- document_archive delete 选项 ---
+
+// TestDocumentArchiveDeleteUsesPurge 验证 delete=true 走永久删除接口。
+func TestDocumentArchiveDeleteUsesPurge(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	fs.mux.HandleFunc("POST /api/workspaces/ws-1/documents/purge", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("path") != "notes/doomed.md" {
+			t.Errorf("purge path = %q", r.URL.Query().Get("path"))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	}))
+
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	args, _ := json.Marshal(map[string]interface{}{"path": "notes/doomed.md", "delete": true})
+	result, err := callToolByName(r, "document_archive", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("永久删除失败: %s", result.Content[0].Text)
+	}
+	if len(fs.requests) != 1 || fs.requests[0].Method != http.MethodPost {
+		t.Fatalf("delete 应只调用一次 POST purge: %#v", fs.requests)
+	}
+}
+
+// TestDocumentArchiveDeleteRequiresOwnerPermission 验证服务端 403 被映射为清晰的权限错误。
+func TestDocumentArchiveDeleteRequiresOwnerPermission(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	fs.mux.HandleFunc("POST /api/workspaces/ws-1/documents/purge", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"永久删除需要 owner 权限"}`))
+	}))
+
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	args, _ := json.Marshal(map[string]interface{}{"path": "notes/doomed.md", "delete": true})
+	result, err := callToolByName(r, "document_archive", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "owner permission") {
+		t.Fatalf("权限错误结果 = %#v", result)
+	}
+}
+
+// TestDocumentArchiveWithoutDeleteRequiresRevisionAndHash 验证默认归档仍需要乐观并发参数。
+func TestDocumentArchiveWithoutDeleteRequiresRevisionAndHash(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+
+	args, _ := json.Marshal(map[string]interface{}{"path": "notes/keep.md"})
+	result, err := callToolByName(r, "document_archive", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "required when delete is false") {
+		t.Fatalf("缺失并发参数错误结果 = %#v", result)
+	}
+	if len(fs.requests) != 0 {
+		t.Fatalf("缺参数应在本地拒绝，不发请求: %#v", fs.requests)
+	}
+}
+
+// TestDocumentArchiveWithoutDeleteArchives 验证默认行为仍走 archive 接口。
+func TestDocumentArchiveWithoutDeleteArchives(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	fs.mux.HandleFunc("POST /api/workspaces/ws-1/documents/archive", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"path":"notes/keep.md","status":"archived"}`))
+	}))
+
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	args, _ := json.Marshal(map[string]interface{}{
+		"path":              "notes/keep.md",
+		"expected_revision": 2,
+		"expected_hash":     "hash-2",
+	})
+	result, err := callToolByName(r, "document_archive", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("归档失败: %s", result.Content[0].Text)
+	}
+	if len(fs.requests) != 1 || fs.requests[0].Method != http.MethodPost {
+		t.Fatalf("归档应只调用一次 POST archive: %#v", fs.requests)
+	}
+}
+
+// --- tools/list 契约 ---
+
+// registeredTool 是 tools/list 响应中的单个工具，字段与 MCP 协议保持一致。
+type registeredTool struct {
+	Name        string                 `json:"name"`
+	Description string                 `json:"description"`
+	InputSchema map[string]interface{} `json:"inputSchema"`
+}
+
+// hasCJK 判断字符串是否包含中日韩统一表意文字。
+// 引入动机：MCP 面向 Agent 的输出统一使用英文，契约测试需要显式检出残留中文。
+func hasCJK(s string) bool {
+	for _, r := range s {
+		if unicode.Is(unicode.Han, r) {
+			return true
+		}
+	}
+	return false
+}
+
+// findTool 按名称取出工具，缺失即失败。
+func findTool(t *testing.T, tools []registeredTool, name string) registeredTool {
+	t.Helper()
+	for _, tool := range tools {
+		if tool.Name == name {
+			return tool
+		}
+	}
+	t.Fatalf("tools/list 缺少工具 %s", name)
+	return registeredTool{}
+}
+
+// toolPropertyNames 返回工具声明的属性名集合。
+func toolPropertyNames(t *testing.T, tool registeredTool) []string {
+	t.Helper()
+	props, ok := tool.InputSchema["properties"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("工具 %s 缺少 properties", tool.Name)
+	}
+	names := make([]string, 0, len(props))
+	for name := range props {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// toolRequiredNames 返回工具声明的 required 集合。
+func toolRequiredNames(t *testing.T, tool registeredTool) []string {
+	t.Helper()
+	raw, ok := tool.InputSchema["required"].([]interface{})
+	if !ok {
+		return nil
+	}
+	names := make([]string, 0, len(raw))
+	for _, item := range raw {
+		name, ok := item.(string)
+		if !ok {
+			t.Fatalf("工具 %s required 含非字符串项: %v", tool.Name, item)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+// TestToolsListCJKDetectionIsEffective 防止"无中文"断言变成空断言：
+// 必须证明 hasCJK 能识别中文，且 encoding/json 不会把中文转义掉（否则契约测试永远通过）。
+func TestToolsListCJKDetectionIsEffective(t *testing.T) {
+	if !hasCJK("中文描述") {
+		t.Fatal("hasCJK 未能识别中文")
+	}
+	if hasCJK("english description") {
+		t.Fatal("hasCJK 误报英文为中文")
+	}
+
+	// tools/list 的响应体经 json.Marshal 产生；中文必须原样保留，才可能被 hasCJK 检出。
+	marshaled, err := json.Marshal(registeredTool{Name: "sample", Description: "中文描述"})
+	if err != nil {
+		t.Fatalf("序列化失败: %v", err)
+	}
+	if !hasCJK(string(marshaled)) {
+		t.Fatalf("JSON 序列化掩盖了中文，契约测试将失去意义: %s", marshaled)
+	}
+}
+
+// TestToolsListContractIsEnglishAndComplete 通过真实 JSON-RPC 往返校验 tools/list 契约。
+// 引入动机：工具元数据直接面向 Agent，必须保证工具清单完整、每个属性都有类型和描述、
+// required 只引用已声明属性，且 initialize instructions 与 tools/list 无中文残留。
+func TestToolsListContractIsEnglishAndComplete(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+
+	r := newTestRegistry(newTestClient(t, fs))
+
+	input := `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}` + "\n" +
+		`{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}` + "\n"
+
+	var stdout bytes.Buffer
+	server := protocol.NewServerWithIO(guidance.MCPGuidance, strings.NewReader(input), &stdout)
+	r.RegisterAll(server)
+
+	if err := server.Run(); err != nil {
+		t.Fatalf("server.Run 失败: %v", err)
+	}
+
+	lines := strings.Split(strings.TrimSpace(stdout.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("期望 2 个 JSON-RPC 响应，得到 %d: %s", len(lines), stdout.String())
+	}
+	for _, line := range lines {
+		if hasCJK(line) {
+			t.Fatalf("MCP 响应残留中文: %s", line)
+		}
+	}
+
+	var listResp struct {
+		Result struct {
+			Tools []registeredTool `json:"tools"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(lines[1]), &listResp); err != nil {
+		t.Fatalf("解析 tools/list 响应失败: %v", err)
+	}
+
+	gotNames := make([]string, 0, len(listResp.Result.Tools))
+	for _, tool := range listResp.Result.Tools {
+		gotNames = append(gotNames, tool.Name)
+	}
+	sort.Strings(gotNames)
+
+	wantNames := []string{
+		"document_archive", "document_create", "document_history", "document_list",
+		"document_move", "document_outline", "document_patch", "document_read",
+		"document_read_lines", "document_read_section", "document_replace", "document_revision",
+		"knowledge_search", "source_attach", "switch_workspace", "upload_document_file",
+		"workspace_bootstrap", "workspace_current", "workspace_list",
+	}
+	sort.Strings(wantNames)
+	if !reflect.DeepEqual(gotNames, wantNames) {
+		t.Fatalf("工具清单不匹配\n got: %v\nwant: %v", gotNames, wantNames)
+	}
+
+	for _, tool := range listResp.Result.Tools {
+		if strings.TrimSpace(tool.Description) == "" {
+			t.Errorf("工具 %s 缺少 description", tool.Name)
+		}
+		if tool.InputSchema["type"] != "object" {
+			t.Errorf("工具 %s inputSchema.type = %v, 期望 object", tool.Name, tool.InputSchema["type"])
+		}
+
+		props, ok := tool.InputSchema["properties"].(map[string]interface{})
+		if !ok {
+			t.Errorf("工具 %s 缺少 properties", tool.Name)
+			continue
+		}
+		for name, rawProp := range props {
+			prop, ok := rawProp.(map[string]interface{})
+			if !ok {
+				t.Errorf("工具 %s 属性 %s 不是对象", tool.Name, name)
+				continue
+			}
+			if typ, _ := prop["type"].(string); typ == "" {
+				t.Errorf("工具 %s 属性 %s 缺少 type", tool.Name, name)
+			}
+			if desc, _ := prop["description"].(string); strings.TrimSpace(desc) == "" {
+				t.Errorf("工具 %s 属性 %s 缺少 description", tool.Name, name)
+			}
+		}
+		for _, name := range toolRequiredNames(t, tool) {
+			if _, ok := props[name]; !ok {
+				t.Errorf("工具 %s 的 required 引用未声明属性 %s", tool.Name, name)
+			}
+		}
+	}
+
+	// upload_document_file：本地文件导入参数，overwrite 控制是否覆盖已有文档。
+	upload := findTool(t, listResp.Result.Tools, "upload_document_file")
+	wantUploadProps := []string{"file_path", "overwrite", "path", "title", "type"}
+	if got := toolPropertyNames(t, upload); !reflect.DeepEqual(got, wantUploadProps) {
+		t.Errorf("upload_document_file properties = %v, 期望 %v", got, wantUploadProps)
+	}
+	if got, want := toolRequiredNames(t, upload), []string{"file_path", "path"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("upload_document_file required = %v, 期望 %v", got, want)
+	}
+	uploadProps, _ := upload.InputSchema["properties"].(map[string]interface{})
+	if got := uploadProps["overwrite"].(map[string]interface{})["type"]; got != "boolean" {
+		t.Errorf("upload_document_file overwrite type = %v, 期望 boolean", got)
+	}
+	if got := uploadProps["file_path"].(map[string]interface{})["type"]; got != "string" {
+		t.Errorf("upload_document_file file_path type = %v, 期望 string", got)
+	}
+
+	// document_archive：delete 控制归档还是永久删除，required 只含 path。
+	archive := findTool(t, listResp.Result.Tools, "document_archive")
+	wantArchiveProps := []string{"delete", "expected_hash", "expected_revision", "path"}
+	if got := toolPropertyNames(t, archive); !reflect.DeepEqual(got, wantArchiveProps) {
+		t.Errorf("document_archive properties = %v, 期望 %v", got, wantArchiveProps)
+	}
+	if got, want := toolRequiredNames(t, archive), []string{"path"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("document_archive required = %v, 期望 %v", got, want)
+	}
+	archiveProps, _ := archive.InputSchema["properties"].(map[string]interface{})
+	if got := archiveProps["delete"].(map[string]interface{})["type"]; got != "boolean" {
+		t.Errorf("document_archive delete type = %v, 期望 boolean", got)
 	}
 }
 

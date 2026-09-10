@@ -157,7 +157,7 @@ func errorResult(msg string) *protocol.ToolResult {
 func jsonResult(data interface{}) (*protocol.ToolResult, error) {
 	jsonBytes, err := json.MarshalIndent(data, "", "  ")
 	if err != nil {
-		return nil, fmt.Errorf("序列化结果: %w", err)
+		return nil, fmt.Errorf("failed to serialize result: %w", err)
 	}
 	return textResult(string(jsonBytes)), nil
 }
@@ -187,7 +187,7 @@ func cacheKey(wsID, key string) string {
 func (r *Registry) workspaceListTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "workspace_list",
-		Description: "列出当前用户可访问的所有 workspace。无需先 switch_workspace。",
+		Description: "List all workspaces the current user can access. switch_workspace is not required first.",
 		InputSchema: map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
@@ -213,7 +213,7 @@ func (r *Registry) handleWorkspaceList(args json.RawMessage) (*protocol.ToolResu
 	}
 
 	if err := r.cli.Get(ctx, "/api/workspaces?limit=100", &result); err != nil {
-		return errorResult(fmt.Sprintf("获取 workspace 列表失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to list workspaces: %v", err)), nil
 	}
 
 	return jsonResult(result)
@@ -222,7 +222,7 @@ func (r *Registry) handleWorkspaceList(args json.RawMessage) (*protocol.ToolResu
 func (r *Registry) workspaceCurrentTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "workspace_current",
-		Description: "返回当前 active workspace 的状态信息。",
+		Description: "Return the status of the active workspace.",
 		InputSchema: map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
@@ -232,7 +232,7 @@ func (r *Registry) workspaceCurrentTool() *protocol.Tool {
 
 func (r *Registry) handleWorkspaceCurrent(args json.RawMessage) (*protocol.ToolResult, error) {
 	if !r.wsState.IsActive() {
-		return textResult("当前未切换 workspace。请先使用 switch_workspace。"), nil
+		return textResult("No active workspace. Use switch_workspace first."), nil
 	}
 
 	info := map[string]string{
@@ -245,13 +245,13 @@ func (r *Registry) handleWorkspaceCurrent(args json.RawMessage) (*protocol.ToolR
 func (r *Registry) switchWorkspaceTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "switch_workspace",
-		Description: "切换 active workspace。切换后所有 project tools 作用于此 workspace。需要用户有该 workspace 的权限。",
+		Description: "Switch the active workspace. All project tools then operate on that workspace. Requires permission on the workspace.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"workspace_id": map[string]interface{}{
 					"type":        "string",
-					"description": "要切换的 workspace UUID",
+					"description": "Workspace UUID to switch to",
 				},
 			},
 			"required": []string{"workspace_id"},
@@ -264,10 +264,10 @@ func (r *Registry) handleSwitchWorkspace(args json.RawMessage) (*protocol.ToolRe
 		WorkspaceID string `json:"workspace_id"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.WorkspaceID == "" {
-		return errorResult("workspace_id 不能为空"), nil
+		return errorResult("workspace_id is required"), nil
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -285,9 +285,9 @@ func (r *Registry) handleSwitchWorkspace(args json.RawMessage) (*protocol.ToolRe
 
 	if err := r.cli.Get(ctx, "/api/workspaces/"+params.WorkspaceID, &ws); err != nil {
 		if apiErr, ok := err.(*client.APIError); ok && apiErr.IsNotFound() {
-			return errorResult("workspace 不存在或无权限"), nil
+			return errorResult("workspace not found or permission denied"), nil
 		}
-		return errorResult(fmt.Sprintf("获取 workspace 信息失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to fetch workspace: %v", err)), nil
 	}
 
 	// 设置 active workspace
@@ -305,7 +305,7 @@ func (r *Registry) handleSwitchWorkspace(args json.RawMessage) (*protocol.ToolRe
 		"workspace_name": ws.DisplayName,
 		"project_md":     map[string]bool{"exists": projectExists},
 		"agents_md":      map[string]bool{"exists": agentsExists},
-		"next_step":      "建议使用 workspace_bootstrap 获取项目概况，或使用 knowledge_search 搜索已有知识。",
+		"next_step":      "Use workspace_bootstrap for a project overview, or knowledge_search to look up existing knowledge.",
 	}
 
 	return jsonResult(result)
@@ -322,7 +322,7 @@ func (r *Registry) checkDocumentExists(ctx context.Context, wsID, path string) b
 func (r *Registry) workspaceBootstrapTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "workspace_bootstrap",
-		Description: "获取当前 workspace 的项目概况：PROJECT.md 和 AGENTS.md 的必要内容、重要入口和推荐先阅读的文档 outline。控制上下文大小，不返回整篇文件。",
+		Description: "Return an overview of the active workspace: the essential parts of PROJECT.md and AGENTS.md, key entry points, and outlines of documents to read first. Bounded in size; full files are not returned.",
 		InputSchema: map[string]interface{}{
 			"type":       "object",
 			"properties": map[string]interface{}{},
@@ -347,7 +347,7 @@ func (r *Registry) handleWorkspaceBootstrap(args json.RawMessage) (*protocol.Too
 		if content, ok := projectDoc["content_markdown"].(string); ok {
 			lines := strings.Split(content, "\n")
 			if len(lines) > 100 {
-				projectContent = strings.Join(lines[:100], "\n") + "\n... (已截断，使用 document_read_section 查看更多)"
+				projectContent = strings.Join(lines[:100], "\n") + "\n... (truncated; use document_read_section for more)"
 			} else {
 				projectContent = content
 			}
@@ -362,7 +362,7 @@ func (r *Registry) handleWorkspaceBootstrap(args json.RawMessage) (*protocol.Too
 		if content, ok := agentsDoc["content_markdown"].(string); ok {
 			lines := strings.Split(content, "\n")
 			if len(lines) > 100 {
-				agentsContent = strings.Join(lines[:100], "\n") + "\n... (已截断，使用 document_read_section 查看更多)"
+				agentsContent = strings.Join(lines[:100], "\n") + "\n... (truncated; use document_read_section for more)"
 			} else {
 				agentsContent = content
 			}
@@ -405,29 +405,29 @@ func (r *Registry) handleWorkspaceBootstrap(args json.RawMessage) (*protocol.Too
 func (r *Registry) documentListTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_list",
-		Description: "列出当前 workspace 的文档。默认隐藏 archived 文档。",
+		Description: "List documents in the active workspace. Archived documents are hidden by default.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"limit": map[string]interface{}{
 					"type":        "integer",
-					"description": "每页数量（默认 20，最大 100）",
+					"description": "Page size (default 20, max 100)",
 				},
 				"offset": map[string]interface{}{
 					"type":        "integer",
-					"description": "分页偏移",
+					"description": "Pagination offset",
 				},
 				"status": map[string]interface{}{
 					"type":        "string",
-					"description": "按状态过滤：active/draft/archived",
+					"description": "Filter by status: active/draft/archived",
 				},
 				"type": map[string]interface{}{
 					"type":        "string",
-					"description": "按类型过滤",
+					"description": "Filter by document type",
 				},
 				"include_archived": map[string]interface{}{
 					"type":        "boolean",
-					"description": "是否包含 archived 文档",
+					"description": "Include archived documents",
 				},
 			},
 		},
@@ -472,7 +472,7 @@ func (r *Registry) handleDocumentList(args json.RawMessage) (*protocol.ToolResul
 
 	var result interface{}
 	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("获取文档列表失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to list documents: %v", err)), nil
 	}
 
 	return jsonResult(result)
@@ -481,13 +481,13 @@ func (r *Registry) handleDocumentList(args json.RawMessage) (*protocol.ToolResul
 func (r *Registry) documentOutlineTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_outline",
-		Description: "返回指定文档的 Markdown heading tree（heading, level, start_line, end_line, section_path）。",
+		Description: "Return the Markdown heading tree of a document (heading, level, start_line, end_line, section_path).",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径（如 architecture/overview.md）",
+					"description": "Document path (e.g. architecture/overview.md)",
 				},
 			},
 			"required": []string{"path"},
@@ -504,10 +504,10 @@ func (r *Registry) handleDocumentOutline(args json.RawMessage) (*protocol.ToolRe
 		Path string `json:"path"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 
 	// 检查缓存
@@ -522,7 +522,7 @@ func (r *Registry) handleDocumentOutline(args json.RawMessage) (*protocol.ToolRe
 
 	var result interface{}
 	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("获取文档 outline 失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to fetch document outline: %v", err)), nil
 	}
 
 	r.cache.Set(cacheKey, result)
@@ -532,13 +532,13 @@ func (r *Registry) handleDocumentOutline(args json.RawMessage) (*protocol.ToolRe
 func (r *Registry) documentReadTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_read",
-		Description: "读取指定文档的完整内容（含 revision_number 和 content_hash）。对于长文建议先使用 document_outline。",
+		Description: "Read the full content of a document, including revision_number and content_hash. For long documents, use document_outline first.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 			},
 			"required": []string{"path"},
@@ -555,10 +555,10 @@ func (r *Registry) handleDocumentRead(args json.RawMessage) (*protocol.ToolResul
 		Path string `json:"path"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 
 	// 检查缓存
@@ -573,7 +573,7 @@ func (r *Registry) handleDocumentRead(args json.RawMessage) (*protocol.ToolResul
 
 	var result interface{}
 	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("读取文档失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to read document: %v", err)), nil
 	}
 
 	r.cache.Set(cacheKey, result)
@@ -583,18 +583,18 @@ func (r *Registry) handleDocumentRead(args json.RawMessage) (*protocol.ToolResul
 func (r *Registry) documentReadSectionTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_read_section",
-		Description: "按 section_path 数组读取指定 section 的 Markdown 内容。section_path 使用结构化数组避免同名 heading 冲突。",
+		Description: "Read one section's Markdown content by section_path. section_path is a structured array that disambiguates duplicate headings.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"section_path": map[string]interface{}{
 					"type":        "array",
 					"items":       map[string]interface{}{"type": "string"},
-					"description": "section 路径数组（如 [\"Architecture\", \"Components\"]）",
+					"description": "Section path array (e.g. [\"Architecture\", \"Components\"])",
 				},
 			},
 			"required": []string{"path", "section_path"},
@@ -612,13 +612,13 @@ func (r *Registry) handleDocumentReadSection(args json.RawMessage) (*protocol.To
 		SectionPath []string `json:"section_path"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if len(params.SectionPath) == 0 {
-		return errorResult("section_path 不能为空"), nil
+		return errorResult("section_path is required"), nil
 	}
 
 	// 构建 section_path 查询参数（JSON 数组格式）
@@ -631,7 +631,7 @@ func (r *Registry) handleDocumentReadSection(args json.RawMessage) (*protocol.To
 
 	var result interface{}
 	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("读取 section 失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to read section: %v", err)), nil
 	}
 
 	return jsonResult(result)
@@ -640,21 +640,21 @@ func (r *Registry) handleDocumentReadSection(args json.RawMessage) (*protocol.To
 func (r *Registry) documentReadLinesTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_read_lines",
-		Description: "按行范围读取指定文档的内容。限制最大 500 行。",
+		Description: "Read a line range from a document. At most 500 lines per call.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"start_line": map[string]interface{}{
 					"type":        "integer",
-					"description": "起始行号（从 1 开始，含）",
+					"description": "Start line (1-based, inclusive)",
 				},
 				"end_line": map[string]interface{}{
 					"type":        "integer",
-					"description": "结束行号（含）",
+					"description": "End line (inclusive)",
 				},
 			},
 			"required": []string{"path", "start_line", "end_line"},
@@ -673,19 +673,19 @@ func (r *Registry) handleDocumentReadLines(args json.RawMessage) (*protocol.Tool
 		EndLine   int    `json:"end_line"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if params.StartLine < 1 {
-		return errorResult("start_line 不能小于 1"), nil
+		return errorResult("start_line must be at least 1"), nil
 	}
 	if params.EndLine < params.StartLine {
-		return errorResult("end_line 不能小于 start_line"), nil
+		return errorResult("end_line must not be less than start_line"), nil
 	}
 	if params.EndLine-params.StartLine+1 > 500 {
-		return errorResult("请求行数超过最大限制 500"), nil
+		return errorResult("requested line range exceeds the 500-line limit"), nil
 	}
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents/lines?path=%s&start=%d&end=%d",
@@ -696,7 +696,7 @@ func (r *Registry) handleDocumentReadLines(args json.RawMessage) (*protocol.Tool
 
 	var result interface{}
 	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("读取行范围失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to read line range: %v", err)), nil
 	}
 
 	return jsonResult(result)
@@ -705,21 +705,21 @@ func (r *Registry) handleDocumentReadLines(args json.RawMessage) (*protocol.Tool
 func (r *Registry) documentHistoryTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_history",
-		Description: "返回指定文档的版本历史列表。",
+		Description: "Return the revision history of a document.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"limit": map[string]interface{}{
 					"type":        "integer",
-					"description": "每页数量",
+					"description": "Page size",
 				},
 				"offset": map[string]interface{}{
 					"type":        "integer",
-					"description": "分页偏移",
+					"description": "Pagination offset",
 				},
 			},
 			"required": []string{"path"},
@@ -738,10 +738,10 @@ func (r *Registry) handleDocumentHistory(args json.RawMessage) (*protocol.ToolRe
 		Offset int    `json:"offset"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 
 	limit := params.Limit
@@ -757,7 +757,7 @@ func (r *Registry) handleDocumentHistory(args json.RawMessage) (*protocol.ToolRe
 
 	var result interface{}
 	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("获取版本历史失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to fetch revision history: %v", err)), nil
 	}
 
 	return jsonResult(result)
@@ -766,17 +766,17 @@ func (r *Registry) handleDocumentHistory(args json.RawMessage) (*protocol.ToolRe
 func (r *Registry) documentRevisionTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_revision",
-		Description: "读取指定文档的指定版本内容。",
+		Description: "Read a specific revision of a document.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"revision": map[string]interface{}{
 					"type":        "integer",
-					"description": "版本号",
+					"description": "Revision number",
 				},
 			},
 			"required": []string{"path", "revision"},
@@ -794,13 +794,13 @@ func (r *Registry) handleDocumentRevision(args json.RawMessage) (*protocol.ToolR
 		Revision int    `json:"revision"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if params.Revision < 1 {
-		return errorResult("revision 不能小于 1"), nil
+		return errorResult("revision must be at least 1"), nil
 	}
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents/revision?path=%s&revision=%d",
@@ -811,7 +811,7 @@ func (r *Registry) handleDocumentRevision(args json.RawMessage) (*protocol.ToolR
 
 	var result interface{}
 	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("获取版本失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to fetch revision: %v", err)), nil
 	}
 
 	return jsonResult(result)
@@ -822,25 +822,25 @@ func (r *Registry) handleDocumentRevision(args json.RawMessage) (*protocol.ToolR
 func (r *Registry) documentCreateTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_create",
-		Description: "创建新文档。不能创建 PROJECT.md 或 AGENTS.md（特殊文件在 workspace 初始化时自动创建）。",
+		Description: "Create a new document. PROJECT.md and AGENTS.md cannot be created this way; they are created when the workspace is initialized.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径（如 architecture/overview.md）",
+					"description": "Document path (e.g. architecture/overview.md)",
 				},
 				"title": map[string]interface{}{
 					"type":        "string",
-					"description": "文档标题",
+					"description": "Document title",
 				},
 				"type": map[string]interface{}{
 					"type":        "string",
-					"description": "文档类型（可选）",
+					"description": "Document type (optional)",
 				},
 				"content_markdown": map[string]interface{}{
 					"type":        "string",
-					"description": "Markdown 内容",
+					"description": "Markdown content",
 				},
 			},
 			"required": []string{"path", "title", "content_markdown"},
@@ -860,16 +860,16 @@ func (r *Registry) handleDocumentCreate(args json.RawMessage) (*protocol.ToolRes
 		ContentMarkdown string `json:"content_markdown"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if params.Title == "" {
-		return errorResult("title 不能为空"), nil
+		return errorResult("title is required"), nil
 	}
 	if params.ContentMarkdown == "" {
-		return errorResult("content_markdown 不能为空"), nil
+		return errorResult("content_markdown is required"), nil
 	}
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents", r.wsState.ID())
@@ -885,7 +885,7 @@ func (r *Registry) handleDocumentCreate(args json.RawMessage) (*protocol.ToolRes
 
 	var result interface{}
 	if err := r.cli.Post(ctx, url, body, &result); err != nil {
-		return errorResult(fmt.Sprintf("创建文档失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to create document: %v", err)), nil
 	}
 
 	// 失效缓存
@@ -896,33 +896,33 @@ func (r *Registry) handleDocumentCreate(args json.RawMessage) (*protocol.ToolRes
 func (r *Registry) documentReplaceTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_replace",
-		Description: "替换文档全文。必须携带 expected_revision 和 expected_hash 进行乐观并发控制。",
+		Description: "Replace a document's full content. expected_revision and expected_hash are required for optimistic concurrency control.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"title": map[string]interface{}{
 					"type":        "string",
-					"description": "文档标题",
+					"description": "Document title",
 				},
 				"type": map[string]interface{}{
 					"type":        "string",
-					"description": "文档类型（可选）",
+					"description": "Document type (optional)",
 				},
 				"content_markdown": map[string]interface{}{
 					"type":        "string",
-					"description": "新的 Markdown 全文",
+					"description": "New full Markdown content",
 				},
 				"expected_revision": map[string]interface{}{
 					"type":        "integer",
-					"description": "期望的当前版本号（用于乐观并发控制）",
+					"description": "Expected current revision number (optimistic concurrency control)",
 				},
 				"expected_hash": map[string]interface{}{
 					"type":        "string",
-					"description": "期望的当前内容哈希（用于乐观并发控制）",
+					"description": "Expected current content hash (optimistic concurrency control)",
 				},
 			},
 			"required": []string{"path", "title", "content_markdown", "expected_revision", "expected_hash"},
@@ -944,16 +944,16 @@ func (r *Registry) handleDocumentReplace(args json.RawMessage) (*protocol.ToolRe
 		ExpectedHash     string `json:"expected_hash"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if params.Title == "" {
-		return errorResult("title 不能为空"), nil
+		return errorResult("title is required"), nil
 	}
 	if params.ContentMarkdown == "" {
-		return errorResult("content_markdown 不能为空"), nil
+		return errorResult("content_markdown is required"), nil
 	}
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents?path=%s", r.wsState.ID(), params.Path)
@@ -971,9 +971,9 @@ func (r *Registry) handleDocumentReplace(args json.RawMessage) (*protocol.ToolRe
 	var result interface{}
 	if err := r.cli.Put(ctx, url, body, &result); err != nil {
 		if apiErr, ok := err.(*client.APIError); ok && apiErr.IsConflict() {
-			return errorResult("版本冲突：expected_revision/expected_hash 不匹配，请重新 document_read 获取最新内容"), nil
+			return errorResult("revision conflict: expected_revision/expected_hash do not match; read the document again"), nil
 		}
-		return errorResult(fmt.Sprintf("替换文档失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to replace document: %v", err)), nil
 	}
 
 	// 失效缓存
@@ -987,7 +987,7 @@ func (r *Registry) handleDocumentReplace(args json.RawMessage) (*protocol.ToolRe
 func (r *Registry) uploadDocumentFileTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "upload_document_file",
-		Description: "Create a document in the active workspace from an existing local Markdown file. Fails if the destination path already exists; never overwrites.",
+		Description: "Create a document in the active workspace from an existing local Markdown file. file_path must be absolute. Set overwrite to true to replace an existing destination document with optimistic concurrency control; otherwise creation fails if the destination path already exists.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -997,7 +997,11 @@ func (r *Registry) uploadDocumentFileTool() *protocol.Tool {
 				},
 				"file_path": map[string]interface{}{
 					"type":        "string",
-					"description": "Local file path on the machine running MCP; supports native absolute or relative paths",
+					"description": "Absolute local file path on the machine running MCP; use the native path format of that operating system",
+				},
+				"overwrite": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, replace the existing destination document using optimistic concurrency control; defaults to false",
 				},
 				"title": map[string]interface{}{
 					"type":        "string",
@@ -1021,19 +1025,23 @@ func (r *Registry) handleUploadDocumentFile(args json.RawMessage) (*protocol.Too
 	}
 
 	var params struct {
-		Path     string `json:"path"`
-		FilePath string `json:"file_path"`
-		Title    string `json:"title"`
-		Type     string `json:"type"`
+		Path      string `json:"path"`
+		FilePath  string `json:"file_path"`
+		Title     string `json:"title"`
+		Type      string `json:"type"`
+		Overwrite bool   `json:"overwrite"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
 		return errorResult("path is required"), nil
 	}
 	if params.FilePath == "" {
 		return errorResult("file_path is required"), nil
+	}
+	if !filepath.IsAbs(params.FilePath) {
+		return errorResult("file_path must be an absolute path"), nil
 	}
 
 	fileInfo, err := os.Stat(params.FilePath)
@@ -1063,21 +1071,60 @@ func (r *Registry) handleUploadDocumentFile(args json.RawMessage) (*protocol.Too
 		}
 	}
 
-	url := fmt.Sprintf("/api/workspaces/%s/documents", r.wsState.ID())
-	body := map[string]interface{}{
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var result interface{}
+	if params.Overwrite {
+		readURL := fmt.Sprintf("/api/workspaces/%s/documents/read%s", r.wsState.ID(),
+			client.BuildQueryParams(map[string]string{"path": params.Path}))
+		var existing struct {
+			Title          string `json:"title"`
+			Type           string `json:"type"`
+			ContentHash    string `json:"content_hash"`
+			RevisionNumber int    `json:"revision_number"`
+		}
+		if err := r.cli.Get(ctx, readURL, &existing); err != nil {
+			if apiErr, ok := err.(*client.APIError); ok && apiErr.IsNotFound() {
+				return errorResult("overwrite requires an existing destination document"), nil
+			}
+			return errorResult(fmt.Sprintf("failed to read destination document: %v", err)), nil
+		}
+		if existing.Title == "" || existing.ContentHash == "" || existing.RevisionNumber < 1 {
+			return errorResult("destination document response is missing title, content_hash, or revision_number"), nil
+		}
+
+		replaceURL := fmt.Sprintf("/api/workspaces/%s/documents%s", r.wsState.ID(),
+			client.BuildQueryParams(map[string]string{"path": params.Path}))
+		replaceBody := map[string]interface{}{
+			"title":             existing.Title,
+			"type":              existing.Type,
+			"content_markdown":  string(contentBytes),
+			"expected_revision": existing.RevisionNumber,
+			"expected_hash":     existing.ContentHash,
+		}
+		if err := r.cli.Put(ctx, replaceURL, replaceBody, &result); err != nil {
+			if apiErr, ok := err.(*client.APIError); ok && apiErr.IsConflict() {
+				return errorResult("destination document changed during upload; read it again and retry"), nil
+			}
+			return errorResult(fmt.Sprintf("failed to overwrite destination document: %v", err)), nil
+		}
+		r.cache.Invalidate(cacheKey(r.wsState.ID(), "read:"+params.Path))
+		r.cache.Invalidate(cacheKey(r.wsState.ID(), "outline:"+params.Path))
+		slog.Info("overwrote document from local file", "path", params.Path, "bytes", len(contentBytes))
+		return jsonResult(result)
+	}
+
+	createURL := fmt.Sprintf("/api/workspaces/%s/documents", r.wsState.ID())
+	createBody := map[string]interface{}{
 		"path":             params.Path,
 		"title":            params.Title,
 		"type":             params.Type,
 		"content_markdown": string(contentBytes),
 	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	var result interface{}
-	if err := r.cli.Post(ctx, url, body, &result); err != nil {
+	if err := r.cli.Post(ctx, createURL, createBody, &result); err != nil {
 		if apiErr, ok := err.(*client.APIError); ok && apiErr.StatusCode == 409 {
-			return errorResult("destination document path already exists; upload_document_file never overwrites documents"), nil
+			return errorResult("destination document path already exists; set overwrite to true to replace it"), nil
 		}
 		return errorResult(fmt.Sprintf("failed to upload file and create document: %v", err)), nil
 	}
@@ -1090,25 +1137,25 @@ func (r *Registry) handleUploadDocumentFile(args json.RawMessage) (*protocol.Too
 func (r *Registry) documentMoveTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_move",
-		Description: "移动文档到新路径。必须携带 expected_revision 和 expected_hash。",
+		Description: "Move a document to a new path. expected_revision and expected_hash are required.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "源文档路径",
+					"description": "Source document path",
 				},
 				"new_path": map[string]interface{}{
 					"type":        "string",
-					"description": "目标文档路径",
+					"description": "Destination document path",
 				},
 				"expected_revision": map[string]interface{}{
 					"type":        "integer",
-					"description": "期望的当前版本号",
+					"description": "Expected current revision number",
 				},
 				"expected_hash": map[string]interface{}{
 					"type":        "string",
-					"description": "期望的当前内容哈希",
+					"description": "Expected current content hash",
 				},
 			},
 			"required": []string{"path", "new_path", "expected_revision", "expected_hash"},
@@ -1128,13 +1175,13 @@ func (r *Registry) handleDocumentMove(args json.RawMessage) (*protocol.ToolResul
 		ExpectedHash     string `json:"expected_hash"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if params.NewPath == "" {
-		return errorResult("new_path 不能为空"), nil
+		return errorResult("new_path is required"), nil
 	}
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents/move?path=%s", r.wsState.ID(), params.Path)
@@ -1150,9 +1197,9 @@ func (r *Registry) handleDocumentMove(args json.RawMessage) (*protocol.ToolResul
 	var result interface{}
 	if err := r.cli.Post(ctx, url, body, &result); err != nil {
 		if apiErr, ok := err.(*client.APIError); ok && apiErr.IsConflict() {
-			return errorResult("版本冲突或目标路径已存在"), nil
+			return errorResult("revision conflict, or the destination path already exists"), nil
 		}
-		return errorResult(fmt.Sprintf("移动文档失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to move document: %v", err)), nil
 	}
 
 	// 失效缓存
@@ -1165,24 +1212,28 @@ func (r *Registry) handleDocumentMove(args json.RawMessage) (*protocol.ToolResul
 func (r *Registry) documentArchiveTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_archive",
-		Description: "归档文档。归档后文档默认不出现在列表和搜索结果中。必须携带 expected_revision 和 expected_hash。",
+		Description: "Archive a document. Set delete to true for permanent deletion; delete requires owner permission. Archive requests require expected_revision and expected_hash.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"expected_revision": map[string]interface{}{
 					"type":        "integer",
-					"description": "期望的当前版本号",
+					"description": "Expected current revision number; required unless delete is true",
 				},
 				"expected_hash": map[string]interface{}{
 					"type":        "string",
-					"description": "期望的当前内容哈希",
+					"description": "Expected current content hash; required unless delete is true",
+				},
+				"delete": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, permanently delete the document instead of archiving it; requires owner permission and ignores expected_revision/expected_hash",
 				},
 			},
-			"required": []string{"path", "expected_revision", "expected_hash"},
+			"required": []string{"path"},
 		},
 	}
 }
@@ -1196,35 +1247,63 @@ func (r *Registry) handleDocumentArchive(args json.RawMessage) (*protocol.ToolRe
 		Path             string `json:"path"`
 		ExpectedRevision int    `json:"expected_revision"`
 		ExpectedHash     string `json:"expected_hash"`
+		Delete           bool   `json:"delete"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 
-	url := fmt.Sprintf("/api/workspaces/%s/documents/archive?path=%s", r.wsState.ID(), params.Path)
-	body := map[string]interface{}{
-		"expected_revision": params.ExpectedRevision,
-		"expected_hash":     params.ExpectedHash,
-	}
-
+	wsID := r.wsState.ID()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	var result interface{}
-	if err := r.cli.Post(ctx, url, body, &result); err != nil {
-		if apiErr, ok := err.(*client.APIError); ok && apiErr.IsConflict() {
-			return errorResult("版本冲突：expected_revision/expected_hash 不匹配"), nil
+
+	// delete=true 走永久删除：只有 owner 能通过服务端权限检查，且不需要 revision/hash。
+	if params.Delete {
+		url := fmt.Sprintf("/api/workspaces/%s/documents/purge%s", wsID,
+			client.BuildQueryParams(map[string]string{"path": params.Path}))
+		if err := r.cli.Post(ctx, url, nil, &result); err != nil {
+			if apiErr, ok := err.(*client.APIError); ok {
+				switch {
+				case apiErr.IsForbidden():
+					return errorResult("permanent deletion requires owner permission"), nil
+				case apiErr.IsNotFound():
+					return errorResult("document not found"), nil
+				}
+			}
+			return errorResult(fmt.Sprintf("failed to permanently delete document: %v", err)), nil
 		}
-		return errorResult(fmt.Sprintf("归档文档失败: %v", err)), nil
+		r.cache.Invalidate(cacheKey(wsID, "read:"+params.Path))
+		r.cache.Invalidate(cacheKey(wsID, "outline:"+params.Path))
+		r.cache.Invalidate(cacheKey(wsID, "list"))
+		slog.Info("permanently deleted document", "path", params.Path)
+		return jsonResult(result)
 	}
 
-	// 失效缓存
-	r.cache.Invalidate(cacheKey(r.wsState.ID(), "read:"+params.Path))
-	r.cache.Invalidate(cacheKey(r.wsState.ID(), "outline:"+params.Path))
-	r.cache.Invalidate(cacheKey(r.wsState.ID(), "list"))
+	if params.ExpectedHash == "" || params.ExpectedRevision < 1 {
+		return errorResult("expected_revision and expected_hash are required when delete is false"), nil
+	}
+
+	url := fmt.Sprintf("/api/workspaces/%s/documents/archive%s", wsID,
+		client.BuildQueryParams(map[string]string{"path": params.Path}))
+	body := map[string]interface{}{
+		"expected_revision": params.ExpectedRevision,
+		"expected_hash":     params.ExpectedHash,
+	}
+	if err := r.cli.Post(ctx, url, body, &result); err != nil {
+		if apiErr, ok := err.(*client.APIError); ok && apiErr.IsConflict() {
+			return errorResult("revision conflict: expected_revision/expected_hash do not match"), nil
+		}
+		return errorResult(fmt.Sprintf("failed to archive document: %v", err)), nil
+	}
+
+	r.cache.Invalidate(cacheKey(wsID, "read:"+params.Path))
+	r.cache.Invalidate(cacheKey(wsID, "outline:"+params.Path))
+	r.cache.Invalidate(cacheKey(wsID, "list"))
 	return jsonResult(result)
 }
 
@@ -1233,21 +1312,21 @@ func (r *Registry) handleDocumentArchive(args json.RawMessage) (*protocol.ToolRe
 func (r *Registry) documentPatchTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_patch",
-		Description: "本地 patch 文档：获取 base revision/content → 验证 old_text 唯一匹配 → 生成 candidate → 计算 hash → 上传。409 时自动尝试一次安全 rebase。",
+		Description: "Patch a document locally: fetch the base revision/content, verify old_text matches exactly once, build the candidate content, compute its hash, then upload. On 409, one safe rebase is attempted.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"old_text": map[string]interface{}{
 					"type":        "string",
-					"description": "要替换的原文（必须在文档中恰好唯一匹配）",
+					"description": "Text to replace; it must match exactly once in the document",
 				},
 				"new_text": map[string]interface{}{
 					"type":        "string",
-					"description": "替换后的新文本",
+					"description": "Replacement text",
 				},
 			},
 			"required": []string{"path", "old_text", "new_text"},
@@ -1266,13 +1345,13 @@ func (r *Registry) handleDocumentPatch(args json.RawMessage) (*protocol.ToolResu
 		NewText string `json:"new_text"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if params.OldText == "" {
-		return errorResult("old_text 不能为空"), nil
+		return errorResult("old_text is required"), nil
 	}
 
 	wsID := r.wsState.ID()
@@ -1306,7 +1385,7 @@ func (r *Registry) handleDocumentPatch(args json.RawMessage) (*protocol.ToolResu
 		defer cancel()
 
 		if err := r.cli.Get(ctx, url, &doc); err != nil {
-			return errorResult(fmt.Sprintf("获取文档失败: %v", err)), nil
+			return errorResult(fmt.Sprintf("failed to fetch document: %v", err)), nil
 		}
 
 		// 缓存文档
@@ -1337,10 +1416,10 @@ func (r *Registry) applyPatchAndUpload(wsID, path, oldText, newText, baseContent
 	// 1. 验证 old_text 在 base content 中恰好唯一匹配
 	count := strings.Count(baseContent, oldText)
 	if count == 0 {
-		return nil, fmt.Errorf("old_text 在文档中未找到（0 次匹配）")
+		return nil, fmt.Errorf("old_text was not found in the document (0 matches)")
 	}
 	if count > 1 {
-		return nil, fmt.Errorf("old_text 在文档中匹配 %d 次，必须唯一匹配", count)
+		return nil, fmt.Errorf("old_text matches %d times; exactly one match is required", count)
 	}
 
 	// 2. 本地应用 old_text→new_text 生成 candidate 完整内容
@@ -1371,11 +1450,11 @@ func (r *Registry) applyPatchAndUpload(wsID, path, oldText, newText, baseContent
 	// 检查是否为 409 冲突
 	apiErr, ok := err.(*client.APIError)
 	if !ok || !apiErr.IsConflict() {
-		return nil, fmt.Errorf("patch 上传失败: %w", err)
+		return nil, fmt.Errorf("failed to upload patch: %w", err)
 	}
 
 	// 5. 409 冲突——尝试一次安全 rebase
-	slog.Info("patch 409 冲突，尝试一次安全 rebase", "path", path)
+	slog.Info("patch hit 409 conflict; attempting one safe rebase", "path", path)
 
 	// 获取最新文档内容
 	readURL := fmt.Sprintf("/api/workspaces/%s/documents/read?path=%s", wsID, path)
@@ -1389,7 +1468,7 @@ func (r *Registry) applyPatchAndUpload(wsID, path, oldText, newText, baseContent
 	defer readCancel()
 
 	if err := r.cli.Get(readCtx, readURL, &latestDoc); err != nil {
-		return nil, fmt.Errorf("rebase: 获取最新文档失败: %w", err)
+		return nil, fmt.Errorf("rebase: failed to fetch the latest document: %w", err)
 	}
 
 	// 检查 old_text 在最新内容中是否仍唯一匹配
@@ -1398,23 +1477,23 @@ func (r *Registry) applyPatchAndUpload(wsID, path, oldText, newText, baseContent
 		// old_text 在最新内容中不存在——返回完整 conflict 信息
 		return map[string]interface{}{
 			"conflict":        true,
-			"reason":          "old_text 在最新内容中未找到（可能已被修改或删除）",
+			"reason":          "old_text was not found in the latest content (it may have been modified or removed)",
 			"base_revision":   baseRevision,
 			"base_hash":       baseHash,
 			"latest_revision": latestDoc.RevisionNumber,
 			"latest_hash":     latestDoc.ContentHash,
-			"suggestion":      "请重新 document_read 获取最新内容，确认 old_text 仍然存在后重试。",
+			"suggestion":      "Read the document again, confirm old_text still exists, then retry.",
 		}, nil
 	}
 	if latestCount > 1 {
 		return map[string]interface{}{
 			"conflict":        true,
-			"reason":          fmt.Sprintf("old_text 在最新内容中匹配 %d 次，无法自动 rebase", latestCount),
+			"reason":          fmt.Sprintf("old_text matches %d times in the latest content; automatic rebase is not possible", latestCount),
 			"base_revision":   baseRevision,
 			"base_hash":       baseHash,
 			"latest_revision": latestDoc.RevisionNumber,
 			"latest_hash":     latestDoc.ContentHash,
-			"suggestion":      "请重新 document_read 获取最新内容，使用更具体的 old_text 确保唯一匹配后重试。",
+			"suggestion":      "Read the document again and use a more specific old_text that matches exactly once, then retry.",
 		}, nil
 	}
 
@@ -1439,12 +1518,12 @@ func (r *Registry) applyPatchAndUpload(wsID, path, oldText, newText, baseContent
 		// rebase 仍失败——返回完整 conflict 信息
 		return map[string]interface{}{
 			"conflict":        true,
-			"reason":          fmt.Sprintf("rebase 后 patch 仍失败: %v", err),
+			"reason":          fmt.Sprintf("patch still failed after rebase: %v", err),
 			"base_revision":   baseRevision,
 			"base_hash":       baseHash,
 			"latest_revision": latestDoc.RevisionNumber,
 			"latest_hash":     latestDoc.ContentHash,
-			"suggestion":      "请重新 document_read 获取最新内容后手动修改。",
+			"suggestion":      "Read the latest content and apply the change manually.",
 		}, nil
 	}
 
@@ -1460,25 +1539,25 @@ func (r *Registry) applyPatchAndUpload(wsID, path, oldText, newText, baseContent
 func (r *Registry) knowledgeSearchTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "knowledge_search",
-		Description: "搜索当前 active workspace 的知识库。永远只搜索 active workspace，不支持跨 workspace 搜索。",
+		Description: "Search the knowledge base of the active workspace only. Cross-workspace search is not supported.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"query": map[string]interface{}{
 					"type":        "string",
-					"description": "搜索查询",
+					"description": "Search query",
 				},
 				"mode": map[string]interface{}{
 					"type":        "string",
-					"description": "搜索模式：hybrid（默认）、lexical、semantic",
+					"description": "Search mode: hybrid (default), lexical, semantic",
 				},
 				"limit": map[string]interface{}{
 					"type":        "integer",
-					"description": "结果数量上限",
+					"description": "Maximum number of results",
 				},
 				"offset": map[string]interface{}{
 					"type":        "integer",
-					"description": "分页偏移",
+					"description": "Pagination offset",
 				},
 			},
 			"required": []string{"query"},
@@ -1498,10 +1577,10 @@ func (r *Registry) handleKnowledgeSearch(args json.RawMessage) (*protocol.ToolRe
 		Offset int    `json:"offset"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Query == "" {
-		return errorResult("query 不能为空"), nil
+		return errorResult("query is required"), nil
 	}
 
 	// mode 默认值
@@ -1530,7 +1609,7 @@ func (r *Registry) handleKnowledgeSearch(args json.RawMessage) (*protocol.ToolRe
 
 	var result interface{}
 	if err := r.cli.Post(ctx, url, body, &result); err != nil {
-		return errorResult(fmt.Sprintf("搜索失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("search failed: %v", err)), nil
 	}
 
 	return jsonResult(result)
@@ -1541,37 +1620,37 @@ func (r *Registry) handleKnowledgeSearch(args json.RawMessage) (*protocol.ToolRe
 func (r *Registry) sourceAttachTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "source_attach",
-		Description: "为指定文档添加来源（provenance）。支持 web/code/file/issue/commit/conversation/manual/other 类型。",
+		Description: "Attach a source (provenance) to a document. Supported types: web/code/file/issue/commit/conversation/manual/other.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
 				"path": map[string]interface{}{
 					"type":        "string",
-					"description": "文档路径",
+					"description": "Document path",
 				},
 				"source_type": map[string]interface{}{
 					"type":        "string",
-					"description": "来源类型：web/code/file/issue/commit/conversation/manual/other",
+					"description": "Source type: web/code/file/issue/commit/conversation/manual/other",
 				},
 				"value": map[string]interface{}{
 					"type":        "string",
-					"description": "来源值（URL/path/identifier）",
+					"description": "Source value (URL/path/identifier)",
 				},
 				"title": map[string]interface{}{
 					"type":        "string",
-					"description": "来源标题（可选）",
+					"description": "Source title (optional)",
 				},
 				"retrieved_at": map[string]interface{}{
 					"type":        "string",
-					"description": "获取时间（RFC3339 格式，可选）",
+					"description": "Retrieval time in RFC3339 format (optional)",
 				},
 				"content_hash": map[string]interface{}{
 					"type":        "string",
-					"description": "来源内容哈希（可选）",
+					"description": "Source content hash (optional)",
 				},
 				"refresh_interval_days": map[string]interface{}{
 					"type":        "integer",
-					"description": "刷新间隔天数（可选）",
+					"description": "Refresh interval in days (optional)",
 				},
 			},
 			"required": []string{"path", "source_type", "value"},
@@ -1594,16 +1673,16 @@ func (r *Registry) handleSourceAttach(args json.RawMessage) (*protocol.ToolResul
 		RefreshIntervalDays int    `json:"refresh_interval_days"`
 	}
 	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
 	}
 	if params.Path == "" {
-		return errorResult("path 不能为空"), nil
+		return errorResult("path is required"), nil
 	}
 	if params.SourceType == "" {
-		return errorResult("source_type 不能为空"), nil
+		return errorResult("source_type is required"), nil
 	}
 	if params.Value == "" {
-		return errorResult("value 不能为空"), nil
+		return errorResult("value is required"), nil
 	}
 
 	// 验证 source_type
@@ -1612,7 +1691,7 @@ func (r *Registry) handleSourceAttach(args json.RawMessage) (*protocol.ToolResul
 		"commit": true, "conversation": true, "manual": true, "other": true,
 	}
 	if !validTypes[params.SourceType] {
-		return errorResult(fmt.Sprintf("非法 source_type: %s", params.SourceType)), nil
+		return errorResult(fmt.Sprintf("invalid source_type: %s", params.SourceType)), nil
 	}
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents/sources?path=%s", r.wsState.ID(), params.Path)
@@ -1630,7 +1709,7 @@ func (r *Registry) handleSourceAttach(args json.RawMessage) (*protocol.ToolResul
 
 	var result interface{}
 	if err := r.cli.Post(ctx, url, body, &result); err != nil {
-		return errorResult(fmt.Sprintf("添加来源失败: %v", err)), nil
+		return errorResult(fmt.Sprintf("failed to attach source: %v", err)), nil
 	}
 
 	return jsonResult(result)

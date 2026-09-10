@@ -81,7 +81,7 @@ func (s *State) Name() string {
 // 引入动机：所有 project tools 在执行前调用此方法。
 func (s *State) RequireActive() error {
 	if !s.IsActive() {
-		return fmt.Errorf("未切换 workspace，请先使用 switch_workspace 工具")
+		return fmt.Errorf("no active workspace; use switch_workspace first")
 	}
 	return nil
 }

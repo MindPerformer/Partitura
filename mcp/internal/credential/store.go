@@ -55,14 +55,14 @@ type Store interface {
 	Delete(serverURL string) error
 }
 
-// failFastLog 在凭据操作失败时记录安全日志并返回错误。
+// failFastLog 在credential operation failed时记录安全日志并返回错误。
 // 引入动机：design 要求存储失败必须 fail-fast 并有安全日志。
 // 安全要求：日志中不输出 token 值。
 func failFastLog(operation, serverURL string, err error) error {
-	slog.Error("凭据操作失败",
+	slog.Error("credential operation failed",
 		"operation", operation,
 		"server_url", serverURL,
 		"error", err.Error(),
 	)
-	return fmt.Errorf("%s 失败: %w", operation, err)
+	return fmt.Errorf("%s failed: %w", operation, err)
 }

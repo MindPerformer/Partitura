@@ -47,7 +47,7 @@ func main() {
 	switch os.Args[1] {
 	case "login":
 		if len(os.Args) < 3 {
-			fmt.Fprintln(os.Stderr, "用法: knowledge-mcp login <server-url>")
+			fmt.Fprintln(os.Stderr, "usage: knowledge-mcp login <server-url>")
 			os.Exit(1)
 		}
 		runLogin(os.Args[2])
@@ -64,7 +64,7 @@ func main() {
 	case "-h", "--help", "help":
 		printHelp()
 	default:
-		fmt.Fprintf(os.Stderr, "未知命令: %s\n", os.Args[1])
+		fmt.Fprintf(os.Stderr, "unknown command: %s\n", os.Args[1])
 		printHelp()
 		os.Exit(1)
 	}
@@ -93,7 +93,7 @@ func runLogin(serverURL string) {
 	// 加载或创建配置
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("加载配置失败", "error", err)
+		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
 
@@ -103,7 +103,7 @@ func runLogin(serverURL string) {
 	// 创建凭据存储（运行目录下的加密文件存储）
 	store, err := newCredentialStore()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "初始化凭据存储失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to initialize credential store: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -114,31 +114,31 @@ func runLogin(serverURL string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 	defer cancel()
 
-	fmt.Fprintf(os.Stderr, "正在连接 %s ...\n", serverURL)
+	fmt.Fprintf(os.Stderr, "connecting to %s ...\n", serverURL)
 
 	// MCP 不要求用户输入设备名，自动生成稳定非敏感名称（OS + hostname hash）。
 	// 不包含用户名、路径、IP 或 token。
 	deviceName := generateDeviceName()
 	startResp, err := cli.DeviceAuthStart(ctx, deviceName)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "启动 device authorization 失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to start device authorization: %v\n", err)
 		os.Exit(1)
 	}
 
 	// 显示用户授权信息
 	fmt.Fprintf(os.Stderr, "\n")
 	fmt.Fprintf(os.Stderr, "========================================\n")
-	fmt.Fprintf(os.Stderr, "  请在浏览器中打开以下 URL 并输入授权码:\n")
+	fmt.Fprintf(os.Stderr, "  Open the following URL in your browser and enter the code:\n")
 	fmt.Fprintf(os.Stderr, "  URL: %s\n", startResp.VerificationURL)
-	fmt.Fprintf(os.Stderr, "  授权码: %s\n", startResp.UserCode)
+	fmt.Fprintf(os.Stderr, "  Code: %s\n", startResp.UserCode)
 	fmt.Fprintf(os.Stderr, "========================================\n")
 	fmt.Fprintf(os.Stderr, "\n")
-	fmt.Fprintf(os.Stderr, "等待授权... (有效期 %d 秒)\n", startResp.ExpiresIn)
+	fmt.Fprintf(os.Stderr, "Waiting for authorization... (expires in %d seconds)\n", startResp.ExpiresIn)
 
 	// 尝试按 OS 安全打开 URL；失败仅向 stderr 输出可复制链接，不阻断轮询。
 	if err := openBrowser(startResp.VerificationURL); err != nil {
-		fmt.Fprintf(os.Stderr, "无法自动打开浏览器: %v\n", err)
-		fmt.Fprintf(os.Stderr, "请手动复制上方 URL 到浏览器打开。\n")
+		fmt.Fprintf(os.Stderr, "could not open the browser automatically: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Copy the URL above into your browser manually.\n")
 	}
 
 	// 轮询授权状态
@@ -159,25 +159,25 @@ func runLogin(serverURL string) {
 				continue
 			}
 			if err == client.ErrAuthorizationDenied {
-				fmt.Fprintf(os.Stderr, "\n授权被拒绝。\n")
+				fmt.Fprintf(os.Stderr, "\nAuthorization denied.\n")
 				os.Exit(1)
 			}
 			if err == client.ErrDeviceCodeExpired {
-				fmt.Fprintf(os.Stderr, "\n授权码已过期，请重新登录。\n")
+				fmt.Fprintf(os.Stderr, "\nThe code has expired; log in again.\n")
 				os.Exit(1)
 			}
 			if err == client.ErrAuthorizationCompleted {
 				// 授权已被一次性交换完成，另一进程/轮询已领取 token。
 				// 本进程无法再从 server 获取 token，必须重新登录。
-				fmt.Fprintf(os.Stderr, "\n授权已完成（token 已由先前轮询领取），请重新登录。\n")
+				fmt.Fprintf(os.Stderr, "\nAuthorization already completed (the token was claimed by an earlier poll); log in again.\n")
 				os.Exit(1)
 			}
-			fmt.Fprintf(os.Stderr, "\n轮询失败: %v\n", err)
+			fmt.Fprintf(os.Stderr, "\npolling failed: %v\n", err)
 			os.Exit(1)
 		}
 
 		if pollResp.Status == "authorized" {
-			fmt.Fprintf(os.Stderr, "\n授权成功！\n")
+			fmt.Fprintf(os.Stderr, "\nAuthorization succeeded.\n")
 
 			// 保存 token 到本地加密凭据文件
 			tokens := &client.CredentialTokens{
@@ -187,22 +187,22 @@ func runLogin(serverURL string) {
 			}
 			cli.SetTokens(tokens)
 			if err := cli.SaveTokens(); err != nil {
-				fmt.Fprintf(os.Stderr, "保存凭据失败: %v\n", err)
+				fmt.Fprintf(os.Stderr, "failed to save credentials: %v\n", err)
 				os.Exit(1)
 			}
 
 			// 保存配置
 			if err := config.Save(cfg); err != nil {
-				fmt.Fprintf(os.Stderr, "保存配置失败: %v\n", err)
+				fmt.Fprintf(os.Stderr, "failed to save config: %v\n", err)
 				os.Exit(1)
 			}
 
-			fmt.Fprintf(os.Stderr, "登录成功。token 已保存到本地加密凭据文件。\n")
+			fmt.Fprintf(os.Stderr, "Login succeeded. The token was saved to the local encrypted credential file.\n")
 			return
 		}
 	}
 
-	fmt.Fprintf(os.Stderr, "\n授权超时，请重试。\n")
+	fmt.Fprintf(os.Stderr, "\nAuthorization timed out; try again.\n")
 	os.Exit(1)
 }
 
@@ -217,18 +217,18 @@ func runLogin(serverURL string) {
 func runLogout() {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 
 	if cfg.Server == "" {
-		fmt.Fprintln(os.Stderr, "未配置 server")
+		fmt.Fprintln(os.Stderr, "server is not configured")
 		os.Exit(1)
 	}
 
 	store, err := newCredentialStore()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "初始化凭据存储失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to initialize credential store: %v\n", err)
 		os.Exit(1)
 	}
 	credAdapter := &credAdapter{store: store}
@@ -237,7 +237,7 @@ func runLogout() {
 	cli := client.NewClient(cfg.Server, credAdapter, cfg.AllowInsecureTLS)
 	if err := cli.LoadTokens(); err != nil {
 		// 凭据加载失败——记录 stderr 但继续清理本地
-		fmt.Fprintf(os.Stderr, "警告: 加载凭据失败，跳过远端 revoke: %v\n", err)
+		fmt.Fprintf(os.Stderr, "warning: failed to load credentials; skipping remote revoke: %v\n", err)
 	} else if cli.IsLoggedIn() {
 		// 尝试调用 server 撤销 session
 		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
@@ -247,24 +247,24 @@ func runLogout() {
 			// 远端 revoke 失败——记录 stderr，但不阻止本地清理
 			// 安全策略：远端失败可能是网络问题或 server 不可达，
 			// 本地凭据仍应删除以防止用户以为仍处于登录状态
-			fmt.Fprintf(os.Stderr, "警告: 远端 session 撤销失败: %v\n", revokeErr)
+			fmt.Fprintf(os.Stderr, "warning: failed to revoke the remote session: %v\n", revokeErr)
 		}
 	}
 
 	// 删除本地凭据（无论远端 revoke 是否成功）
 	if err := store.Delete(cfg.Server); err != nil {
-		fmt.Fprintf(os.Stderr, "清除本地凭据失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to clear local credentials: %v\n", err)
 		os.Exit(1)
 	}
 
 	// 清除 active workspace
 	cfg.ActiveWorkspace = ""
 	if err := config.Save(cfg); err != nil {
-		fmt.Fprintf(os.Stderr, "清除 active workspace 配置失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to clear the active workspace setting: %v\n", err)
 		os.Exit(1)
 	}
 
-	fmt.Fprintln(os.Stderr, "已退出登录，凭据已清除。")
+	fmt.Fprintln(os.Stderr, "Logged out; credentials cleared.")
 }
 
 // runServe 启动 stdio MCP server。
@@ -273,19 +273,19 @@ func runServe() {
 	// 加载配置
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("加载配置失败", "error", err)
+		slog.Error("failed to load config", "error", err)
 		os.Exit(1)
 	}
 
 	if cfg.Server == "" {
-		slog.Error("未配置 server URL，请先执行 knowledge-mcp login <server-url>")
+		slog.Error("server URL is not configured; run knowledge-mcp login <server-url> first")
 		os.Exit(1)
 	}
 
 	// 创建凭据存储（运行目录下的加密文件存储）
 	credStore, err := newCredentialStore()
 	if err != nil {
-		slog.Error("初始化凭据存储失败", "error", err)
+		slog.Error("failed to initialize credential store", "error", err)
 		os.Exit(1)
 	}
 
@@ -294,12 +294,12 @@ func runServe() {
 
 	// 加载已保存的 token
 	if err := cli.LoadTokens(); err != nil {
-		slog.Error("加载凭据失败", "error", err)
+		slog.Error("failed to load credentials", "error", err)
 		os.Exit(1)
 	}
 
 	if !cli.IsLoggedIn() {
-		slog.Error("未登录，请先执行 knowledge-mcp login <server-url>")
+		slog.Error("not logged in; run knowledge-mcp login <server-url> first")
 		os.Exit(1)
 	}
 
@@ -323,7 +323,7 @@ func runServe() {
 	// 创建缓存
 	ttl, err := cfg.ParseCacheTTL()
 	if err != nil {
-		slog.Error("解析 cache TTL 失败", "error", err)
+		slog.Error("failed to parse cache TTL", "error", err)
 		os.Exit(1)
 	}
 	memCache := cache.New(ttl, cfg.CacheMaxEntries)
@@ -339,7 +339,7 @@ func runServe() {
 
 	// 启动 stdio 循环
 	if err := server.Run(); err != nil {
-		slog.Error("MCP server 运行失败", "error", err)
+		slog.Error("MCP server failed", "error", err)
 		os.Exit(1)
 	}
 }
@@ -348,11 +348,11 @@ func runServe() {
 func runServerList() {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 	if cfg.Server == "" {
-		fmt.Println("未配置 server")
+		fmt.Println("server is not configured")
 		return
 	}
 	fmt.Printf("Server: %s\n", cfg.Server)
@@ -362,11 +362,11 @@ func runServerList() {
 func runServerCurrent() {
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "加载配置失败: %v\n", err)
+		fmt.Fprintf(os.Stderr, "failed to load config: %v\n", err)
 		os.Exit(1)
 	}
 	if cfg.Server == "" {
-		fmt.Println("未配置 server")
+		fmt.Println("server is not configured")
 		return
 	}
 	fmt.Println(cfg.Server)
@@ -387,11 +387,11 @@ func runVersion() {
 func newCredentialStore() (*credential.FileStore, error) {
 	dir, err := os.Getwd()
 	if err != nil {
-		return nil, fmt.Errorf("获取当前工作目录: %w", err)
+		return nil, fmt.Errorf("failed to get the current working directory: %w", err)
 	}
 	store, err := credential.NewStore(dir)
 	if err != nil {
-		return nil, fmt.Errorf("创建凭据存储: %w", err)
+		return nil, fmt.Errorf("failed to create credential store: %w", err)
 	}
 	return store, nil
 }
@@ -424,10 +424,10 @@ func openBrowser(url string) error {
 	case "linux", "freebsd", "openbsd":
 		cmd = exec.Command("xdg-open", url)
 	default:
-		return fmt.Errorf("不支持的操作系统: %s", runtime.GOOS)
+		return fmt.Errorf("unsupported operating system: %s", runtime.GOOS)
 	}
 	if err := cmd.Start(); err != nil {
-		return fmt.Errorf("启动浏览器: %w", err)
+		return fmt.Errorf("failed to launch browser: %w", err)
 	}
 	return nil
 }

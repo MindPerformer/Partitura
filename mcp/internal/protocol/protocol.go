@@ -177,12 +177,20 @@ type Server struct {
 // 参数：
 //   - instructions：MCP Guidance 文本
 func NewServer(instructions string) *Server {
+	return NewServerWithIO(instructions, os.Stdin, os.Stdout)
+}
+
+// NewServerWithIO 创建使用指定 reader/writer 的 MCP server。
+// 引入动机：需要在不派生子进程的情况下驱动完整 JSON-RPC 往返（例如校验 tools/list
+// 契约的测试，或将来把 MCP 嵌入其他宿主）。
+// 语义与 NewServer 完全一致，只是把 stdio 换成调用方提供的流。
+func NewServerWithIO(instructions string, reader io.Reader, writer io.Writer) *Server {
 	return &Server{
 		tools:        make(map[string]*Tool),
 		handlers:     make(map[string]ToolHandler),
 		instructions: instructions,
-		reader:       os.Stdin,
-		writer:       os.Stdout,
+		reader:       reader,
+		writer:       writer,
 		logger:       slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	}
 }
@@ -218,7 +226,7 @@ func (s *Server) Run() error {
 	}
 
 	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("读取 stdin: %w", err)
+		return fmt.Errorf("failed to read stdin: %w", err)
 	}
 
 	return nil
@@ -233,7 +241,7 @@ func (s *Server) handleLine(line string) {
 			ID:      nil,
 			Error: &RPCError{
 				Code:    CodeParseError,
-				Message: "解析 JSON 失败",
+				Message: "failed to parse JSON",
 			},
 		})
 		return
@@ -241,7 +249,7 @@ func (s *Server) handleLine(line string) {
 
 	// 通知（无 ID）不需要响应
 	if req.ID == nil {
-		s.logger.Debug("收到通知，不回复", "method", req.Method)
+		s.logger.Debug("received notification; not replying", "method", req.Method)
 		return
 	}
 
@@ -264,7 +272,7 @@ func (s *Server) handleRequest(req *Request) *Response {
 			ID:      req.ID,
 			Error: &RPCError{
 				Code:    CodeMethodNotFound,
-				Message: fmt.Sprintf("未知方法: %s", req.Method),
+				Message: fmt.Sprintf("unknown method: %s", req.Method),
 			},
 		}
 	}
@@ -324,7 +332,7 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 			ID:      req.ID,
 			Error: &RPCError{
 				Code:    CodeInvalidParams,
-				Message: "解析 tools/call 参数失败",
+				Message: "failed to parse tools/call params",
 			},
 		}
 	}
@@ -340,7 +348,7 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 			ID:      req.ID,
 			Error: &RPCError{
 				Code:    CodeMethodNotFound,
-				Message: fmt.Sprintf("未知工具: %s", params.Name),
+				Message: fmt.Sprintf("unknown tool: %s", params.Name),
 			},
 		}
 	}
@@ -374,13 +382,13 @@ func (s *Server) handleToolsCall(req *Request) *Response {
 func (s *Server) sendResponse(resp *Response) {
 	data, err := json.Marshal(resp)
 	if err != nil {
-		s.logger.Error("序列化响应失败", "error", err)
+		s.logger.Error("failed to serialize response", "error", err)
 		return
 	}
 
 	// 直接写入 stdout，每条消息一行
 	if _, err := s.writer.Write(append(data, '\n')); err != nil {
-		s.logger.Error("写入 stdout 失败", "error", err)
+		s.logger.Error("failed to write to stdout", "error", err)
 	}
 }
 

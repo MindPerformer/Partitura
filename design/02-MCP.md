@@ -255,19 +255,38 @@ MCP 可尝试一次安全 rebase：
 
 ## upload_document_file
 
-本地 MCP 提供 `upload_document_file`，用于把运行 MCP 的本机文件内容导入当前 Workspace，并创建一个新文档。
+本地 MCP 提供 `upload_document_file`，用于把运行 MCP 的本机文件内容导入当前 Workspace。
 
 输入：
-- `path`：要创建的 Workspace 文档路径
-- `file_path`：本机已有文件路径，支持当前操作系统的绝对或相对路径
+- `path`：Workspace 文档路径
+- `file_path`：本机已有文件路径，**必须是绝对路径**
 - `title`：可选文档标题；省略时使用本地文件名（不含扩展名）
 - `type`：可选文档类型
+- `overwrite`：可选，默认 false
+
+行为：
+- `overwrite` 缺省或 false：调用 `document_create` 语义创建新文档；目标路径已存在时失败，不隐式覆盖。
+- `overwrite: true`：目标文档必须已存在；先读取其 title/type/revision/content_hash，再以 `document_replace` 语义覆盖，并携带 `expected_revision` + `expected_hash` 做乐观并发控制。
 
 约束：
 - 必须先 `switch_workspace`。
-- 工具读取本地文件后调用 `document_create` 语义创建文档，不要求调用方复制正文参数。
-- 目标路径已存在时直接失败，**不得调用 replace，不得隐式覆盖已有文档**。
+- `file_path` 必须传绝对路径：路径由运行 MCP 的本机解释，使用该操作系统的原生格式；**不得传相对路径**，否则工具在本地直接拒绝。
+- 覆盖冲突（409）或目标文档不存在时返回错误，不静默覆盖、不自动创建。
 - 本地文件必须是有效 UTF-8 文本；MCP 不持久化本地文件副本。
+
+## document_archive
+
+输入：
+- `path`
+- `expected_revision` + `expected_hash`：`delete` 为 false 时必填
+- `delete`：可选 boolean，默认 false
+
+行为：
+- `delete` 缺省或 false：归档文档（可恢复），走 archive 接口并要求 `expected_revision` + `expected_hash`。
+- `delete: true`：永久删除文档，走 purge 接口，忽略 `expected_revision`/`expected_hash`。
+
+约束：
+- 永久删除需要 owner 权限；服务端返回 403 时 MCP 必须映射为明确的权限错误，不得静默降级为归档。
 
 ## MCP 配置
 

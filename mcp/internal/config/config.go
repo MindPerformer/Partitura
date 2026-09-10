@@ -76,10 +76,10 @@ func (c *Config) ParseCacheTTL() (time.Duration, error) {
 	}
 	d, err := time.ParseDuration(c.CacheTTL)
 	if err != nil {
-		return 0, fmt.Errorf("解析 cache_ttl: %w", err)
+		return 0, fmt.Errorf("failed to parse cache_ttl: %w", err)
 	}
 	if d <= 0 {
-		return 0, fmt.Errorf("cache_ttl 必须为正数")
+		return 0, fmt.Errorf("cache_ttl must be positive")
 	}
 	return d, nil
 }
@@ -92,7 +92,7 @@ func (c *Config) ParseCacheTTL() (time.Duration, error) {
 func configPath() (string, error) {
 	cwd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("获取当前工作目录: %w", err)
+		return "", fmt.Errorf("failed to get the current working directory: %w", err)
 	}
 	return filepath.Join(cwd, ".knowledge-mcp", "config.toml"), nil
 }
@@ -107,7 +107,7 @@ func configPath() (string, error) {
 func Load() (*Config, error) {
 	path, err := configPath()
 	if err != nil {
-		return nil, fmt.Errorf("获取配置文件路径: %w", err)
+		return nil, fmt.Errorf("failed to get the config file path: %w", err)
 	}
 
 	return LoadFromPath(path)
@@ -124,15 +124,15 @@ func LoadFromPath(path string) (*Config, error) {
 			// 配置文件不存在——返回默认配置
 			return &cfg, nil
 		}
-		return nil, fmt.Errorf("读取配置文件: %w", err)
+		return nil, fmt.Errorf("failed to read config file: %w", err)
 	}
 
 	if err := toml.Unmarshal(data, &cfg); err != nil {
-		return nil, fmt.Errorf("解析配置文件: %w", err)
+		return nil, fmt.Errorf("failed to parse config file: %w", err)
 	}
 
 	if cfg.Server == "" {
-		return nil, fmt.Errorf("配置缺少 server URL")
+		return nil, fmt.Errorf("config is missing the server URL")
 	}
 
 	return &cfg, nil
@@ -155,7 +155,7 @@ func Save(cfg *Config) error {
 func SaveToPath(cfg *Config, path string) error {
 	configDir := filepath.Dir(path)
 	if err := os.MkdirAll(configDir, 0700); err != nil {
-		return fmt.Errorf("创建配置目录: %w", err)
+		return fmt.Errorf("failed to create config directory: %w", err)
 	}
 
 	// 序列化为 TOML
@@ -178,13 +178,13 @@ func SaveToPath(cfg *Config, path string) error {
 
 	f, err := os.Create(path)
 	if err != nil {
-		return fmt.Errorf("创建配置文件: %w", err)
+		return fmt.Errorf("failed to create config file: %w", err)
 	}
 	defer f.Close()
 
 	encoder := toml.NewEncoder(f)
 	if err := encoder.Encode(&buf); err != nil {
-		return fmt.Errorf("写入配置文件: %w", err)
+		return fmt.Errorf("failed to write config file: %w", err)
 	}
 
 	return nil

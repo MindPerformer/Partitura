@@ -91,15 +91,15 @@ type FileStore struct {
 // dir 为空或不可用（不存在/非目录）时返回错误（fail-fast），不得退化到其他目录。
 func NewStore(dir string) (*FileStore, error) {
 	if dir == "" {
-		return nil, fmt.Errorf("凭据存储目录为空")
+		return nil, fmt.Errorf("credential store directory is empty")
 	}
 
 	info, err := os.Stat(dir)
 	if err != nil {
-		return nil, fmt.Errorf("凭据存储目录不可用 %s: %w", dir, err)
+		return nil, fmt.Errorf("credential store directory is unusable %s: %w", dir, err)
 	}
 	if !info.IsDir() {
-		return nil, fmt.Errorf("凭据存储目录不是目录: %s", dir)
+		return nil, fmt.Errorf("credential store path is not a directory: %s", dir)
 	}
 
 	return &FileStore{dir: dir}, nil
@@ -121,12 +121,12 @@ func (s *FileStore) filePath() string {
 // 失败（读写、序列化、加密、落盘）必须返回错误，不静默降级。
 func (s *FileStore) Save(serverURL string, tokens *Tokens) error {
 	if tokens == nil {
-		return failFastLog("保存凭据", serverURL, fmt.Errorf("tokens 为 nil"))
+		return failFastLog("save credentials", serverURL, fmt.Errorf("tokens is nil"))
 	}
 
 	creds, exists, err := s.loadCredentials()
 	if err != nil {
-		return failFastLog("保存凭据", serverURL, err)
+		return failFastLog("save credentials", serverURL, err)
 	}
 	if !exists {
 		creds = make(map[string]Tokens)
@@ -135,7 +135,7 @@ func (s *FileStore) Save(serverURL string, tokens *Tokens) error {
 	creds[serverURL] = *tokens
 
 	if err := s.storeCredentials(creds); err != nil {
-		return failFastLog("保存凭据", serverURL, err)
+		return failFastLog("save credentials", serverURL, err)
 	}
 	return nil
 }
@@ -147,7 +147,7 @@ func (s *FileStore) Save(serverURL string, tokens *Tokens) error {
 func (s *FileStore) Load(serverURL string) (*Tokens, error) {
 	creds, exists, err := s.loadCredentials()
 	if err != nil {
-		return nil, failFastLog("读取凭据", serverURL, err)
+		return nil, failFastLog("read credentials", serverURL, err)
 	}
 	if !exists {
 		return &Tokens{}, nil
@@ -166,7 +166,7 @@ func (s *FileStore) Load(serverURL string) (*Tokens, error) {
 func (s *FileStore) Delete(serverURL string) error {
 	creds, exists, err := s.loadCredentials()
 	if err != nil {
-		return failFastLog("删除凭据", serverURL, err)
+		return failFastLog("delete credentials", serverURL, err)
 	}
 	if !exists {
 		return nil
@@ -178,7 +178,7 @@ func (s *FileStore) Delete(serverURL string) error {
 	delete(creds, serverURL)
 
 	if err := s.storeCredentials(creds); err != nil {
-		return failFastLog("删除凭据", serverURL, err)
+		return failFastLog("delete credentials", serverURL, err)
 	}
 	return nil
 }
@@ -192,43 +192,43 @@ func (s *FileStore) loadCredentials() (creds map[string]Tokens, exists bool, err
 		if os.IsNotExist(err) {
 			return nil, false, nil
 		}
-		return nil, false, fmt.Errorf("读取凭据文件 %s: %w", s.filePath(), err)
+		return nil, false, fmt.Errorf("failed to read credential file %s: %w", s.filePath(), err)
 	}
 
 	var env credentialEnvelope
 	if err := json.Unmarshal(data, &env); err != nil {
-		return nil, false, fmt.Errorf("解析凭据信封: %w", err)
+		return nil, false, fmt.Errorf("failed to parse credential envelope: %w", err)
 	}
 	if env.V != credentialFormatVersion {
-		return nil, false, fmt.Errorf("不支持的凭据文件版本 %d（期望 %d）", env.V, credentialFormatVersion)
+		return nil, false, fmt.Errorf("unsupported credential file version %d (expected %d)", env.V, credentialFormatVersion)
 	}
 
 	nonce, err := base64.StdEncoding.DecodeString(env.Nonce)
 	if err != nil {
-		return nil, false, fmt.Errorf("解码 nonce: %w", err)
+		return nil, false, fmt.Errorf("failed to decode nonce: %w", err)
 	}
 	sealed, err := base64.StdEncoding.DecodeString(env.Data)
 	if err != nil {
-		return nil, false, fmt.Errorf("解码密文: %w", err)
+		return nil, false, fmt.Errorf("failed to decode ciphertext: %w", err)
 	}
 
 	block, err := aes.NewCipher(credentialEncryptionKey)
 	if err != nil {
-		return nil, false, fmt.Errorf("创建 AES cipher: %w", err)
+		return nil, false, fmt.Errorf("failed to create AES cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, false, fmt.Errorf("创建 GCM: %w", err)
+		return nil, false, fmt.Errorf("failed to create GCM: %w", err)
 	}
 
 	plaintext, err := gcm.Open(nil, nonce, sealed, nil)
 	if err != nil {
-		return nil, false, fmt.Errorf("解密凭据失败: %w", err)
+		return nil, false, fmt.Errorf("failed to decrypt credentials: %w", err)
 	}
 
 	result := make(map[string]Tokens)
 	if err := json.Unmarshal(plaintext, &result); err != nil {
-		return nil, false, fmt.Errorf("解析凭据内容: %w", err)
+		return nil, false, fmt.Errorf("failed to parse credential content: %w", err)
 	}
 	return result, true, nil
 }
@@ -238,7 +238,7 @@ func (s *FileStore) loadCredentials() (creds map[string]Tokens, exists bool, err
 func (s *FileStore) storeCredentials(creds map[string]Tokens) error {
 	plaintext, err := json.Marshal(creds)
 	if err != nil {
-		return fmt.Errorf("序列化凭据内容: %w", err)
+		return fmt.Errorf("failed to serialize credential content: %w", err)
 	}
 
 	env, err := sealCredentials(plaintext)
@@ -254,16 +254,16 @@ func (s *FileStore) storeCredentials(creds map[string]Tokens) error {
 func sealCredentials(plaintext []byte) (*credentialEnvelope, error) {
 	block, err := aes.NewCipher(credentialEncryptionKey)
 	if err != nil {
-		return nil, fmt.Errorf("创建 AES cipher: %w", err)
+		return nil, fmt.Errorf("failed to create AES cipher: %w", err)
 	}
 	gcm, err := cipher.NewGCM(block)
 	if err != nil {
-		return nil, fmt.Errorf("创建 GCM: %w", err)
+		return nil, fmt.Errorf("failed to create GCM: %w", err)
 	}
 
 	nonce := make([]byte, gcm.NonceSize())
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, fmt.Errorf("生成 nonce: %w", err)
+		return nil, fmt.Errorf("failed to generate nonce: %w", err)
 	}
 
 	sealed := gcm.Seal(nil, nonce, plaintext, nil)
@@ -281,17 +281,17 @@ func sealCredentials(plaintext []byte) (*credentialEnvelope, error) {
 func (s *FileStore) writeEnvelope(env *credentialEnvelope) error {
 	dir := s.dirPath()
 	if err := os.MkdirAll(dir, credentialDirPerm); err != nil {
-		return fmt.Errorf("创建凭据目录 %s: %w", dir, err)
+		return fmt.Errorf("failed to create credential directory %s: %w", dir, err)
 	}
 
 	data, err := json.Marshal(env)
 	if err != nil {
-		return fmt.Errorf("序列化凭据信封: %w", err)
+		return fmt.Errorf("failed to serialize credential envelope: %w", err)
 	}
 
 	tmp, err := os.CreateTemp(dir, credentialTempPattern)
 	if err != nil {
-		return fmt.Errorf("创建临时凭据文件: %w", err)
+		return fmt.Errorf("failed to create temporary credential file: %w", err)
 	}
 	tmpPath := tmp.Name()
 
@@ -302,7 +302,7 @@ func (s *FileStore) writeEnvelope(env *credentialEnvelope) error {
 
 	if err := os.Rename(tmpPath, s.filePath()); err != nil {
 		removeTempCredentialFile(tmpPath)
-		return fmt.Errorf("替换凭据文件 %s: %w", s.filePath(), err)
+		return fmt.Errorf("failed to replace credential file %s: %w", s.filePath(), err)
 	}
 	return nil
 }
@@ -313,15 +313,15 @@ func (s *FileStore) writeEnvelope(env *credentialEnvelope) error {
 func writeTempCredentialFile(f *os.File, data []byte) (retErr error) {
 	defer func() {
 		if closeErr := f.Close(); closeErr != nil && retErr == nil {
-			retErr = fmt.Errorf("关闭临时凭据文件: %w", closeErr)
+			retErr = fmt.Errorf("failed to close temporary credential file: %w", closeErr)
 		}
 	}()
 
 	if _, err := f.Write(data); err != nil {
-		return fmt.Errorf("写入临时凭据文件: %w", err)
+		return fmt.Errorf("failed to write temporary credential file: %w", err)
 	}
 	if err := f.Chmod(credentialFilePerm); err != nil {
-		return fmt.Errorf("设置凭据文件权限: %w", err)
+		return fmt.Errorf("failed to set credential file permissions: %w", err)
 	}
 	return nil
 }
@@ -330,6 +330,6 @@ func writeTempCredentialFile(f *os.File, data []byte) (retErr error) {
 // 引入动机：失败路径不得在运行目录留下游离临时文件；清理失败必须记录日志，不得静默吞错。
 func removeTempCredentialFile(path string) {
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-		slog.Error("清理临时凭据文件失败", "path", path, "error", err.Error())
+		slog.Error("failed to clean up temporary credential file", "path", path, "error", err.Error())
 	}
 }

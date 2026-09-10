@@ -58,7 +58,7 @@ type APIError struct {
 
 // Error 实现 error 接口。
 func (e *APIError) Error() string {
-	return fmt.Sprintf("API 错误 %d: %s", e.StatusCode, e.Message)
+	return fmt.Sprintf("API error %d: %s", e.StatusCode, e.Message)
 }
 
 // IsNotFound 判断是否为 404 错误。
@@ -136,7 +136,7 @@ func NewClient(serverURL string, credStore CredentialStore, allowInsecureTLS boo
 func (c *Client) LoadTokens() error {
 	tokens, err := c.credStore.Load(c.serverURL)
 	if err != nil {
-		return fmt.Errorf("加载凭据: %w", err)
+		return fmt.Errorf("load credentials: %w", err)
 	}
 	if tokens != nil && tokens.AccessToken != "" {
 		c.tokens = tokens
@@ -157,7 +157,7 @@ func (c *Client) SetTokens(tokens *CredentialTokens) {
 // SaveTokens 将当前 token 保存到凭据存储。
 func (c *Client) SaveTokens() error {
 	if c.tokens == nil {
-		return fmt.Errorf("无 token 可保存")
+		return fmt.Errorf("no token to save")
 	}
 	return c.credStore.Save(c.serverURL, c.tokens)
 }
@@ -173,7 +173,7 @@ func (c *Client) ClearTokens() error {
 // 引入动机：所有 API 调用共用此方法，统一处理 bearer token 注入和 401 自动刷新。
 func (c *Client) doRequest(ctx context.Context, method, path string, body interface{}) (*http.Response, []byte, error) {
 	if !c.IsLoggedIn() {
-		return nil, nil, fmt.Errorf("未登录，请先执行 knowledge-mcp login")
+		return nil, nil, fmt.Errorf("not logged in; run knowledge-mcp login first")
 	}
 
 	resp, respBody, err := c.executeWithToken(ctx, method, path, body, c.tokens.AccessToken)
@@ -183,9 +183,9 @@ func (c *Client) doRequest(ctx context.Context, method, path string, body interf
 
 	// 401 时尝试一次 token 刷新
 	if resp.StatusCode == http.StatusUnauthorized {
-		slog.Debug("access token 过期，尝试刷新")
+		slog.Debug("access token expired; attempting refresh")
 		if err := c.refreshToken(ctx); err != nil {
-			return nil, nil, fmt.Errorf("刷新 token 失败: %w", err)
+			return nil, nil, fmt.Errorf("failed to refresh token: %w", err)
 		}
 		// 用新 token 重试
 		return c.executeWithToken(ctx, method, path, body, c.tokens.AccessToken)
@@ -202,14 +202,14 @@ func (c *Client) executeWithToken(ctx context.Context, method, path string, body
 	if body != nil {
 		data, err := json.Marshal(body)
 		if err != nil {
-			return nil, nil, fmt.Errorf("序列化请求体: %w", err)
+			return nil, nil, fmt.Errorf("failed to serialize request body: %w", err)
 		}
 		bodyReader = bytes.NewReader(data)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, method, fullURL, bodyReader)
 	if err != nil {
-		return nil, nil, fmt.Errorf("创建请求: %w", err)
+		return nil, nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
 	req.Header.Set("Authorization", "Bearer "+accessToken)
@@ -219,13 +219,13 @@ func (c *Client) executeWithToken(ctx context.Context, method, path string, body
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, nil, fmt.Errorf("HTTP 请求失败: %w", err)
+		return nil, nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, nil, fmt.Errorf("读取响应体: %w", err)
+		return nil, nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	return resp, respBody, nil
@@ -235,38 +235,38 @@ func (c *Client) executeWithToken(ctx context.Context, method, path string, body
 // 引入动机：access token 过期后自动刷新，不需要用户重新登录。
 func (c *Client) refreshToken(ctx context.Context) error {
 	if c.tokens == nil || c.tokens.RefreshToken == "" {
-		return fmt.Errorf("无 refresh token 可用")
+		return fmt.Errorf("no refresh token available")
 	}
 
 	reqBody := map[string]string{"refresh_token": c.tokens.RefreshToken}
 	data, err := json.Marshal(reqBody)
 	if err != nil {
-		return fmt.Errorf("序列化 refresh 请求: %w", err)
+		return fmt.Errorf("failed to serialize refresh request: %w", err)
 	}
 
 	fullURL := c.serverURL + "/api/auth/refresh"
 	req, err := http.NewRequestWithContext(ctx, "POST", fullURL, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("创建 refresh 请求: %w", err)
+		return fmt.Errorf("failed to create refresh request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("refresh 请求失败: %w", err)
+		return fmt.Errorf("refresh request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("读取 refresh 响应体: %w", err)
+		return fmt.Errorf("failed to read refresh response body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		slog.Error("token 刷新失败", "status", resp.StatusCode)
+		slog.Error("token refresh failed", "status", resp.StatusCode)
 		c.tokens = nil
 		_ = c.credStore.Delete(c.serverURL)
-		return fmt.Errorf("refresh 失败 (HTTP %d)", resp.StatusCode)
+		return fmt.Errorf("refresh failed (HTTP %d)", resp.StatusCode)
 	}
 
 	var refreshResp struct {
@@ -274,11 +274,11 @@ func (c *Client) refreshToken(ctx context.Context) error {
 		RefreshToken string `json:"refresh_token"`
 	}
 	if err := json.Unmarshal(respBody, &refreshResp); err != nil {
-		return fmt.Errorf("解析 refresh 响应: %w", err)
+		return fmt.Errorf("failed to parse refresh response: %w", err)
 	}
 
 	if refreshResp.AccessToken == "" {
-		return fmt.Errorf("refresh 响应缺少 access_token")
+		return fmt.Errorf("refresh response is missing access_token")
 	}
 
 	c.tokens.AccessToken = refreshResp.AccessToken
@@ -288,8 +288,8 @@ func (c *Client) refreshToken(ctx context.Context) error {
 
 	// 持久化新 token
 	if err := c.credStore.Save(c.serverURL, c.tokens); err != nil {
-		slog.Error("持久化刷新后的 token 失败", "error", err)
-		return fmt.Errorf("持久化 token: %w", err)
+		slog.Error("failed to persist refreshed token", "error", err)
+		return fmt.Errorf("failed to persist token: %w", err)
 	}
 
 	return nil
@@ -304,33 +304,33 @@ func (c *Client) DeviceAuthStart(ctx context.Context, deviceName string) (*Devic
 	reqBody := map[string]string{"device_name": deviceName}
 	data, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("序列化请求: %w", err)
+		return nil, fmt.Errorf("failed to serialize request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", fullURL, bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("创建请求: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP 请求失败: %w", err)
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取响应体: %w", err)
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("device auth start 失败 (HTTP %d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("device auth start failed (HTTP %d): %s", resp.StatusCode, string(respBody))
 	}
 
 	var result DeviceAuthStartResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("解析响应: %w", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	return &result, nil
@@ -362,29 +362,29 @@ func (c *Client) DeviceAuthPoll(ctx context.Context, deviceCode string) (*Device
 	reqBody := map[string]string{"device_code": deviceCode}
 	data, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("序列化请求: %w", err)
+		return nil, fmt.Errorf("failed to serialize request: %w", err)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, "POST", fullURL, bytes.NewReader(data))
 	if err != nil {
-		return nil, fmt.Errorf("创建请求: %w", err)
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("HTTP 请求失败: %w", err)
+		return nil, fmt.Errorf("HTTP request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
 	respBody, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取响应体: %w", err)
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
 	var result DeviceAuthPollResponse
 	if err := json.Unmarshal(respBody, &result); err != nil {
-		return nil, fmt.Errorf("解析响应: %w", err)
+		return nil, fmt.Errorf("failed to parse response: %w", err)
 	}
 
 	// 根据状态码判断结果
@@ -406,7 +406,7 @@ func (c *Client) DeviceAuthPoll(ctx context.Context, deviceCode string) (*Device
 		// device code 过期
 		return &result, ErrDeviceCodeExpired
 	default:
-		return nil, fmt.Errorf("device auth poll 失败 (HTTP %d): %s", resp.StatusCode, string(respBody))
+		return nil, fmt.Errorf("device auth poll failed (HTTP %d): %s", resp.StatusCode, string(respBody))
 	}
 }
 
@@ -430,11 +430,11 @@ type DeviceAuthPollResponse struct {
 
 // 授权状态错误
 var (
-	ErrPendingAuthorization  = fmt.Errorf("授权待批准")
-	ErrAuthorizationDenied   = fmt.Errorf("用户拒绝了授权")
-	ErrDeviceCodeExpired     = fmt.Errorf("device code 已过期")
+	ErrPendingAuthorization  = fmt.Errorf("authorization pending")
+	ErrAuthorizationDenied   = fmt.Errorf("user denied authorization")
+	ErrDeviceCodeExpired     = fmt.Errorf("device code expired")
 	// ErrAuthorizationCompleted 表示授权已被一次性交换完成（另一 poll 已领取 token）。
-	ErrAuthorizationCompleted = fmt.Errorf("device authorization 已完成交换")
+	ErrAuthorizationCompleted = fmt.Errorf("device authorization already exchanged")
 )
 
 // statusPending 是待处理的 HTTP 状态码（HTTP 202 Accepted）。
@@ -506,7 +506,7 @@ func (c *Client) Delete(ctx context.Context, path string) error {
 func (c *Client) RevokeSession(ctx context.Context) error {
 	resp, respBody, err := c.doRequest(ctx, "POST", "/api/auth/revoke", nil)
 	if err != nil {
-		return fmt.Errorf("revoke 请求失败: %w", err)
+		return fmt.Errorf("revoke request failed: %w", err)
 	}
 	if resp.StatusCode >= 400 {
 		return &APIError{
@@ -539,7 +539,7 @@ func parseResponse(resp *http.Response, body []byte, result interface{}) error {
 		if unmarshalErr := json.Unmarshal(body, &errResp); unmarshalErr != nil {
 			// error body 不是合法 JSON——记录 debug 级日志（不记录 body 正文/token）
 			// 引入动机：design 要求不可静默丢错，但也不能在日志中泄露敏感信息。
-			slog.Debug("error body 非 JSON，使用 fallback", "status_code", resp.StatusCode, "parse_error", unmarshalErr.Error())
+			slog.Debug("error body is not JSON; using fallback", "status_code", resp.StatusCode, "parse_error", unmarshalErr.Error())
 			// 安全 fallback：使用 HTTP 状态码作为错误信息
 			msg := fmt.Sprintf("HTTP %d", resp.StatusCode)
 			return &APIError{
@@ -561,7 +561,7 @@ func parseResponse(resp *http.Response, body []byte, result interface{}) error {
 
 	if result != nil && len(body) > 0 {
 		if err := json.Unmarshal(body, result); err != nil {
-			return fmt.Errorf("解析响应 JSON: %w", err)
+			return fmt.Errorf("failed to parse response JSON: %w", err)
 		}
 	}
 
