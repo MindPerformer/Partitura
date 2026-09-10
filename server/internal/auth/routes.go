@@ -18,6 +18,7 @@ import (
 //   - POST /api/auth/device/authorize — 需认证 + CSRF
 //   - POST /api/auth/refresh          — 公开（需 refresh token）
 //   - POST /api/auth/revoke           — 需认证 + CSRF
+//   - GET  /api/auth/device/sessions  — 需认证，列出当前用户设备会话
 //
 // middleware 链（请求进入顺序）：
 //   - AuthMiddleware：解析 cookie session 或 bearer token，设置 Identity
@@ -59,4 +60,9 @@ func RegisterRoutes(mux *http.ServeMux, handler *Handler, repo Repository, cfg A
 	mux.Handle("POST /api/auth/logout", protected)
 	mux.Handle("POST /api/auth/device/authorize", protected)
 	mux.Handle("POST /api/auth/revoke", protected)
+
+	// 设备会话列表只需要认证，不涉及状态变更，因此不需要 CSRF。
+	mux.Handle("GET /api/auth/device/sessions",
+		AuthMiddleware(repo, cfg)(RequireAuth(http.HandlerFunc(handler.ListDeviceSessions))),
+	)
 }

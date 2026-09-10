@@ -13,8 +13,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -55,10 +58,18 @@ func newFakeServer() *fakeServer {
 // recordMiddleware 记录请求信息。
 func (fs *fakeServer) recordMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "failed to read request body", http.StatusInternalServerError)
+			return
+		}
+		r.Body.Close()
+		r.Body = io.NopCloser(strings.NewReader(string(body)))
 		fs.requests = append(fs.requests, recordedRequest{
 			Method: r.Method,
 			Path:   r.URL.Path,
 			Auth:   r.Header.Get("Authorization"),
+			Body:   string(body),
 		})
 		next(w, r)
 	}
@@ -141,7 +152,7 @@ func TestProjectToolsRejectWithoutSwitch(t *testing.T) {
 	projectTools := []string{
 		"document_list", "document_outline", "document_read", "document_read_section",
 		"document_read_lines", "document_history", "document_revision",
-		"document_create", "document_patch", "document_replace", "document_move",
+		"document_create", "document_patch", "document_replace", "upload_document_file", "document_move",
 		"document_archive", "knowledge_search", "source_attach", "workspace_bootstrap",
 	}
 
@@ -613,6 +624,137 @@ func TestBootstrapContextLimit(t *testing.T) {
 	text := result.Content[0].Text
 	if !strings.Contains(text, "已截断") {
 		t.Errorf("bootstrap 结果应包含截断标记: %s", text[:min(200, len(text))])
+	}
+}
+
+// --- upload_document_file ---
+
+func TestUploadDocumentFileCreatesDocumentFromLocalFile(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+
+	var receivedBody map[string]interface{}
+	fs.mux.HandleFunc("POST /api/workspaces/ws-1/documents", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			t.Fatalf("解析上传请求失败: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"path":"notes/imported.md","title":"Imported file","revision_number":1}`))
+	}))
+
+	localDir := t.TempDir()
+	localPath := filepath.Join(localDir, "nested", "source.md")
+	if err := os.MkdirAll(filepath.Dir(localPath), 0755); err != nil {
+		t.Fatalf("创建测试目录失败: %v", err)
+	}
+	content := "# Uploaded\\n\\nContent from local file.\\n"
+	if err := os.WriteFile(localPath, []byte(content), 0644); err != nil {
+		t.Fatalf("写入测试文件失败: %v", err)
+	}
+
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	args, err := json.Marshal(map[string]string{
+		"path":      "notes/imported.md",
+		"file_path": localPath,
+	})
+	if err != nil {
+		t.Fatalf("序列化参数失败: %v", err)
+	}
+
+	result, err := callToolByName(r, "upload_document_file", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("上传失败: %s", result.Content[0].Text)
+	}
+	if receivedBody["path"] != "notes/imported.md" || receivedBody["title"] != "source" {
+		t.Fatalf("路径或默认标题错误: %#v", receivedBody)
+	}
+	if receivedBody["content_markdown"] != content {
+		t.Fatalf("上传正文 = %#v, 期望 %#v", receivedBody["content_markdown"], content)
+	}
+	if len(fs.requests) != 1 || fs.requests[0].Method != http.MethodPost {
+		t.Fatalf("上传应只调用一次 POST 创建接口: %#v", fs.requests)
+	}
+	if fs.requests[0].Auth != "Bearer test-access-token" {
+		t.Fatalf("Authorization = %q", fs.requests[0].Auth)
+	}
+}
+
+func TestUploadDocumentFileRejectsInvalidLocalFiles(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+
+	tests := []struct {
+		name     string
+		filePath string
+		wantText string
+	}{
+		{name: "missing", filePath: filepath.Join(t.TempDir(), "missing.md"), wantText: "failed to stat local file"},
+		{name: "directory", filePath: t.TempDir(), wantText: "must refer to a regular file"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			args, err := json.Marshal(map[string]string{"path": "notes/existing.md", "file_path": tc.filePath})
+			if err != nil {
+				t.Fatalf("序列化参数失败: %v", err)
+			}
+			result, err := callToolByName(r, "upload_document_file", args)
+			if err != nil {
+				t.Fatalf("意外错误: %v", err)
+			}
+			if !result.IsError || !strings.Contains(result.Content[0].Text, tc.wantText) {
+				t.Fatalf("错误结果 = %#v", result)
+			}
+		})
+	}
+
+	invalidPath := filepath.Join(t.TempDir(), "invalid.md")
+	if err := os.WriteFile(invalidPath, []byte{0xff, 0xfe}, 0644); err != nil {
+		t.Fatalf("写入无效文件失败: %v", err)
+	}
+	args, _ := json.Marshal(map[string]string{"path": "notes/existing.md", "file_path": invalidPath})
+	result, err := callToolByName(r, "upload_document_file", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "valid UTF-8") {
+		t.Fatalf("无效 UTF-8 错误结果 = %#v", result)
+	}
+	if len(fs.requests) != 0 {
+		t.Fatalf("本地文件校验失败后不应发起请求: %#v", fs.requests)
+	}
+}
+
+func TestUploadDocumentFileRejectsExistingDestination(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	fs.mux.HandleFunc("POST /api/workspaces/ws-1/documents", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"error":"目标路径已存在"}`))
+	}))
+
+	localPath := filepath.Join(t.TempDir(), "source.md")
+	if err := os.WriteFile(localPath, []byte("# Content\\n"), 0644); err != nil {
+		t.Fatalf("写入测试文件失败: %v", err)
+	}
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	args, _ := json.Marshal(map[string]string{"path": "notes/existing.md", "file_path": localPath})
+	result, err := callToolByName(r, "upload_document_file", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "never overwrites") {
+		t.Fatalf("已存在目标错误结果 = %#v", result)
+	}
+	if len(fs.requests) != 1 || fs.requests[0].Method != http.MethodPost {
+		t.Fatalf("目标冲突应只调用创建接口: %#v", fs.requests)
 	}
 }
 

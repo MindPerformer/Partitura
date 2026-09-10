@@ -31,6 +31,9 @@ const MCPGuidance = `# Knowledge Workspace MCP — Agent 工作约束
 ## 文档修改策略
 - 修改前先 document_read 获取当前 revision 和 hash。
 - document_patch 前确认 revision/hash，避免并发冲突。
+- Use upload_document_file to import an existing local Markdown file into the active workspace.
+- upload_document_file creates a new workspace document and never overwrites an existing destination path.
+- Its file_path is interpreted by the machine running MCP using native absolute or relative path rules.
 - 冲突后重新 read 获取最新内容再修改。
 - 不保存 chain-of-thought、临时 debug 噪声。
 - 不复制完整源码到知识库。

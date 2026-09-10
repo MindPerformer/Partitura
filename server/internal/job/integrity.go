@@ -40,10 +40,10 @@ type IntegrityIssue struct {
 
 // IntegrityResult 是完整性检查结果。
 type IntegrityResult struct {
-	Issues     []IntegrityIssue
-	TotalPG    int
-	TotalES    int
-	CheckedOK  bool
+	Issues    []IntegrityIssue
+	TotalPG   int
+	TotalES   int
+	CheckedOK bool
 }
 
 // DocumentForIndex 是从 PG 读取的用于索引的文档信息。
@@ -493,8 +493,8 @@ func readESDocumentMeta(ctx context.Context, esClient es.Client, indexName, work
 		"aggs": map[string]interface{}{
 			"doc_ids": map[string]interface{}{
 				"terms": map[string]interface{}{
-					"field":  "document_id",
-					"size":   100000, // 足够大的 bucket 数量
+					"field": "document_id",
+					"size":  100000, // 足够大的 bucket 数量
 				},
 				"aggs": map[string]interface{}{
 					"chunk_count": map[string]interface{}{
@@ -594,12 +594,12 @@ func readESDocumentMeta(ctx context.Context, esClient es.Client, indexName, work
 // 引入动机：design/05-OPERATIONS.md §Background Jobs 要求支持 index_document, rebuild_index, repair_index 等任务。
 // design/03-DOCUMENTS.md §Revision 要求定时清理历史 snapshot，即 cleanup_revisions 任务。
 type IndexJobHandler struct {
-	db        *sql.DB
-	esClient  es.Client
+	db       *sql.DB
+	esClient es.Client
 	// embEmbed 用于生成 embedding 向量（C5）
-	embEmbed  func(ctx context.Context, texts []string) ([][]float32, error)
-	// embAvailable 检查 embedding provider 是否可用
-	embAvailable func(ctx context.Context) bool
+	embEmbed func(ctx context.Context, texts []string) ([][]float32, error)
+	// embConfigured 判断 provider 是否已配置，不执行网络型健康检查。
+	embConfigured func(ctx context.Context) bool
 	// profileRepo 用于获取 active profile
 	profileRepo ProfileRepo
 	// revisionCleanupRepo 用于清理过期 revision
@@ -629,27 +629,28 @@ type RevisionCleanupRepo interface {
 // Analyzer 字段引入动机：Phase 6 修复要求 rebuild_index 从 active profile
 // 获取 analyzer 配置以创建正确的 ES index mapping，而非依赖 ES auto-create。
 type ProfileForJob struct {
-	ID                   string
-	ESIndexName          string
-	ChunkTargetSize      int
-	ChunkOverlap         int
-	EmbeddingDimensions  int
+	ID                        string
+	ESIndexName               string
+	ChunkTargetSize           int
+	ChunkOverlap              int
+	EmbeddingDimensions       int
 	EmbeddingQueryInstruction string
 	EmbeddingDocInstruction   string
 	// Analyzer 是 ES 索引的分析器名称（如 "standard"），用于创建 index mapping。
-	Analyzer                  string
+	Analyzer string
 }
 
 // NewIndexJobHandler 创建索引任务处理器。
 // 引入动机：C5 要求 index job 实际生成 embedding，需要注入 embedding provider 和 profile repo。
-// embEmbed 和 embAvailable 从 embedding.Provider 接口适配，避免 job 包导入 embedding 包。
+// embEmbed 和 embConfigured 从 embedding.Provider 接口适配，避免 job 包导入 embedding 包。
+// embConfigured 只表示 provider 已配置，不执行网络健康检查。
 // revisionCleanupRepo 用于 cleanup_revisions job，可为 nil（当 revision 清理未启用时）。
-func NewIndexJobHandler(db *sql.DB, esClient es.Client, embEmbed func(ctx context.Context, texts []string) ([][]float32, error), embAvailable func(ctx context.Context) bool, profileRepo ProfileRepo, revisionCleanupRepo RevisionCleanupRepo) *IndexJobHandler {
+func NewIndexJobHandler(db *sql.DB, esClient es.Client, embEmbed func(ctx context.Context, texts []string) ([][]float32, error), embConfigured func(ctx context.Context) bool, profileRepo ProfileRepo, revisionCleanupRepo RevisionCleanupRepo) *IndexJobHandler {
 	return &IndexJobHandler{
 		db:                  db,
 		esClient:            esClient,
 		embEmbed:            embEmbed,
-		embAvailable:        embAvailable,
+		embConfigured:       embConfigured,
 		profileRepo:         profileRepo,
 		revisionCleanupRepo: revisionCleanupRepo,
 	}
@@ -721,14 +722,14 @@ func (h *IndexJobHandler) handleIndexDocument(ctx context.Context, job *Job) err
 
 	// 构建 embedding 函数
 	//
-	// 修复说明：当 Provider 健康（embAvailable 返回 true）但 profileConfig 为 nil 时，
+	// 修复说明：当 Provider 已配置（embConfigured 返回 true）但 profileConfig 为 nil 时，
 	// 原实现将 embFunc 设为 nil 并静默完成无向量索引。这违反设计要求：
-	// "index_document 不得在 Provider 健康却未生成向量时静默完成"。
-	// 现在当 Provider 健康但无法生成向量时（profileConfig 为 nil），明确返回错误。
+	// "index_document 不得在 Provider 已配置却未生成向量时静默完成"。
+	// embConfigured 仅用于判断是否配置，不执行网络健康检查；正式可用性由 Embed 结果决定。
 	var embFunc embeddingProviderFunc
-	if h.embEmbed != nil && h.embAvailable != nil && h.embAvailable(ctx) {
+	if h.embEmbed != nil && h.embConfigured != nil && h.embConfigured(ctx) {
 		if profileConfig == nil {
-			return fmt.Errorf("embedding provider 健康但无法获取 active profile 配置，无法生成向量")
+			return fmt.Errorf("embedding provider 已配置但无法获取 active profile 配置，无法生成向量")
 		}
 		embFunc = h.embEmbed
 	}
@@ -800,10 +801,10 @@ func (h *IndexJobHandler) ensureAliasAndIndex(ctx context.Context, dimensions in
 // integrity validation → alias 原子切换 → PG 持久 profile indexname/status。
 //
 // Phase 6 修复：
-// - 目标索引不存在时，使用 active profile 的 dimensions 和 analyzer 显式创建正确 mapping，
-//   绝不依赖 ES auto-create 或手动预建。
-// - 索引已存在时不重复创建，直接使用。
-// - alias 切换使用 ES8 兼容的嵌套 JSON 格式（通过 AliasAction.MarshalJSON 实现）。
+//   - 目标索引不存在时，使用 active profile 的 dimensions 和 analyzer 显式创建正确 mapping，
+//     绝不依赖 ES auto-create 或手动预建。
+//   - 索引已存在时不重复创建，直接使用。
+//   - alias 切换使用 ES8 兼容的嵌套 JSON 格式（通过 AliasAction.MarshalJSON 实现）。
 func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) error {
 	indexName, _ := job.Payload["index_name"].(string)
 	workspaceID, _ := job.Payload["workspace_id"].(string)
@@ -860,14 +861,15 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 
 	// 构建 embedding 函数
 	//
-	// 修复说明：当 Provider 健康（embAvailable 返回 true）但 profileConfig 为 nil 时，
+	// 修复说明：当 Provider 已配置（embConfigured 返回 true）但 profileConfig 为 nil 时，
 	// 原实现将 embFunc 设为 nil 并静默完成无向量索引。这违反设计要求：
 	// "Provider 已配置且调用失败时 index_document 应失败/重试，不能产生无向量 completed job"。
-	// 现在当 Provider 健康但无法生成向量时（profileConfig 为 nil），明确返回错误。
+	// 现在当 Provider 已配置但无法生成向量时（profileConfig 为 nil），明确返回错误。
+	// embConfigured 仅用于判断是否配置，不执行网络健康检查；正式可用性由 Embed 结果决定。
 	var embFunc embeddingProviderFunc
-	if h.embEmbed != nil && h.embAvailable != nil && h.embAvailable(ctx) {
+	if h.embEmbed != nil && h.embConfigured != nil && h.embConfigured(ctx) {
 		if profileConfig == nil {
-			return fmt.Errorf("embedding provider 健康但无法获取 active profile 配置，无法生成向量")
+			return fmt.Errorf("embedding provider 已配置但无法获取 active profile 配置，无法生成向量")
 		}
 		embFunc = h.embEmbed
 	}
@@ -995,9 +997,9 @@ func (h *IndexJobHandler) handleRepairIndex(ctx context.Context, job *Job) error
 
 	// 构建 embedding 函数
 	var embFunc embeddingProviderFunc
-	if h.embEmbed != nil && h.embAvailable != nil && h.embAvailable(ctx) {
+	if h.embEmbed != nil && h.embConfigured != nil && h.embConfigured(ctx) {
 		if profileConfig == nil {
-			return fmt.Errorf("embedding provider 健康但无法获取 active profile 配置，无法生成向量")
+			return fmt.Errorf("embedding provider 已配置但无法获取 active profile 配置，无法生成向量")
 		}
 		embFunc = h.embEmbed
 	}

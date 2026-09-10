@@ -18,8 +18,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -92,7 +95,9 @@ type Client interface {
 // 引入动机：ES _aliases API 使用 actions 数组进行原子操作。
 //
 // ES8 要求的 JSON 格式为嵌套结构：
-//   {"actions":[{"add":{"index":"knowledge_v1","alias":"knowledge_current"}}]}
+//
+//	{"actions":[{"add":{"index":"knowledge_v1","alias":"knowledge_current"}}]}
+//
 // 而非扁平结构 {"actions":[{"Action":"add","Index":"...","Alias":"..."}]}。
 // 通过自定义 MarshalJSON 实现 ES8 兼容的嵌套 JSON 格式。
 type AliasAction struct {
@@ -139,8 +144,8 @@ func (a AliasAction) MarshalJSON() ([]byte, error) {
 
 // IndexDoc 是要索引的单条文档。
 type IndexDoc struct {
-	ID     string
-	Body   map[string]interface{}
+	ID   string
+	Body map[string]interface{}
 }
 
 // SearchResponse 是 ES 搜索响应的简化结构。
@@ -359,8 +364,62 @@ func (c *HTTPClient) GetAliasIndex(ctx context.Context, alias string) (string, e
 	return "", fmt.Errorf("alias %s 响应为空", alias)
 }
 
-// BulkIndex 批量索引文档。
-// 引入动机：rebuild 和 index_document job 需要高效批量写入。
+const (
+	bulkResponseLimit   = 2 << 20
+	diagnosticBodyLimit = 4096
+	bulkErrorLogLimit   = 5
+)
+
+// bulkItemResponse 是 bulk 响应中单个操作的诊断字段。
+// 只保留 ES 返回的元数据和错误分类，避免把文档 source 写入日志。
+type bulkItemResponse struct {
+	Index  string          `json:"_index"`
+	ID     string          `json:"_id"`
+	Status int             `json:"status"`
+	Error  json.RawMessage `json:"error"`
+}
+
+// diagnosticContext 返回一次 HTTP 调用的可观测上下文，不包含请求体。
+func (c *HTTPClient) diagnosticContext(ctx context.Context, requestURL string, docCount, requestBytes int, started time.Time) []any {
+	attrs := []any{
+		"url", diagnosticURL(requestURL),
+		"documents", docCount,
+		"request_bytes", requestBytes,
+		"client_timeout", c.httpClient.Timeout,
+		"duration", time.Since(started),
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		attrs = append(attrs, "context_deadline", deadline, "context_remaining", time.Until(deadline))
+	} else {
+		attrs = append(attrs, "context_deadline", nil, "context_remaining", nil)
+	}
+	return attrs
+}
+
+// diagnosticURL 只记录 scheme/host/path，避免 URL 中的 userinfo 或 query 凭据进入日志。
+func diagnosticURL(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "<invalid-url>"
+	}
+	return (&url.URL{Scheme: parsed.Scheme, Host: parsed.Host, Path: parsed.Path}).String()
+}
+
+// diagnosticBodySummary 限制响应摘要大小，并遮蔽常见凭据字段。
+func diagnosticBodySummary(body []byte) string {
+	if len(body) > diagnosticBodyLimit {
+		body = body[:diagnosticBodyLimit]
+	}
+	text := string(body)
+	for _, key := range []string{"password", "passwd", "token", "api_key", "apikey", "authorization", "credential", "secret"} {
+		re := regexp.MustCompile(`(?i)([\"']?` + regexp.QuoteMeta(key) + `[\"']?\s*[:=]\s*[\"']?)[^,}\"']+`)
+		text = re.ReplaceAllString(text, `${1}<redacted>`)
+	}
+	return text
+}
+
+// BulkIndex 批量索引文档，并在失败时记录足够的请求、响应和 item 级诊断信息。
+// 引入动机：rebuild 和 index_document job 需要高效批量写入，同时必须能定位 ES 的具体拒绝原因。
 func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []IndexDoc) error {
 	if len(docs) == 0 {
 		return nil
@@ -368,66 +427,101 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 
 	var buf bytes.Buffer
 	for _, doc := range docs {
-		// action line
 		action := map[string]interface{}{
-			"index": map[string]interface{}{
-				"_index": indexName,
-				"_id":    doc.ID,
-			},
+			"index": map[string]interface{}{"_index": indexName, "_id": doc.ID},
 		}
 		actionLine, err := json.Marshal(action)
 		if err != nil {
-			return fmt.Errorf("序列化 bulk action: %w", err)
+			return fmt.Errorf("序列化 bulk action (index=%s, doc_id=%s): %w", indexName, doc.ID, err)
 		}
 		buf.Write(actionLine)
 		buf.WriteByte('\n')
 
-		// source line
 		sourceLine, err := json.Marshal(doc.Body)
 		if err != nil {
-			return fmt.Errorf("序列化 bulk source: %w", err)
+			return fmt.Errorf("序列化 bulk source (index=%s, doc_id=%s): %w", indexName, doc.ID, err)
 		}
 		buf.Write(sourceLine)
 		buf.WriteByte('\n')
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/_bulk", bytes.NewReader(buf.Bytes()))
+	requestURL := c.baseURL + "/_bulk"
+	requestBytes := buf.Len()
+	started := time.Now()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(buf.Bytes()))
 	if err != nil {
-		return fmt.Errorf("创建 bulk 请求: %w", err)
+		attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+		slog.Error("创建 ES bulk 请求失败", append(attrs, "error", err)...)
+		return fmt.Errorf("创建 bulk 请求 (url=%s, documents=%d, request_bytes=%d): %w", diagnosticURL(requestURL), len(docs), requestBytes, err)
 	}
 	req.Header.Set("Content-Type", "application/x-ndjson")
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("执行 bulk index: %w", err)
+		attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+		slog.Error("执行 ES bulk 请求失败", append(attrs, "error", err)...)
+		return fmt.Errorf("执行 bulk index (url=%s, documents=%d, request_bytes=%d, client_timeout=%s): %w", diagnosticURL(requestURL), len(docs), requestBytes, c.httpClient.Timeout, err)
 	}
 	defer resp.Body.Close()
 
+	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, bulkResponseLimit+1))
+	attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+	attrs = append(attrs, "status", resp.StatusCode, "content_type", resp.Header.Get("Content-Type"), "body_summary", diagnosticBodySummary(responseBody))
+	if readErr != nil {
+		slog.Error("读取 ES bulk 响应失败", append(attrs, "error", readErr)...)
+		return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), resp.StatusCode, resp.Header.Get("Content-Type"), diagnosticBodySummary(responseBody), readErr)
+	}
+	if len(responseBody) > bulkResponseLimit {
+		err := fmt.Errorf("响应超过 %d 字节限制", bulkResponseLimit)
+		slog.Error("ES bulk 响应过大", append(attrs, "error", err)...)
+		return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d): %w", diagnosticURL(requestURL), resp.StatusCode, err)
+	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("bulk index 返回状态码 %d", resp.StatusCode)
+		err := fmt.Errorf("bulk index 返回状态码 %d", resp.StatusCode)
+		slog.Error("ES bulk 请求返回错误状态", append(attrs, "error", err)...)
+		return fmt.Errorf("%w (url=%s, content_type=%q, body=%q)", err, diagnosticURL(requestURL), resp.Header.Get("Content-Type"), diagnosticBodySummary(responseBody))
 	}
 
 	var bulkResp struct {
-		Errors bool `json:"errors"`
-		Items  []map[string]map[string]interface{} `json:"items"`
+		Errors bool                          `json:"errors"`
+		Items  []map[string]bulkItemResponse `json:"items"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&bulkResp); err != nil {
-		return fmt.Errorf("解析 bulk 响应: %w", err)
+	if err := json.Unmarshal(responseBody, &bulkResp); err != nil {
+		slog.Error("解析 ES bulk 响应失败", append(attrs, "error", err)...)
+		return fmt.Errorf("解析 bulk 响应 (url=%s, status=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), resp.StatusCode, resp.Header.Get("Content-Type"), diagnosticBodySummary(responseBody), err)
 	}
 
 	if bulkResp.Errors {
-		errCount := 0
+		failed := 0
+		details := make([]string, 0, bulkErrorLogLimit)
 		for _, item := range bulkResp.Items {
-			if idx, ok := item["index"]; ok {
-				if errVal, exists := idx["error"]; exists && errVal != nil {
-					errCount++
+			for operation, result := range item {
+				if len(result.Error) == 0 || string(result.Error) == "null" {
+					continue
+				}
+				failed++
+				var itemErr struct {
+					Type   string `json:"type"`
+					Reason string `json:"reason"`
+				}
+				if err := json.Unmarshal(result.Error, &itemErr); err != nil {
+					itemErr.Reason = diagnosticBodySummary(result.Error)
+				}
+				itemErr.Reason = diagnosticBodySummary([]byte(itemErr.Reason))
+				detail := fmt.Sprintf("operation=%s index=%s id=%s status=%d error.type=%s error.reason=%s", operation, result.Index, result.ID, result.Status, itemErr.Type, itemErr.Reason)
+				if len(details) < bulkErrorLogLimit {
+					details = append(details, detail)
 				}
 			}
 		}
-		slog.Error("ES bulk index 部分失败", "index", indexName, "total", len(docs), "errors", errCount)
-		return fmt.Errorf("bulk index 有 %d 个文档索引失败", errCount)
+		slog.Error("ES bulk index 部分失败", append(attrs, "index", indexName, "errors", failed, "item_errors", details)...)
+		if len(details) == 0 {
+			return fmt.Errorf("bulk index 报告 errors=true，但未找到 item 错误详情 (index=%s, documents=%d)", indexName, len(docs))
+		}
+		return fmt.Errorf("bulk index 有 %d 个文档索引失败: %s", failed, strings.Join(details, "; "))
 	}
 
+	slog.Info("ES bulk index 成功", append(attrs, "index", indexName)...)
 	return nil
 }
 
@@ -683,11 +777,11 @@ func BuildIndexMapping(dimensions int, analyzer string) map[string]interface{} {
 		},
 		"mappings": map[string]interface{}{
 			"properties": map[string]interface{}{
-				"document_id":   map[string]interface{}{"type": "keyword"},
-				"workspace_id":  map[string]interface{}{"type": "keyword"},
+				"document_id":  map[string]interface{}{"type": "keyword"},
+				"workspace_id": map[string]interface{}{"type": "keyword"},
 				// path 同时支持 BM25 text 检索和精确 keyword 过滤（H3）
 				"path": map[string]interface{}{
-					"type": "text",
+					"type":     "text",
 					"analyzer": analyzer,
 					"fields": map[string]interface{}{
 						"keyword": map[string]interface{}{
@@ -695,17 +789,17 @@ func BuildIndexMapping(dimensions int, analyzer string) map[string]interface{} {
 						},
 					},
 				},
-				"title":         map[string]interface{}{"type": "text", "analyzer": analyzer},
-				"heading":       map[string]interface{}{"type": "text", "analyzer": analyzer},
-				"section_path":  map[string]interface{}{"type": "text", "analyzer": analyzer},
-				"content":       map[string]interface{}{"type": "text", "analyzer": analyzer},
-				"start_line":    map[string]interface{}{"type": "integer"},
-				"end_line":      map[string]interface{}{"type": "integer"},
-				"chunk_index":   map[string]interface{}{"type": "integer"},
-				"content_hash":  map[string]interface{}{"type": "keyword"},
-				"revision":      map[string]interface{}{"type": "integer"},
-				"status":        map[string]interface{}{"type": "keyword"},
-				"is_special":    map[string]interface{}{"type": "boolean"},
+				"title":        map[string]interface{}{"type": "text", "analyzer": analyzer},
+				"heading":      map[string]interface{}{"type": "text", "analyzer": analyzer},
+				"section_path": map[string]interface{}{"type": "text", "analyzer": analyzer},
+				"content":      map[string]interface{}{"type": "text", "analyzer": analyzer},
+				"start_line":   map[string]interface{}{"type": "integer"},
+				"end_line":     map[string]interface{}{"type": "integer"},
+				"chunk_index":  map[string]interface{}{"type": "integer"},
+				"content_hash": map[string]interface{}{"type": "keyword"},
+				"revision":     map[string]interface{}{"type": "integer"},
+				"status":       map[string]interface{}{"type": "keyword"},
+				"is_special":   map[string]interface{}{"type": "boolean"},
 				"embedding": map[string]interface{}{
 					"type":       "dense_vector",
 					"dims":       dimensions,
@@ -723,11 +817,11 @@ func BuildIndexMapping(dimensions int, analyzer string) map[string]interface{} {
 // 保留旧索引以支持 rollback。
 //
 // 处理三种场景：
-// 1. alias 已存在并指向旧索引：原子 remove old + add new。
-// 2. alias 不存在且无同名具体索引：直接 add 创建 alias。
-// 3. alias 不存在但存在同名具体索引（如 ES 自动创建了 knowledge_current 索引）：
-//    先删除同名具体索引，再创建 alias。此场景发生在 index_document job
-//    直接向 alias 名称写入数据时 ES 自动创建了具体索引。
+//  1. alias 已存在并指向旧索引：原子 remove old + add new。
+//  2. alias 不存在且无同名具体索引：直接 add 创建 alias。
+//  3. alias 不存在但存在同名具体索引（如 ES 自动创建了 knowledge_current 索引）：
+//     先删除同名具体索引，再创建 alias。此场景发生在 index_document job
+//     直接向 alias 名称写入数据时 ES 自动创建了具体索引。
 //
 // 安全约束：删除同名具体索引前确认它不是 newIndex 本身，
 // 避免删除正在构建的新索引。删除后立即创建 alias，窗口极小。

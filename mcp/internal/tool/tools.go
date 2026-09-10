@@ -7,8 +7,8 @@
 // 工具清单：
 //   - workspace_list, workspace_current, switch_workspace, workspace_bootstrap
 //   - document_list, document_outline, document_read, document_read_section, document_read_lines
-//   - document_create, document_patch, document_replace, document_move, document_archive,
-//     document_history, document_revision
+//   - document_create, document_patch, document_replace, upload_document_file,
+//     document_move, document_archive, document_history, document_revision
 //   - knowledge_search, source_attach
 //
 // 安全原则：
@@ -25,8 +25,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"partitura/mcp/internal/cache"
 	"partitura/mcp/internal/client"
@@ -87,6 +90,7 @@ func (r *Registry) RegisterAll(server *protocol.Server) {
 	server.RegisterTool(r.documentCreateTool(), r.handleDocumentCreate)
 	server.RegisterTool(r.documentPatchTool(), r.handleDocumentPatch)
 	server.RegisterTool(r.documentReplaceTool(), r.handleDocumentReplace)
+	server.RegisterTool(r.uploadDocumentFileTool(), r.handleUploadDocumentFile)
 	server.RegisterTool(r.documentMoveTool(), r.handleDocumentMove)
 	server.RegisterTool(r.documentArchiveTool(), r.handleDocumentArchive)
 
@@ -101,13 +105,13 @@ func (r *Registry) RegisterAll(server *protocol.Server) {
 // 引入动机：测试需要直接调用工具 handler 而不经过 MCP 协议层。
 func (r *Registry) callToolForTest(name string, args json.RawMessage) (*protocol.ToolResult, error) {
 	handlers := map[string]func(json.RawMessage) (*protocol.ToolResult, error){
-		"workspace_list":      r.handleWorkspaceList,
-		"workspace_current":   r.handleWorkspaceCurrent,
-		"switch_workspace":    r.handleSwitchWorkspace,
-		"workspace_bootstrap": r.handleWorkspaceBootstrap,
-		"document_list":       r.handleDocumentList,
-		"document_outline":    r.handleDocumentOutline,
-		"document_read":       r.handleDocumentRead,
+		"workspace_list":        r.handleWorkspaceList,
+		"workspace_current":     r.handleWorkspaceCurrent,
+		"switch_workspace":      r.handleSwitchWorkspace,
+		"workspace_bootstrap":   r.handleWorkspaceBootstrap,
+		"document_list":         r.handleDocumentList,
+		"document_outline":      r.handleDocumentOutline,
+		"document_read":         r.handleDocumentRead,
 		"document_read_section": r.handleDocumentReadSection,
 		"document_read_lines":   r.handleDocumentReadLines,
 		"document_history":      r.handleDocumentHistory,
@@ -115,6 +119,7 @@ func (r *Registry) callToolForTest(name string, args json.RawMessage) (*protocol
 		"document_create":       r.handleDocumentCreate,
 		"document_patch":        r.handleDocumentPatch,
 		"document_replace":      r.handleDocumentReplace,
+		"upload_document_file":  r.handleUploadDocumentFile,
 		"document_move":         r.handleDocumentMove,
 		"document_archive":      r.handleDocumentArchive,
 		"knowledge_search":      r.handleKnowledgeSearch,
@@ -435,11 +440,11 @@ func (r *Registry) handleDocumentList(args json.RawMessage) (*protocol.ToolResul
 	}
 
 	var params struct {
-		Limit            int    `json:"limit"`
-		Offset           int    `json:"offset"`
-		Status           string `json:"status"`
-		Type             string `json:"type"`
-		IncludeArchived  bool   `json:"include_archived"`
+		Limit           int    `json:"limit"`
+		Offset          int    `json:"offset"`
+		Status          string `json:"status"`
+		Type            string `json:"type"`
+		IncludeArchived bool   `json:"include_archived"`
 	}
 	_ = parseArgs(args, &params)
 
@@ -977,6 +982,111 @@ func (r *Registry) handleDocumentReplace(args json.RawMessage) (*protocol.ToolRe
 	return jsonResult(result)
 }
 
+// uploadDocumentFileTool defines the MCP tool for creating a Workspace document from a local file.
+// Motivation: agents need to import an existing local Markdown file without copying its full content into arguments.
+func (r *Registry) uploadDocumentFileTool() *protocol.Tool {
+	return &protocol.Tool{
+		Name:        "upload_document_file",
+		Description: "Create a document in the active workspace from an existing local Markdown file. Fails if the destination path already exists; never overwrites.",
+		InputSchema: map[string]interface{}{
+			"type": "object",
+			"properties": map[string]interface{}{
+				"path": map[string]interface{}{
+					"type":        "string",
+					"description": "Destination path for the new Workspace document",
+				},
+				"file_path": map[string]interface{}{
+					"type":        "string",
+					"description": "Local file path on the machine running MCP; supports native absolute or relative paths",
+				},
+				"title": map[string]interface{}{
+					"type":        "string",
+					"description": "Document title; defaults to the local filename without its extension",
+				},
+				"type": map[string]interface{}{
+					"type":        "string",
+					"description": "Document type (optional)",
+				},
+			},
+			"required": []string{"path", "file_path"},
+		},
+	}
+}
+
+// handleUploadDocumentFile reads a local file and creates a Workspace document.
+// Motivation: importing must use document_create semantics and must not turn into an unconfirmed overwrite.
+func (r *Registry) handleUploadDocumentFile(args json.RawMessage) (*protocol.ToolResult, error) {
+	if err := r.wsState.RequireActive(); err != nil {
+		return errorResult(err.Error()), nil
+	}
+
+	var params struct {
+		Path     string `json:"path"`
+		FilePath string `json:"file_path"`
+		Title    string `json:"title"`
+		Type     string `json:"type"`
+	}
+	if err := parseArgs(args, &params); err != nil {
+		return errorResult(fmt.Sprintf("参数解析失败: %v", err)), nil
+	}
+	if params.Path == "" {
+		return errorResult("path is required"), nil
+	}
+	if params.FilePath == "" {
+		return errorResult("file_path is required"), nil
+	}
+
+	fileInfo, err := os.Stat(params.FilePath)
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to stat local file: %v", err)), nil
+	}
+	if !fileInfo.Mode().IsRegular() {
+		return errorResult("file_path must refer to a regular file"), nil
+	}
+
+	contentBytes, err := os.ReadFile(params.FilePath)
+	if err != nil {
+		return errorResult(fmt.Sprintf("failed to read local file: %v", err)), nil
+	}
+	if len(contentBytes) == 0 {
+		return errorResult("local file must not be empty"), nil
+	}
+	if !utf8.Valid(contentBytes) {
+		return errorResult("local file must contain valid UTF-8 text"), nil
+	}
+
+	if params.Title == "" {
+		baseName := filepath.Base(params.FilePath)
+		params.Title = strings.TrimSuffix(baseName, filepath.Ext(baseName))
+		if params.Title == "" {
+			return errorResult("cannot derive title from file_path; provide title explicitly"), nil
+		}
+	}
+
+	url := fmt.Sprintf("/api/workspaces/%s/documents", r.wsState.ID())
+	body := map[string]interface{}{
+		"path":             params.Path,
+		"title":            params.Title,
+		"type":             params.Type,
+		"content_markdown": string(contentBytes),
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	var result interface{}
+	if err := r.cli.Post(ctx, url, body, &result); err != nil {
+		if apiErr, ok := err.(*client.APIError); ok && apiErr.StatusCode == 409 {
+			return errorResult("destination document path already exists; upload_document_file never overwrites documents"), nil
+		}
+		return errorResult(fmt.Sprintf("failed to upload file and create document: %v", err)), nil
+	}
+
+	r.cache.Invalidate(cacheKey(r.wsState.ID(), "list"))
+	slog.Info("created document from local file", "path", params.Path, "bytes", len(contentBytes))
+	return jsonResult(result)
+}
+
 func (r *Registry) documentMoveTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_move",
@@ -1029,7 +1139,7 @@ func (r *Registry) handleDocumentMove(args json.RawMessage) (*protocol.ToolResul
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents/move?path=%s", r.wsState.ID(), params.Path)
 	body := map[string]interface{}{
-		"new_path":         params.NewPath,
+		"new_path":          params.NewPath,
 		"expected_revision": params.ExpectedRevision,
 		"expected_hash":     params.ExpectedHash,
 	}
@@ -1475,12 +1585,12 @@ func (r *Registry) handleSourceAttach(args json.RawMessage) (*protocol.ToolResul
 	}
 
 	var params struct {
-		Path               string `json:"path"`
-		SourceType         string `json:"source_type"`
-		Value              string `json:"value"`
-		Title              string `json:"title"`
-		RetrievedAt        string `json:"retrieved_at"`
-		ContentHash        string `json:"content_hash"`
+		Path                string `json:"path"`
+		SourceType          string `json:"source_type"`
+		Value               string `json:"value"`
+		Title               string `json:"title"`
+		RetrievedAt         string `json:"retrieved_at"`
+		ContentHash         string `json:"content_hash"`
 		RefreshIntervalDays int    `json:"refresh_interval_days"`
 	}
 	if err := parseArgs(args, &params); err != nil {
@@ -1507,11 +1617,11 @@ func (r *Registry) handleSourceAttach(args json.RawMessage) (*protocol.ToolResul
 
 	url := fmt.Sprintf("/api/workspaces/%s/documents/sources?path=%s", r.wsState.ID(), params.Path)
 	body := map[string]interface{}{
-		"source_type":          params.SourceType,
-		"value":                params.Value,
-		"title":                params.Title,
-		"retrieved_at":         params.RetrievedAt,
-		"content_hash":         params.ContentHash,
+		"source_type":           params.SourceType,
+		"value":                 params.Value,
+		"title":                 params.Title,
+		"retrieved_at":          params.RetrievedAt,
+		"content_hash":          params.ContentHash,
 		"refresh_interval_days": params.RefreshIntervalDays,
 	}
 

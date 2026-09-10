@@ -1,43 +1,54 @@
-<!-- pages/device-sessions.vue — API / Device Sessions
-//
-// 引入动机：design/04-WEB-API.md §页面 要求 API / Device Sessions 页面。
-// server 提供 device authorization flow（start/approve/deny/poll）和 device/authorize、revoke。
-// 但 server 没有 list device sessions 端点，因此只能展示 device authorization flow。
--->
+<!-- pages/device-sessions.vue — API / Device Sessions -->
 <script setup lang="ts">
-import type { ApiError, DeviceAuthStartResponse } from '~/types/api'
+import type { ApiError, DeviceAuthStartResponse, DeviceSession } from '~/types/api'
 
 definePageMeta({
   middleware: ['auth']
 })
 
 const { t } = useI18n()
-const { currentUser } = useAuth()
 
-// Device authorization flow
+const sessions = ref<DeviceSession[]>([])
+const sessionsLoading = ref(false)
+const sessionsError = ref<string | null>(null)
+
 const deviceName = ref('')
 const startResult = ref<DeviceAuthStartResponse | null>(null)
 const startLoading = ref(false)
 const startError = ref<string | null>(null)
 
-// Approve flow
 const userCode = ref('')
 const approveLoading = ref(false)
 const approveError = ref<string | null>(null)
 const approveSuccess = ref(false)
 
-// Revoke flow
-const revokeSessionId = ref('')
-const revokeLoading = ref(false)
-const revokeError = ref<string | null>(null)
+async function loadSessions() {
+  sessionsLoading.value = true
+  sessionsError.value = null
+  try {
+    const response = await useAuthApi().listSessions({ limit: 100 })
+    if (!Array.isArray(response.sessions) || typeof response.total !== 'number') {
+      console.error('[device-sessions] 设备会话列表响应非法', response)
+      sessions.value = []
+      sessionsError.value = t('device.invalidListResponse')
+      return
+    }
+    sessions.value = response.sessions
+  } catch (err) {
+    const apiErr = err as ApiError
+    sessionsError.value = apiErr.error || t('device.loadSessionsFailed')
+  } finally {
+    sessionsLoading.value = false
+  }
+}
+
+onMounted(loadSessions)
 
 async function handleStart() {
-  // device_name 可选：为空时服务端会生成安全 fallback。
   startLoading.value = true
   startError.value = null
   try {
-    const api = useAuthApi()
-    startResult.value = await api.deviceStart(deviceName.value)
+    startResult.value = await useAuthApi().deviceStart(deviceName.value)
   } catch (err) {
     const apiErr = err as ApiError
     startError.value = apiErr.error || t('device.startFailed')
@@ -55,8 +66,7 @@ async function handleApprove() {
   approveError.value = null
   approveSuccess.value = false
   try {
-    const api = useAuthApi()
-    await api.deviceApprove(userCode.value)
+    await useAuthApi().deviceApprove(userCode.value)
     approveSuccess.value = true
     userCode.value = ''
   } catch (err) {
@@ -70,8 +80,7 @@ async function handleApprove() {
 async function handleDeny() {
   if (!userCode.value) return
   try {
-    const api = useAuthApi()
-    await api.deviceDeny(userCode.value)
+    await useAuthApi().deviceDeny(userCode.value)
     userCode.value = ''
   } catch (err) {
     const apiErr = err as ApiError
@@ -79,23 +88,20 @@ async function handleDeny() {
   }
 }
 
-async function handleRevoke() {
-  if (!revokeSessionId.value) {
-    revokeError.value = t('device.sessionIdRequired')
-    return
-  }
-  revokeLoading.value = true
-  revokeError.value = null
+async function handleRevoke(session: DeviceSession) {
+  if (session.revoked_at || !window.confirm(t('device.revokeConfirm', { name: session.device_name }))) return
   try {
-    const api = useAuthApi()
-    await api.revoke(revokeSessionId.value)
-    revokeSessionId.value = ''
+    await useAuthApi().revoke(session.id)
+    await loadSessions()
   } catch (err) {
     const apiErr = err as ApiError
-    revokeError.value = apiErr.error || t('device.revokeFailed')
-  } finally {
-    revokeLoading.value = false
+    sessionsError.value = apiErr.error || t('device.revokeFailed')
   }
+}
+
+function formatDate(value: string): string {
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? t('common.timeUnavailable') : date.toLocaleString()
 }
 
 useHead({ title: () => t('device.title') + ' · ' + t('common.appName') })
@@ -108,22 +114,37 @@ useHead({ title: () => t('device.title') + ' · ' + t('common.appName') })
     <div class="max-w-3xl mx-auto px-4 py-8">
       <h1 class="text-2xl font-bold text-highlighted mb-6">{{ t('device.title') }}</h1>
 
-      <!-- Info banner about missing list endpoint -->
-      <div class="rounded-lg border border-info/20 bg-info/10 p-4 mb-6">
-        <div class="flex items-start gap-2 text-sm text-info">
-          <UIcon name="i-lucide-info" class="w-5 h-5 flex-shrink-0 mt-0.5" />
-          <div>
-            <p class="font-medium">{{ t('device.listNotAvailable') }}</p>
-            <p class="mt-1">{{ t('device.listNotAvailableDesc') }}</p>
-          </div>
-        </div>
-      </div>
-
-      <!-- Authorize new device -->
       <UCard class="mb-6">
         <template #header>
-          <h2 class="font-semibold">{{ t('device.authorizeNewDevice') }}</h2>
+          <div class="flex items-center justify-between">
+            <h2 class="font-semibold">{{ t('device.loggedInDevices') }}</h2>
+            <UButton size="sm" variant="outline" :loading="sessionsLoading" @click="loadSessions">{{ t('common.retry') }}</UButton>
+          </div>
         </template>
+        <ErrorDisplay v-if="sessionsError" :message="sessionsError" class="mb-3" />
+        <div v-if="sessionsLoading" class="flex justify-center py-6">
+          <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
+        </div>
+        <div v-else-if="sessions.length" class="space-y-3">
+          <div v-for="session in sessions" :key="session.id" class="rounded-lg border border-default p-4">
+            <div class="flex items-start justify-between gap-4">
+              <div class="min-w-0">
+                <p class="font-medium text-highlighted">{{ session.device_name }}</p>
+                <p class="text-xs text-muted mt-1">{{ t('device.createdAt') }}: {{ formatDate(session.created_at) }}</p>
+                <p class="text-xs text-muted">{{ t('device.expiresAt') }}: {{ formatDate(session.refresh_expires_at) }}</p>
+                <p v-if="session.revoked_at" class="text-xs text-error mt-1">{{ t('device.revokedAt') }}: {{ formatDate(session.revoked_at) }}</p>
+              </div>
+              <UButton color="error" variant="outline" size="sm" :disabled="Boolean(session.revoked_at)" @click="handleRevoke(session)">
+                {{ session.revoked_at ? t('device.revoked') : t('common.revoke') }}
+              </UButton>
+            </div>
+          </div>
+        </div>
+        <p v-else class="text-center text-muted py-6">{{ t('device.noSessions') }}</p>
+      </UCard>
+
+      <UCard class="mb-6">
+        <template #header><h2 class="font-semibold">{{ t('device.authorizeNewDevice') }}</h2></template>
         <p class="text-sm text-muted mb-4">{{ t('device.authorizeDesc') }}</p>
         <form @submit.prevent="handleStart" class="flex gap-2">
           <UInput v-model="deviceName" :placeholder="t('device.deviceNamePlaceholder')" class="flex-1" />
@@ -140,11 +161,8 @@ useHead({ title: () => t('device.title') + ' · ' + t('common.appName') })
         </div>
       </UCard>
 
-      <!-- Approve/Deny device -->
-      <UCard class="mb-6">
-        <template #header>
-          <h2 class="font-semibold">{{ t('device.approveOrDeny') }}</h2>
-        </template>
+      <UCard>
+        <template #header><h2 class="font-semibold">{{ t('device.approveOrDeny') }}</h2></template>
         <p class="text-sm text-muted mb-4">{{ t('device.approveOrDenyDesc') }}</p>
         <form @submit.prevent="handleApprove" class="space-y-3">
           <UInput v-model="userCode" :placeholder="t('device.userCodePlaceholder')" class="w-full" />
@@ -154,22 +172,7 @@ useHead({ title: () => t('device.title') + ' · ' + t('common.appName') })
           </div>
         </form>
         <ErrorDisplay v-if="approveError" :message="approveError" class="mt-3" />
-        <div v-if="approveSuccess" class="mt-3 rounded border border-success/20 bg-success/10 p-2 text-sm text-success">
-          {{ t('device.deviceApproved') }}
-        </div>
-      </UCard>
-
-      <!-- Revoke session -->
-      <UCard>
-        <template #header>
-          <h2 class="font-semibold text-error">{{ t('device.revokeDeviceSession') }}</h2>
-        </template>
-        <p class="text-sm text-muted mb-4">{{ t('device.revokeDesc') }}</p>
-        <form @submit.prevent="handleRevoke" class="flex gap-2">
-          <UInput v-model="revokeSessionId" :placeholder="t('device.sessionIdPlaceholder')" class="flex-1" />
-          <UButton type="submit" color="error" :loading="revokeLoading">{{ t('common.revoke') }}</UButton>
-        </form>
-        <ErrorDisplay v-if="revokeError" :message="revokeError" class="mt-3" />
+        <div v-if="approveSuccess" class="mt-3 rounded border border-success/20 bg-success/10 p-2 text-sm text-success">{{ t('device.deviceApproved') }}</div>
       </UCard>
     </div>
   </div>

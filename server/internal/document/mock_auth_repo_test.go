@@ -23,8 +23,8 @@ type LocalAuthMockRepository struct {
 
 	users map[string]*auth.User // key: username
 
-	sessions         map[string]*auth.SessionRecord // key: token_hash
-	sessionsByID     map[string]*auth.SessionRecord // key: session ID
+	sessions     map[string]*auth.SessionRecord // key: token_hash
+	sessionsByID map[string]*auth.SessionRecord // key: session ID
 
 	deviceSessions          map[string]*auth.DeviceSessionRecord // key: access_token_hash
 	deviceSessionsByRefresh map[string]*auth.DeviceSessionRecord // key: refresh_token_hash
@@ -172,6 +172,32 @@ func (m *LocalAuthMockRepository) GetDeviceSessionByID(ctx context.Context, devi
 	}
 	copied := *d
 	return &copied, nil
+}
+
+// ListDeviceSessions 实现 auth.Repository 接口。
+func (m *LocalAuthMockRepository) ListDeviceSessions(ctx context.Context, userID string, limit, offset int) (*auth.ListDeviceSessionsResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	sessions := make([]auth.DeviceSessionSummary, 0)
+	for _, d := range m.deviceSessionsByID {
+		if d.UserID != userID {
+			continue
+		}
+		s := auth.DeviceSessionSummary{ID: d.ID, DeviceName: d.DeviceName, ExpiresAt: d.ExpiresAt.UTC().Format(time.RFC3339), RefreshExpiresAt: d.RefreshExpiresAt.UTC().Format(time.RFC3339), CreatedAt: d.CreatedAt.UTC().Format(time.RFC3339)}
+		if d.RevokedAt.Valid {
+			revoked := d.RevokedAt.Time.UTC().Format(time.RFC3339)
+			s.RevokedAt = &revoked
+		}
+		sessions = append(sessions, s)
+	}
+	if offset > len(sessions) {
+		offset = len(sessions)
+	}
+	end := offset + limit
+	if end > len(sessions) {
+		end = len(sessions)
+	}
+	return &auth.ListDeviceSessionsResult{Sessions: sessions[offset:end], Total: len(sessions)}, nil
 }
 
 // UpdateDeviceSessionTokens 实现 auth.Repository 接口。

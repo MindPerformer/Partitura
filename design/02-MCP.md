@@ -193,6 +193,7 @@ PROJECT.md 和 AGENTS.md 不通过 search 找。
 - document_create
 - document_patch
 - document_replace
+- upload_document_file
 - document_move
 - document_archive
 - document_history
@@ -251,6 +252,22 @@ MCP 可尝试一次安全 rebase：
 否则返回 conflict。
 
 不要做复杂自动三方 merge。
+
+## upload_document_file
+
+本地 MCP 提供 `upload_document_file`，用于把运行 MCP 的本机文件内容导入当前 Workspace，并创建一个新文档。
+
+输入：
+- `path`：要创建的 Workspace 文档路径
+- `file_path`：本机已有文件路径，支持当前操作系统的绝对或相对路径
+- `title`：可选文档标题；省略时使用本地文件名（不含扩展名）
+- `type`：可选文档类型
+
+约束：
+- 必须先 `switch_workspace`。
+- 工具读取本地文件后调用 `document_create` 语义创建文档，不要求调用方复制正文参数。
+- 目标路径已存在时直接失败，**不得调用 replace，不得隐式覆盖已有文档**。
+- 本地文件必须是有效 UTF-8 文本；MCP 不持久化本地文件副本。
 
 ## MCP 配置
 

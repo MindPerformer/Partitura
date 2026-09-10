@@ -19,11 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"partitura/server/internal/search/httpdiag"
 	types "partitura/server/internal/search/types"
 )
 
@@ -58,8 +60,8 @@ type Provider interface {
 //
 // 不写死任何 provider/base URL/API key/model/dimensions，全部通过 EmbeddingConfig 传入。
 type OpenAICompatibleProvider struct {
-	config      types.EmbeddingConfig
-	httpClient  *http.Client
+	config     types.EmbeddingConfig
+	httpClient *http.Client
 }
 
 // NewOpenAICompatibleProvider 创建 OpenAI-compatible Embedding Provider。
@@ -140,6 +142,8 @@ func (p *OpenAICompatibleProvider) Embed(ctx context.Context, texts []string) ([
 // 被状态码或 Content-Type 检查拦截，不会产生 "invalid character '<'" 解析错误，
 // 且错误信息包含状态码和 Content-Type 供诊断，不泄露响应体。
 func (p *OpenAICompatibleProvider) embedBatch(ctx context.Context, texts []string) ([][]float32, error) {
+	startedAt := time.Now()
+	configuredTimeout := p.httpClient.Timeout
 	reqBody := embeddingRequest{
 		Model:      p.config.Model,
 		Input:      texts,
@@ -166,58 +170,58 @@ func (p *OpenAICompatibleProvider) embedBatch(ctx context.Context, texts []strin
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		slog.Error("embedding API 调用失败", "error", err, "model", p.config.Model)
+		httpdiag.LogFailure(ctx, slog.LevelError, "embedding API 调用失败", httpdiag.Diagnostics{
+			StartedAt: startedAt, URL: url, Model: p.config.Model, InputCount: len(texts), RequestBytes: len(body),
+			ConfiguredTimeout: configuredTimeout, RequestBody: body, Err: err, Secret: p.config.APIKey,
+		})
 		return nil, fmt.Errorf("调用 embedding API: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// 1. 非 2xx 立即失败，不尝试解析响应体
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		slog.Error("embedding API 返回非 2xx 状态码",
-			"status", resp.StatusCode,
-			"content_type", resp.Header.Get("Content-Type"),
-			"path", url,
-			"model", p.config.Model)
-		return nil, fmt.Errorf("embedding API 返回非 2xx 状态码 %d (Content-Type: %s)", resp.StatusCode, resp.Header.Get("Content-Type"))
+	responseBody, readErr := io.ReadAll(resp.Body)
+	contentType := resp.Header.Get("Content-Type")
+	baseDiag := httpdiag.Diagnostics{StartedAt: startedAt, URL: url, Model: p.config.Model, InputCount: len(texts), RequestBytes: len(body), ConfiguredTimeout: configuredTimeout, HTTPStatus: resp.StatusCode, ContentType: contentType, RequestBody: body, ResponseBody: responseBody, Secret: p.config.APIKey}
+	if readErr != nil {
+		baseDiag.Err = readErr
+		httpdiag.LogFailure(ctx, slog.LevelError, "读取 embedding API 响应失败", baseDiag)
+		return nil, fmt.Errorf("读取 embedding 响应: %w", readErr)
 	}
 
-	// 2. 检查响应 Content-Type 必须是 JSON
-	contentType := resp.Header.Get("Content-Type")
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpdiag.LogFailure(ctx, slog.LevelError, "embedding API 返回非 2xx 状态码", baseDiag)
+		return nil, fmt.Errorf("embedding API 返回非 2xx 状态码 %d (Content-Type: %s)", resp.StatusCode, contentType)
+	}
+
 	if !strings.Contains(contentType, "application/json") {
-		slog.Error("embedding API 响应 Content-Type 非 JSON",
-			"content_type", contentType,
-			"status", resp.StatusCode,
-			"path", url,
-			"model", p.config.Model)
+		httpdiag.LogFailure(ctx, slog.LevelError, "embedding API 响应 Content-Type 非 JSON", baseDiag)
 		return nil, fmt.Errorf("embedding API 响应 Content-Type 非 JSON: %s (状态码 %d)", contentType, resp.StatusCode)
 	}
 
-	// 3. JSON 解码响应体
 	var result embeddingResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		slog.Error("解析 embedding JSON 响应失败",
-			"error", err,
-			"status", resp.StatusCode,
-			"content_type", contentType,
-			"model", p.config.Model)
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		baseDiag.Err = err
+		httpdiag.LogFailure(ctx, slog.LevelError, "解析 embedding JSON 响应失败", baseDiag)
 		return nil, fmt.Errorf("解析 embedding 响应: %w", err)
 	}
 
 	// 4. 检查 API 级别 error 字段
 	if result.Error != nil {
-		slog.Error("embedding API 返回错误", "message", result.Error.Message, "model", p.config.Model)
-		return nil, fmt.Errorf("embedding API 错误: %s", result.Error.Message)
+		baseDiag.Err = fmt.Errorf("%s", result.Error.Message)
+		httpdiag.LogFailure(ctx, slog.LevelError, "embedding API 返回错误", baseDiag)
+		return nil, fmt.Errorf("embedding API 错误: %s", httpdiag.RedactSensitive(result.Error.Message, p.config.APIKey))
 	}
 
 	if len(result.Data) != len(texts) {
-		slog.Error("embedding 返回向量数量不匹配", "expected", len(texts), "got", len(result.Data))
+		httpdiag.LogFailure(ctx, slog.LevelError, "embedding 返回向量数量不匹配", baseDiag)
+		slog.Error("embedding 返回向量数量不匹配详情", "expected", len(texts), "got", len(result.Data))
 		return nil, fmt.Errorf("embedding 返回向量数量不匹配: expected %d, got %d", len(texts), len(result.Data))
 	}
 
 	vectors := make([][]float32, len(result.Data))
 	for i, d := range result.Data {
 		if len(d.Embedding) != p.config.Dimensions {
-			slog.Error("embedding 向量维度不匹配", "expected", p.config.Dimensions, "got", len(d.Embedding))
+			httpdiag.LogFailure(ctx, slog.LevelError, "embedding 向量维度不匹配", baseDiag)
+			slog.Error("embedding 向量维度不匹配详情", "expected", p.config.Dimensions, "got", len(d.Embedding))
 			return nil, fmt.Errorf("embedding 向量维度不匹配: expected %d, got %d", p.config.Dimensions, len(d.Embedding))
 		}
 		vectors[i] = d.Embedding

@@ -58,6 +58,24 @@ export interface DeviceAuthInfoResponse {
   expires_in: number
 }
 
+/** GET /api/auth/device/sessions 响应中的设备会话元数据。 */
+export interface DeviceSession {
+  id: string
+  device_name: string
+  expires_at: string
+  refresh_expires_at: string
+  created_at: string
+  revoked_at?: string
+}
+
+/** GET /api/auth/device/sessions 响应。 */
+export interface ListDeviceSessionsResponse {
+  sessions: DeviceSession[]
+  total: number
+  limit: number
+  offset: number
+}
+
 // ============================================================
 // Workspace
 // ============================================================

@@ -19,11 +19,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"time"
 
+	"partitura/server/internal/search/httpdiag"
 	types "partitura/server/internal/search/types"
 )
 
@@ -50,8 +52,8 @@ type Provider interface {
 // 引入动机：design/01-SEARCH.md §Reranker Provider 要求在线 API，
 // 支持 OpenAI-compatible reranker API 格式。
 type HTTPProvider struct {
-	config      types.RerankerConfig
-	httpClient  *http.Client
+	config     types.RerankerConfig
+	httpClient *http.Client
 }
 
 // NewHTTPProvider 创建 Reranker HTTP Provider。
@@ -83,8 +85,8 @@ type rerankerRequest struct {
 // rerankerResponse 是 reranker API 的响应体。
 type rerankerResponse struct {
 	Results []struct {
-		Index    int     `json:"index"`
-		Score    float64 `json:"relevance_score"`
+		Index int     `json:"index"`
+		Score float64 `json:"relevance_score"`
 	} `json:"results"`
 	Error *struct {
 		Message string `json:"message"`
@@ -93,6 +95,8 @@ type rerankerResponse struct {
 
 // Rerank 对候选文本列表按与 query 的相关性进行重排序。
 func (p *HTTPProvider) Rerank(ctx context.Context, query string, candidates []types.RerankerCandidate) ([]types.RerankerResult, error) {
+	startedAt := time.Now()
+	configuredTimeout := p.httpClient.Timeout
 	if len(candidates) == 0 {
 		return nil, nil
 	}
@@ -138,56 +142,49 @@ func (p *HTTPProvider) Rerank(ctx context.Context, query string, candidates []ty
 
 	resp, err := p.httpClient.Do(req)
 	if err != nil {
-		slog.Warn("reranker API 调用失败，将降级为 RRF 结果", "error", err, "model", p.config.Model)
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "reranker API 调用失败，将降级为 RRF 结果", httpdiag.Diagnostics{
+			StartedAt: startedAt, URL: url, Model: p.config.Model, InputCount: len(candidates), RequestBytes: len(body),
+			ConfiguredTimeout: configuredTimeout, RequestBody: body, Err: err, Secret: p.config.APIKey,
+		})
 		return nil, fmt.Errorf("调用 reranker API: %w", err)
 	}
 	defer resp.Body.Close()
 
-	// 1. 非 2xx 立即失败，不尝试解析响应体
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		slog.Warn("reranker API 返回非 2xx 状态码，将降级为 RRF 结果",
-			"status", resp.StatusCode,
-			"content_type", resp.Header.Get("Content-Type"),
-			"path", url,
-			"model", p.config.Model)
-		return nil, fmt.Errorf("reranker API 返回非 2xx 状态码 %d (Content-Type: %s)", resp.StatusCode, resp.Header.Get("Content-Type"))
+	responseBody, readErr := io.ReadAll(resp.Body)
+	contentType := resp.Header.Get("Content-Type")
+	baseDiag := httpdiag.Diagnostics{StartedAt: startedAt, URL: url, Model: p.config.Model, InputCount: len(candidates), RequestBytes: len(body), ConfiguredTimeout: configuredTimeout, HTTPStatus: resp.StatusCode, ContentType: contentType, RequestBody: body, ResponseBody: responseBody, Secret: p.config.APIKey}
+	if readErr != nil {
+		baseDiag.Err = readErr
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "读取 reranker API 响应失败，将降级为 RRF 结果", baseDiag)
+		return nil, fmt.Errorf("读取 reranker 响应: %w", readErr)
 	}
 
-	// 2. 检查响应 Content-Type 必须是 JSON
-	contentType := resp.Header.Get("Content-Type")
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "reranker API 返回非 2xx 状态码，将降级为 RRF 结果", baseDiag)
+		return nil, fmt.Errorf("reranker API 返回非 2xx 状态码 %d (Content-Type: %s)", resp.StatusCode, contentType)
+	}
+
 	if !strings.Contains(contentType, "application/json") {
-		slog.Warn("reranker API 响应 Content-Type 非 JSON，将降级为 RRF 结果",
-			"content_type", contentType,
-			"status", resp.StatusCode,
-			"path", url,
-			"model", p.config.Model)
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "reranker API 响应 Content-Type 非 JSON，将降级为 RRF 结果", baseDiag)
 		return nil, fmt.Errorf("reranker API 响应 Content-Type 非 JSON: %s (状态码 %d)", contentType, resp.StatusCode)
 	}
 
-	// 3. JSON 解码响应体
 	var result rerankerResponse
-	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-		slog.Warn("解析 reranker JSON 响应失败，将降级为 RRF 结果",
-			"error", err,
-			"status", resp.StatusCode,
-			"content_type", contentType,
-			"path", url)
+	if err := json.Unmarshal(responseBody, &result); err != nil {
+		baseDiag.Err = err
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "解析 reranker JSON 响应失败，将降级为 RRF 结果", baseDiag)
 		return nil, fmt.Errorf("解析 reranker 响应: %w", err)
 	}
 
 	// 4. 检查 API 级别 error 字段
 	if result.Error != nil {
-		slog.Warn("reranker API 返回错误，将降级为 RRF 结果",
-			"message", result.Error.Message,
-			"path", url,
-			"model", p.config.Model)
-		return nil, fmt.Errorf("reranker API 错误: %s", result.Error.Message)
+		baseDiag.Err = fmt.Errorf("%s", result.Error.Message)
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "reranker API 返回错误，将降级为 RRF 结果", baseDiag)
+		return nil, fmt.Errorf("reranker API 错误: %s", httpdiag.RedactSensitive(result.Error.Message, p.config.APIKey))
 	}
 
 	if len(result.Results) == 0 {
-		slog.Warn("reranker 返回空结果，将降级为 RRF 结果",
-			"path", url,
-			"model", p.config.Model)
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "reranker 返回空结果，将降级为 RRF 结果", baseDiag)
 		return nil, fmt.Errorf("reranker 返回空结果")
 	}
 
@@ -196,12 +193,11 @@ func (p *HTTPProvider) Rerank(ctx context.Context, query string, candidates []ty
 	// 越界索引会导致下游 panic 或错误排序。
 	for i, r := range result.Results {
 		if r.Index < 0 || r.Index >= len(candidates) {
-			slog.Error("reranker 返回越界索引",
+			httpdiag.LogFailure(ctx, slog.LevelError, "reranker 返回越界索引", baseDiag)
+			slog.Error("reranker 返回越界索引详情",
 				"result_index", i,
 				"returned_index", r.Index,
-				"candidate_count", len(candidates),
-				"path", url,
-				"model", p.config.Model)
+				"candidate_count", len(candidates))
 			return nil, fmt.Errorf("reranker 返回越界索引: result[%d].index=%d, candidates=%d", i, r.Index, len(candidates))
 		}
 	}
@@ -210,11 +206,10 @@ func (p *HTTPProvider) Rerank(ctx context.Context, query string, candidates []ty
 	// 引入动机：某些 API 可能过滤低相关性候选而返回较少结果，
 	// 这不一定是错误，但调用方应知晓部分结果可能缺失候选。
 	if len(result.Results) < len(candidates) {
-		slog.Warn("reranker 返回部分结果",
+		httpdiag.LogFailure(ctx, slog.LevelWarn, "reranker 返回部分结果", baseDiag)
+		slog.Warn("reranker 返回部分结果详情",
 			"expected", len(candidates),
-			"got", len(result.Results),
-			"path", url,
-			"model", p.config.Model)
+			"got", len(result.Results))
 	}
 
 	// 转换为 RerankerResult

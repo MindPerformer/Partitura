@@ -142,13 +142,16 @@ var errFakeAliasNotFound = &fakeESSError{msg: "alias 不存在"}
 
 // fakeEmbeddingProvider 是测试用的可控 embedding provider。
 type fakeEmbeddingProvider struct {
-	available bool
-	dims      int
-	vectors   [][]float32
-	err       error
+	available          bool
+	dims               int
+	vectors            [][]float32
+	err                error
+	embedCallCount     int
+	availableCallCount int
 }
 
 func (p *fakeEmbeddingProvider) Embed(ctx context.Context, texts []string) ([][]float32, error) {
+	p.embedCallCount++
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -168,16 +171,22 @@ func (p *fakeEmbeddingProvider) Embed(ctx context.Context, texts []string) ([][]
 
 func (p *fakeEmbeddingProvider) Dimensions() int { return p.dims }
 
-func (p *fakeEmbeddingProvider) Available(ctx context.Context) bool { return p.available }
+func (p *fakeEmbeddingProvider) Available(ctx context.Context) bool {
+	p.availableCallCount++
+	return p.available
+}
 
 // fakeRerankerProvider 是测试用的可控 reranker provider。
 type fakeRerankerProvider struct {
-	available bool
-	results   []types.RerankerResult
-	err       error
+	available          bool
+	results            []types.RerankerResult
+	err                error
+	rerankCallCount    int
+	availableCallCount int
 }
 
 func (p *fakeRerankerProvider) Rerank(ctx context.Context, query string, candidates []types.RerankerCandidate) ([]types.RerankerResult, error) {
+	p.rerankCallCount++
 	if p.err != nil {
 		return nil, p.err
 	}
@@ -192,27 +201,30 @@ func (p *fakeRerankerProvider) Rerank(ctx context.Context, query string, candida
 	return results, nil
 }
 
-func (p *fakeRerankerProvider) Available(ctx context.Context) bool { return p.available }
+func (p *fakeRerankerProvider) Available(ctx context.Context) bool {
+	p.availableCallCount++
+	return p.available
+}
 
 func testProfile() types.SearchProfileConfig {
 	return types.SearchProfileConfig{
-		ID:                "test-profile",
-		Name:              "test",
-		Version:           1,
-		ESIndexName:       "knowledge_v1",
-		EmbeddingDimensions: 128,
-		LexicalTopK:       10,
-		VectorTopK:        10,
-		RRFK:              60,
+		ID:                     "test-profile",
+		Name:                   "test",
+		Version:                1,
+		ESIndexName:            "knowledge_v1",
+		EmbeddingDimensions:    128,
+		LexicalTopK:            10,
+		VectorTopK:             10,
+		RRFK:                   60,
 		RerankerCandidateCount: 10,
 		RerankerFinalCount:     5,
-		MaxChunksPerDocument: 3,
-		MergeAdjacentChunks:  true,
-		TitleBoost:   2.0,
-		HeadingBoost: 1.5,
-		PathBoost:    1.0,
-		TagsBoost:    0.5,
-		BodyBoost:    1.0,
+		MaxChunksPerDocument:   3,
+		MergeAdjacentChunks:    true,
+		TitleBoost:             2.0,
+		HeadingBoost:           1.5,
+		PathBoost:              1.0,
+		TagsBoost:              0.5,
+		BodyBoost:              1.0,
 	}
 }
 
@@ -274,9 +286,8 @@ func TestSearch_EmbeddingUnavailable_LexicalOnly(t *testing.T) {
 		}},
 	})
 
-	// embedding 不可用
-	embProvider := &fakeEmbeddingProvider{available: false, dims: 128}
-
+	// embedding provider 已配置但正式调用失败
+	embProvider := &fakeEmbeddingProvider{available: false, dims: 128, err: errFakeUnavailable}
 	pipe := NewPipeline(client, embProvider, nil)
 
 	output, err := pipe.Search(ctx, SearchInput{
@@ -293,6 +304,12 @@ func TestSearch_EmbeddingUnavailable_LexicalOnly(t *testing.T) {
 	if !output.Degraded {
 		t.Error("embedding 不可用时应 degraded=true")
 	}
+	if embProvider.embedCallCount != 1 {
+		t.Errorf("embedding 应只调用正式 Embed 一次，实际 %d 次", embProvider.embedCallCount)
+	}
+	if embProvider.availableCallCount != 0 {
+		t.Errorf("embedding 不应调用 Available 预检，实际 %d 次", embProvider.availableCallCount)
+	}
 }
 
 func TestSearch_RerankerUnavailable_ReturnsRRF(t *testing.T) {
@@ -308,14 +325,18 @@ func TestSearch_RerankerUnavailable_ReturnsRRF(t *testing.T) {
 			"title":        "Test",
 			"content":      "test content",
 		}},
+		{ID: "doc2_0", Body: map[string]interface{}{
+			"document_id":  "doc2",
+			"workspace_id": "ws-1",
+			"path":         "other.md",
+			"title":        "Other",
+			"content":      "other content",
+		}},
 	})
 
-	// embedding 可用
 	embProvider := &fakeEmbeddingProvider{available: true, dims: 128}
-
-	// reranker 不可用
-	rrProvider := &fakeRerankerProvider{available: false}
-
+	// health check 返回不可用，但正式调用仍应直接执行。
+	rrProvider := &fakeRerankerProvider{available: false, err: errFakeUnavailable}
 	pipe := NewPipeline(client, embProvider, rrProvider)
 
 	output, err := pipe.Search(ctx, SearchInput{
@@ -327,13 +348,17 @@ func TestSearch_RerankerUnavailable_ReturnsRRF(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Search 失败: %v", err)
 	}
-
-	// reranker 不可用时应降级
 	if !output.Degraded {
 		t.Error("reranker 不可用时应 degraded=true")
 	}
 	if output.RerankerUsed {
 		t.Error("reranker 不可用时 RerankerUsed 应为 false")
+	}
+	if rrProvider.rerankCallCount != 1 {
+		t.Errorf("reranker 应只调用正式 Rerank 一次，实际 %d 次", rrProvider.rerankCallCount)
+	}
+	if rrProvider.availableCallCount != 0 {
+		t.Errorf("reranker 不应调用 Available 预检，实际 %d 次", rrProvider.availableCallCount)
 	}
 }
 

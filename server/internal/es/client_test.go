@@ -6,7 +6,11 @@ package es
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 )
 
 // FakeClient 是 ES Client 接口的内存 fake 实现，用于测试。
@@ -273,5 +277,32 @@ func TestFakeClient_PingUnavailable(t *testing.T) {
 	err := client.Ping(context.Background())
 	if err == nil {
 		t.Error("ES 不可用时 Ping 应返回错误")
+	}
+}
+
+func TestHTTPClient_BulkIndexIncludesItemErrorDetails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/_bulk" {
+			t.Fatalf("请求路径 = %s, 期望 /_bulk", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"errors":true,"items":[{"index":{"_index":"safe-index","_id":"doc-42","status":400,"error":{"type":"mapper_parsing_exception","reason":"field rejected"}}}]}`))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, time.Second)
+	err := client.BulkIndex(context.Background(), "safe-index", []IndexDoc{{ID: "doc-42", Body: map[string]interface{}{"token": "do-not-log"}}})
+	if err == nil {
+		t.Fatal("BulkIndex 应返回 item 错误")
+	}
+	message := err.Error()
+	for _, expected := range []string{"mapper_parsing_exception", "field rejected", "doc-42", "400"} {
+		if !strings.Contains(message, expected) {
+			t.Errorf("错误 %q 应包含 %q", message, expected)
+		}
+	}
+	if strings.Contains(message, "do-not-log") {
+		t.Error("BulkIndex 错误不应泄露请求文档内容")
 	}
 }

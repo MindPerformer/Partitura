@@ -520,3 +520,38 @@ func TestWriteError_ValidJSON(t *testing.T) {
 		t.Errorf("error = %q, 期望 %q", resp["error"], extreme)
 	}
 }
+
+// TestRoute_DeviceSessions_ListsOwnMetadata 验证设备会话列表只返回当前用户的非敏感元数据。
+func TestRoute_DeviceSessions_ListsOwnMetadata(t *testing.T) {
+	mux, repo, cfg := setupRouter(t)
+	deviceResult, err := AuthorizeDevice(nil, repo, cfg, "user-001", "test-device")
+	if err != nil {
+		t.Fatalf("AuthorizeDevice 失败: %v", err)
+	}
+	login := doLoginViaRouter(t, mux, "testuser", "testpass123")
+	sessionToken, _ := extractSessionAndCSRF(t, login, cfg)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/auth/device/sessions", nil)
+	req.AddCookie(&http.Cookie{Name: cfg.CookieName, Value: sessionToken})
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("设备会话列表应返回 200，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+
+	var response struct {
+		Sessions []DeviceSessionSummary `json:"sessions"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &response); err != nil {
+		t.Fatalf("解析设备会话列表失败: %v", err)
+	}
+	if len(response.Sessions) != 1 || response.Sessions[0].ID != deviceResult.DeviceSessionID {
+		t.Fatalf("设备会话列表内容不正确: %+v", response.Sessions)
+	}
+	if response.Sessions[0].DeviceName != "test-device" {
+		t.Errorf("device_name = %q", response.Sessions[0].DeviceName)
+	}
+	if strings.Contains(rr.Body.String(), deviceResult.AccessToken) || strings.Contains(rr.Body.String(), deviceResult.RefreshToken) {
+		t.Error("设备会话列表不得暴露 token")
+	}
+}

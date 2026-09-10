@@ -19,23 +19,23 @@ type MockRepository struct {
 
 	users map[string]*User // key: username
 
-	sessions         map[string]*SessionRecord // key: token_hash
-	sessionsByID     map[string]*SessionRecord // key: session ID
+	sessions     map[string]*SessionRecord // key: token_hash
+	sessionsByID map[string]*SessionRecord // key: session ID
 
-	deviceSessions               map[string]*DeviceSessionRecord // key: access_token_hash
-	deviceSessionsByRefresh      map[string]*DeviceSessionRecord // key: refresh_token_hash
-	deviceSessionsByID           map[string]*DeviceSessionRecord // key: device session ID
+	deviceSessions          map[string]*DeviceSessionRecord // key: access_token_hash
+	deviceSessionsByRefresh map[string]*DeviceSessionRecord // key: refresh_token_hash
+	deviceSessionsByID      map[string]*DeviceSessionRecord // key: device session ID
 }
 
 // NewMockRepository 创建空 mock repository。
 func NewMockRepository() *MockRepository {
 	return &MockRepository{
-		users:                       make(map[string]*User),
-		sessions:                    make(map[string]*SessionRecord),
-		sessionsByID:                make(map[string]*SessionRecord),
-		deviceSessions:              make(map[string]*DeviceSessionRecord),
-		deviceSessionsByRefresh:     make(map[string]*DeviceSessionRecord),
-		deviceSessionsByID:          make(map[string]*DeviceSessionRecord),
+		users:                   make(map[string]*User),
+		sessions:                make(map[string]*SessionRecord),
+		sessionsByID:            make(map[string]*SessionRecord),
+		deviceSessions:          make(map[string]*DeviceSessionRecord),
+		deviceSessionsByRefresh: make(map[string]*DeviceSessionRecord),
+		deviceSessionsByID:      make(map[string]*DeviceSessionRecord),
 	}
 }
 
@@ -171,6 +171,38 @@ func (m *MockRepository) GetDeviceSessionByID(ctx context.Context, deviceSession
 	}
 	copied := *d
 	return &copied, nil
+}
+
+// ListDeviceSessions 实现 Repository 接口，只返回指定用户的非敏感元数据。
+func (m *MockRepository) ListDeviceSessions(ctx context.Context, userID string, limit, offset int) (*ListDeviceSessionsResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	all := make([]DeviceSessionSummary, 0)
+	for _, d := range m.deviceSessionsByID {
+		if d.UserID != userID {
+			continue
+		}
+		s := DeviceSessionSummary{
+			ID: d.ID, DeviceName: d.DeviceName,
+			ExpiresAt:        d.ExpiresAt.UTC().Format(time.RFC3339),
+			RefreshExpiresAt: d.RefreshExpiresAt.UTC().Format(time.RFC3339),
+			CreatedAt:        d.CreatedAt.UTC().Format(time.RFC3339),
+		}
+		if d.RevokedAt.Valid {
+			revoked := d.RevokedAt.Time.UTC().Format(time.RFC3339)
+			s.RevokedAt = &revoked
+		}
+		all = append(all, s)
+	}
+	if offset > len(all) {
+		offset = len(all)
+	}
+	end := offset + limit
+	if end > len(all) {
+		end = len(all)
+	}
+	return &ListDeviceSessionsResult{Sessions: all[offset:end], Total: len(all)}, nil
 }
 
 // UpdateDeviceSessionTokens 实现 Repository 接口。

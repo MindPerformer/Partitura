@@ -50,15 +50,32 @@ type SessionRecord struct {
 // 引入动机：middleware 验证 bearer access token 和 refresh token 流程需要读取
 // device session 信息，包括过期时间和撤销状态。
 type DeviceSessionRecord struct {
-	ID                string
-	UserID            string
-	DeviceName        string
-	AccessTokenHash   string
-	RefreshTokenHash  string
-	ExpiresAt         time.Time
-	RefreshExpiresAt  time.Time
-	RevokedAt         sql.NullTime
-	CreatedAt         time.Time
+	ID               string
+	UserID           string
+	DeviceName       string
+	AccessTokenHash  string
+	RefreshTokenHash string
+	ExpiresAt        time.Time
+	RefreshExpiresAt time.Time
+	RevokedAt        sql.NullTime
+	CreatedAt        time.Time
+}
+
+// DeviceSessionSummary 是设备会话列表对外返回的非敏感元数据。
+// 引入动机：设备管理页面需要展示设备并按 ID 撤销会话，但绝不能暴露 token 或其哈希。
+type DeviceSessionSummary struct {
+	ID               string  `json:"id"`
+	DeviceName       string  `json:"device_name"`
+	ExpiresAt        string  `json:"expires_at"`
+	RefreshExpiresAt string  `json:"refresh_expires_at"`
+	CreatedAt        string  `json:"created_at"`
+	RevokedAt        *string `json:"revoked_at,omitempty"`
+}
+
+// ListDeviceSessionsResult 是当前用户设备会话列表查询结果。
+type ListDeviceSessionsResult struct {
+	Sessions []DeviceSessionSummary `json:"sessions"`
+	Total    int                    `json:"total"`
 }
 
 // ErrUsersAlreadyExist 表示 users 表中已存在用户，Bootstrap 不可用。
@@ -100,6 +117,10 @@ type Repository interface {
 	// 引入动机：revoke 端点需要根据 ID 查询 device session 以验证所有权。
 	// 不存在返回 sql.ErrNoRows。
 	GetDeviceSessionByID(ctx context.Context, deviceSessionID string) (*DeviceSessionRecord, error)
+
+	// ListDeviceSessions 查询指定用户的设备会话元数据，按创建时间倒序分页。
+	// 引入动机：设备管理页面需要展示当前用户已登录设备，返回值不得包含 token/hash。
+	ListDeviceSessions(ctx context.Context, userID string, limit, offset int) (*ListDeviceSessionsResult, error)
 
 	// UpdateDeviceSessionTokens 更新 device session 的 access token 和 refresh token 哈希及过期时间。
 	// 引入动机：refresh 流程需要轮换两个 token 的哈希值。
@@ -263,6 +284,45 @@ func (r *PGRepository) GetDeviceSessionByID(ctx context.Context, deviceSessionID
 		return nil, mapDBError(err, "根据 ID 查询 device session")
 	}
 	return &d, nil
+}
+
+// ListDeviceSessions 查询指定用户的设备会话元数据，绝不读取或返回 token/hash。
+func (r *PGRepository) ListDeviceSessions(ctx context.Context, userID string, limit, offset int) (*ListDeviceSessionsResult, error) {
+	var total int
+	if err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM device_sessions WHERE user_id = $1`, userID).Scan(&total); err != nil {
+		return nil, mapDBError(err, "查询设备会话总数")
+	}
+
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT id, device_name,
+		        to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+		        to_char(refresh_expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+		        CASE WHEN revoked_at IS NULL THEN NULL ELSE to_char(revoked_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"') END
+		 FROM device_sessions WHERE user_id = $1 ORDER BY created_at DESC LIMIT $2 OFFSET $3`,
+		userID, limit, offset,
+	)
+	if err != nil {
+		return nil, mapDBError(err, "查询设备会话列表")
+	}
+	defer rows.Close()
+
+	sessions := make([]DeviceSessionSummary, 0)
+	for rows.Next() {
+		var session DeviceSessionSummary
+		var revokedAt sql.NullString
+		if err := rows.Scan(&session.ID, &session.DeviceName, &session.ExpiresAt, &session.RefreshExpiresAt, &session.CreatedAt, &revokedAt); err != nil {
+			return nil, fmt.Errorf("扫描设备会话行: %w", err)
+		}
+		if revokedAt.Valid {
+			session.RevokedAt = &revokedAt.String
+		}
+		sessions = append(sessions, session)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历设备会话结果集: %w", err)
+	}
+	return &ListDeviceSessionsResult{Sessions: sessions, Total: total}, nil
 }
 
 // UpdateDeviceSessionTokens 更新 device session 的 token 哈希及过期时间。

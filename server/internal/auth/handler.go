@@ -21,6 +21,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"partitura/server/internal/queryutil"
 )
 
 // Handler 是 auth 模块的 HTTP handler 集合。
@@ -46,9 +48,9 @@ type loginRequest struct {
 // loginResponse 是 login 端点的响应体。
 type loginResponse struct {
 	User struct {
-		ID          string `json:"id"`
-		Username    string `json:"username"`
-		SystemRole  string `json:"system_role"`
+		ID         string `json:"id"`
+		Username   string `json:"username"`
+		SystemRole string `json:"system_role"`
 	} `json:"user"`
 	CSRFToken string `json:"csrf_token"`
 	ExpiresAt string `json:"expires_at"`
@@ -64,8 +66,8 @@ type loginResponse struct {
 //  5. 返回用户信息和 CSRF token
 //
 // 安全：
-//  - 认证失败返回 401，错误信息不泄露用户是否存在
-//  - 请求体解析失败返回 400
+//   - 认证失败返回 401，错误信息不泄露用户是否存在
+//   - 请求体解析失败返回 400
 func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req loginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -283,6 +285,37 @@ func (h *Handler) Refresh(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// ListDeviceSessions 处理 GET /api/auth/device/sessions。
+// 只返回当前登录用户自己的设备会话非敏感元数据，供设备管理页面展示。
+func (h *Handler) ListDeviceSessions(w http.ResponseWriter, r *http.Request) {
+	id := IdentityFromContext(r.Context())
+	if id == nil {
+		writeError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+
+	limit, offset, err := queryutil.ParsePagination(r)
+	if err != nil {
+		slog.Warn("解析设备会话分页参数失败", "error", err, "user_id", id.UserID)
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	result, err := h.repo.ListDeviceSessions(r.Context(), id.UserID, limit, offset)
+	if err != nil {
+		slog.Error("查询设备会话列表失败", "error", err, "user_id", id.UserID)
+		writeError(w, http.StatusInternalServerError, "查询设备会话失败")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"sessions": result.Sessions,
+		"total":    result.Total,
+		"limit":    limit,
+		"offset":   offset,
+	})
 }
 
 // revokeRequest 是 device session 撤销端点的请求体。

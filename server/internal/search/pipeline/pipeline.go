@@ -24,8 +24,8 @@ import (
 	"partitura/server/internal/search/chunking"
 	"partitura/server/internal/search/diversity"
 	"partitura/server/internal/search/embedding"
-	"partitura/server/internal/search/rrf"
 	"partitura/server/internal/search/reranker"
+	"partitura/server/internal/search/rrf"
 	types "partitura/server/internal/search/types"
 )
 
@@ -33,9 +33,9 @@ import (
 // 引入动机：将搜索管线的各阶段（BM25、vector、RRF、reranker、diversity）编排在一起，
 // 由 Search Profile 配置驱动。
 type Pipeline struct {
-	esClient       es.Client
+	esClient          es.Client
 	embeddingProvider embedding.Provider
-	rerankerProvider reranker.Provider
+	rerankerProvider  reranker.Provider
 	// embeddingProviderFn 是动态获取 Embedding Provider 的函数。
 	// 引入动机：计划要求搜索管线从 Provider Registry 获取当前实例，
 	// 支持热更新后无需重启。若此函数非 nil，优先使用它获取 Provider。
@@ -48,7 +48,7 @@ type Pipeline struct {
 // NewPipeline 创建搜索管线执行器。
 func NewPipeline(esClient es.Client, embProvider embedding.Provider, rrProvider reranker.Provider) *Pipeline {
 	return &Pipeline{
-		esClient:         esClient,
+		esClient:          esClient,
 		embeddingProvider: embProvider,
 		rerankerProvider:  rrProvider,
 	}
@@ -103,14 +103,14 @@ type SearchInput struct {
 
 // SearchOutput 是搜索管线的输出结果。
 type SearchOutput struct {
-	Results        []types.SearchResult
-	Total          int
-	Degraded       bool
+	Results           []types.SearchResult
+	Total             int
+	Degraded          bool
 	DegradationReason string
-	RerankerUsed   bool
-	RerankerCost   float64
-	SearchID       string
-	LatencyMs      int
+	RerankerUsed      bool
+	RerankerCost      float64
+	SearchID          string
+	LatencyMs         int
 }
 
 // Search 执行完整的搜索管线。
@@ -207,35 +207,39 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 	// --- 阶段 2: Dense vector 检索 ---
 	embProvider := p.currentEmbeddingProvider()
 	var vectorResults []types.CandidateResult
-	if (mode == "hybrid" || mode == "semantic") && embProvider != nil && embProvider.Available(ctx) {
-		queryInput := chunking.BuildQueryEmbeddingInput(input.Query, input.Profile.EmbeddingQueryInstruction)
-		queryVec, embErr := embProvider.Embed(ctx, []string{queryInput})
-		if embErr != nil || len(queryVec) == 0 {
-			slog.Warn("embedding 不可用，降级为 lexical-only", "error", embErr)
+	if mode == "hybrid" || mode == "semantic" {
+		if embProvider == nil {
+			// 未配置 embedding provider 时，保持 lexical-only 降级语义。
 			output.Degraded = true
 			output.DegradationReason = "embedding_unavailable"
 		} else {
-			// 修复说明：原实现忽略 searchVector 返回错误，ES knn 查询失败（如 400 参数错误）
-			// 时静默产生 0 命中且 degraded=false。现在记录错误：semantic 模式直接降级失败；
-			// hybrid 模式降级为 lexical-only 检索，避免无声空结果。
-			var vecErr error
-			vectorResults, vecErr = p.searchVector(ctx, indexName, input, workspaceFilter, queryVec[0])
-			if vecErr != nil {
-				slog.Warn("vector 检索失败", "error", vecErr, "mode", mode)
+			// 直接调用 Embed。Available(ctx) 通常会发起一次健康检查请求，
+			// 再调用 Embed 会让同一次搜索重复访问模型 API；Embed 失败时统一降级。
+			queryInput := chunking.BuildQueryEmbeddingInput(input.Query, input.Profile.EmbeddingQueryInstruction)
+			queryVec, embErr := embProvider.Embed(ctx, []string{queryInput})
+			if embErr != nil || len(queryVec) == 0 {
+				slog.Warn("embedding 不可用，降级为 lexical-only", "error", embErr)
 				output.Degraded = true
-				output.DegradationReason = "vector_search_failed"
-				if mode == "semantic" {
-					// semantic 仅依赖向量检索，失败即无可返回结果
-					output.LatencyMs = int(time.Since(startTime).Milliseconds())
-					return output, nil
+				output.DegradationReason = "embedding_unavailable"
+			} else {
+				// 修复说明：原实现忽略 searchVector 返回错误，ES knn 查询失败（如 400 参数错误）
+				// 时静默产生 0 命中且 degraded=false。现在记录错误：semantic 模式直接降级失败；
+				// hybrid 模式降级为 lexical-only 检索，避免无声空结果。
+				var vecErr error
+				vectorResults, vecErr = p.searchVector(ctx, indexName, input, workspaceFilter, queryVec[0])
+				if vecErr != nil {
+					slog.Warn("vector 检索失败", "error", vecErr, "mode", mode)
+					output.Degraded = true
+					output.DegradationReason = "vector_search_failed"
+					if mode == "semantic" {
+						// semantic 仅依赖向量检索，失败即无可返回结果
+						output.LatencyMs = int(time.Since(startTime).Milliseconds())
+						return output, nil
+					}
+					vectorResults = nil
 				}
-				vectorResults = nil
 			}
 		}
-	} else {
-		// embedding provider 为 nil 或不可用，降级为 lexical-only
-		output.Degraded = true
-		output.DegradationReason = "embedding_unavailable"
 	}
 
 	// --- 阶段 3: RRF 融合 ---
@@ -252,7 +256,9 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 	// 此处统一视为降级提示并以 RRF 顺序直接返回，避免整个搜索请求被拖至 504。
 	rrProvider := p.currentRerankerProvider()
 	var finalResults []types.SearchResult
-	if rrProvider != nil && rrProvider.Available(ctx) && len(candidates) > 1 {
+	if rrProvider != nil && len(candidates) > 1 {
+		// 直接调用 Rerank。Available(ctx) 会额外触发一次健康检查请求，
+		// 调用失败由现有降级逻辑处理，避免同一次搜索重复访问模型 API。
 		rerankerCandidates := make([]types.RerankerCandidate, len(candidates))
 		for i, c := range candidates {
 			rerankerCandidates[i] = types.RerankerCandidate{
@@ -276,14 +282,8 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 			finalResults = rerankedToResults(candidates, reranked)
 		}
 	} else {
-		// 无 reranker 或候选不足，直接使用 RRF 结果
-		// 引入动机：design/01-SEARCH.md §Reranker Provider 要求 reranker 不可用时系统降级。
-		if rrProvider != nil && !rrProvider.Available(ctx) {
-			output.Degraded = true
-			if output.DegradationReason == "" {
-				output.DegradationReason = "reranker_unavailable"
-			}
-		}
+		// 无 reranker 或候选不足，直接使用 RRF 结果。
+		// 候选不足时不调用 provider，也不将其视为 provider 不可用。
 		finalResults = candidatesToResults(candidates)
 	}
 
@@ -322,7 +322,7 @@ func (p *Pipeline) searchBM25(ctx context.Context, indexName string, input Searc
 				"must": []interface{}{
 					map[string]interface{}{
 						"multi_match": map[string]interface{}{
-							"query":  input.Query,
+							"query": input.Query,
 							"fields": []interface{}{
 								fmt.Sprintf("title^%g", profile.TitleBoost),
 								fmt.Sprintf("heading^%g", profile.HeadingBoost),

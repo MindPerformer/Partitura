@@ -41,8 +41,8 @@ import (
 	"partitura/server/internal/provider"
 	"partitura/server/internal/scheduler"
 	"partitura/server/internal/search"
-	"partitura/server/internal/settings"
 	"partitura/server/internal/search/pipeline"
+	"partitura/server/internal/settings"
 	"partitura/server/internal/workspace"
 
 	"github.com/google/uuid"
@@ -344,42 +344,40 @@ func runServer(ctx context.Context, runner *migration.Runner, cfg *config.Config
 	// Phase 6 修复：worker 使用 serverCtx 而非 context.Background，使 SIGTERM 能有界取消 worker。
 	var jobWorker *job.Worker
 	if cfg.JobWorkerEnabled {
-	// 恢复 stale running jobs（worker 崩溃后遗留的 running 状态 job）
-	// 引入动机：design/05-OPERATIONS.md §Background Jobs 要求支持故障恢复。
-	// worker 崩溃或被 SIGKILL 后，其 claim 的 job 会永久停留在 running 状态。
-	// 启动时恢复这些 stale job，使其重新被 worker claim 执行。
-	recoveredCount, recoverErr := jobRepo.RecoverStaleJobs(ctx, job.DefaultStaleJobTimeout)
-	if recoverErr != nil {
-		slog.Warn("恢复 stale running job 失败", "error", recoverErr)
-	} else if recoveredCount > 0 {
-		slog.Info("已恢复 stale running job", "count", recoveredCount)
-	}
-	// 将 embedding.Provider 适配为 job 所需的函数签名。
-	//
-	// 引入动机：job worker 需要从 Registry 动态获取 Provider，支持热更新。
-	// 使用 Registry 函数引用而非启动期静态实例，使 Provider 保存后 job 立即使用新实例。
-	//
-	// 修复说明：原实现仅在启动时 Provider 已配置才创建闭包，导致启动时未配置但
-	// 后续通过 Web API 热更新 Provider 后 job 仍无法使用（闭包为 nil）。
-	// 现在无条件创建闭包，每次调用从 Registry 动态获取当前 Provider 实例，
-	// 无论 Provider 何时被配置，job 都能立即使用。
-	embEmbed := func(ctx context.Context, texts []string) ([][]float32, error) {
-		p := providerRegistry.GetEmbeddingProvider()
-		if p == nil {
-			return nil, fmt.Errorf("embedding provider 未配置")
+		// 恢复 stale running jobs（worker 崩溃后遗留的 running 状态 job）
+		// 引入动机：design/05-OPERATIONS.md §Background Jobs 要求支持故障恢复。
+		// worker 崩溃或被 SIGKILL 后，其 claim 的 job 会永久停留在 running 状态。
+		// 启动时恢复这些 stale job，使其重新被 worker claim 执行。
+		recoveredCount, recoverErr := jobRepo.RecoverStaleJobs(ctx, job.DefaultStaleJobTimeout)
+		if recoverErr != nil {
+			slog.Warn("恢复 stale running job 失败", "error", recoverErr)
+		} else if recoveredCount > 0 {
+			slog.Info("已恢复 stale running job", "count", recoveredCount)
 		}
-		return p.Embed(ctx, texts)
-	}
-	embAvailable := func(ctx context.Context) bool {
-		p := providerRegistry.GetEmbeddingProvider()
-		if p == nil {
-			return false
+		// 将 embedding.Provider 适配为 job 所需的函数签名。
+		//
+		// 引入动机：job worker 需要从 Registry 动态获取 Provider，支持热更新。
+		// 使用 Registry 函数引用而非启动期静态实例，使 Provider 保存后 job 立即使用新实例。
+		//
+		// 修复说明：原实现仅在启动时 Provider 已配置才创建闭包，导致启动时未配置但
+		// 后续通过 Web API 热更新 Provider 后 job 仍无法使用（闭包为 nil）。
+		// 现在无条件创建闭包，每次调用从 Registry 动态获取当前 Provider 实例，
+		// 无论 Provider 何时被配置，job 都能立即使用。
+		embEmbed := func(ctx context.Context, texts []string) ([][]float32, error) {
+			p := providerRegistry.GetEmbeddingProvider()
+			if p == nil {
+				return nil, fmt.Errorf("embedding provider 未配置")
+			}
+			return p.Embed(ctx, texts)
 		}
-		return p.Available(ctx)
-	}
+		// 仅判断 provider 是否已配置；正式 Embed 调用负责发现网络/API 故障，
+		// 避免 index job 在 Embed 前额外发起一次 health embedding 请求。
+		embConfigured := func(ctx context.Context) bool {
+			return providerRegistry.GetEmbeddingProvider() != nil
+		}
 		// 将 profile.PGRepository 适配为 job.ProfileRepo
 		jobProfileRepo := &profileRepoAdapter{repo: profileRepo}
-		baseJobHandler := job.NewIndexJobHandler(database, esClient, embEmbed, embAvailable, jobProfileRepo, docRepo)
+		baseJobHandler := job.NewIndexJobHandler(database, esClient, embEmbed, embConfigured, jobProfileRepo, docRepo)
 
 		// 构建带评测能力的 job handler
 		profileRepoExt := &profileRepoExtAdapter{repo: profileRepo}
@@ -532,7 +530,7 @@ func (a *profileRepoAdapter) GetActiveProfile(ctx context.Context) (*job.Profile
 		EmbeddingQueryInstruction: p.EmbeddingQueryInstruction,
 		EmbeddingDocInstruction:   p.EmbeddingDocInstruction,
 		// Phase 6 修复：传递 Analyzer 字段，使 rebuild_index 能创建正确的 ES mapping。
-		Analyzer:                  p.Analyzer,
+		Analyzer: p.Analyzer,
 	}, nil
 }
 
@@ -592,32 +590,32 @@ func (a *profileRepoExtAdapter) CreateCandidateProfile(ctx context.Context, base
 	// embedding/reranker provider/model/analyzer 不可变，必须从 base 继承。
 	// CreatedBy 继承 base profile 的创建者，保证审计可追溯，不使用伪造 UUID。
 	input := &profile.CreateProfileInput{
-		Name:                     base.Name,
-		EmbeddingProvider:        base.EmbeddingProvider,
-		EmbeddingModel:           base.EmbeddingModel,
-		EmbeddingDimensions:      base.EmbeddingDimensions,
+		Name:                      base.Name,
+		EmbeddingProvider:         base.EmbeddingProvider,
+		EmbeddingModel:            base.EmbeddingModel,
+		EmbeddingDimensions:       base.EmbeddingDimensions,
 		EmbeddingQueryInstruction: base.EmbeddingQueryInstruction,
 		EmbeddingDocInstruction:   base.EmbeddingDocInstruction,
-		ChunkTargetSize:          base.ChunkTargetSize,
-		ChunkOverlap:             base.ChunkOverlap,
-		TitleBoost:               base.TitleBoost,
-		HeadingBoost:             base.HeadingBoost,
-		PathBoost:                base.PathBoost,
+		ChunkTargetSize:           base.ChunkTargetSize,
+		ChunkOverlap:              base.ChunkOverlap,
+		TitleBoost:                base.TitleBoost,
+		HeadingBoost:              base.HeadingBoost,
+		PathBoost:                 base.PathBoost,
 		TagsBoost:                 base.TagsBoost,
-		BodyBoost:                base.BodyBoost,
-		Analyzer:                 base.Analyzer,
-		LexicalTopK:              base.LexicalTopK,
-		VectorTopK:               base.VectorTopK,
-		RRFK:                     base.RRFK,
-		RerankerProvider:         base.RerankerProvider,
-		RerankerModel:            base.RerankerModel,
-		RerankerCandidateCount:   base.RerankerCandidateCount,
-		RerankerFinalCount:       base.RerankerFinalCount,
-		MaxChunksPerDocument:     base.MaxChunksPerDocument,
-		MergeAdjacentChunks:      base.MergeAdjacentChunks,
-		MaxP95LatencyMs:          base.MaxP95LatencyMs,
-		MaxRerankerCostPerQuery:  base.MaxRerankerCostPerQuery,
-		CreatedBy:                base.CreatedBy,
+		BodyBoost:                 base.BodyBoost,
+		Analyzer:                  base.Analyzer,
+		LexicalTopK:               base.LexicalTopK,
+		VectorTopK:                base.VectorTopK,
+		RRFK:                      base.RRFK,
+		RerankerProvider:          base.RerankerProvider,
+		RerankerModel:             base.RerankerModel,
+		RerankerCandidateCount:    base.RerankerCandidateCount,
+		RerankerFinalCount:        base.RerankerFinalCount,
+		MaxChunksPerDocument:      base.MaxChunksPerDocument,
+		MergeAdjacentChunks:       base.MergeAdjacentChunks,
+		MaxP95LatencyMs:           base.MaxP95LatencyMs,
+		MaxRerankerCostPerQuery:   base.MaxRerankerCostPerQuery,
+		CreatedBy:                 base.CreatedBy,
 	}
 
 	// 应用 Level 1 参数变更

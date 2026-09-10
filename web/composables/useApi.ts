@@ -61,6 +61,7 @@ import type {
   DeviceAuthStartResponse,
   DeviceAuthPollResponse,
   DeviceAuthInfoResponse,
+  ListDeviceSessionsResponse,
   DeviceAuthorizeResponse,
   WorkspaceStatsResponse,
   SystemSetting,
@@ -260,7 +261,10 @@ export function useAuthApi() {
       }),
 
     deviceInfo: (userCode: string) =>
-      apiFetch<DeviceAuthInfoResponse>('/auth/device/info', { query: { code: userCode } })
+      apiFetch<DeviceAuthInfoResponse>('/auth/device/info', { query: { code: userCode } }),
+
+    listSessions: (params?: PaginationParams) =>
+      apiFetch<ListDeviceSessionsResponse>('/auth/device/sessions', { query: params })
   }
 }
 

@@ -4,7 +4,7 @@
 // 仅 system_admin 可访问。支持数据集管理、添加评测条目、运行评测、查看结果。
 -->
 <script setup lang="ts">
-import type { EvaluationDataset, SearchProfile, ApiError } from '~/types/api'
+import type { ApiError, EvaluationDataset } from '~/types/api'
 import type { SelectItem } from '@nuxt/ui'
 
 definePageMeta({
@@ -14,13 +14,16 @@ definePageMeta({
 const { t } = useI18n()
 const { isSystemAdmin } = useAuth()
 
-const datasets = ref<EvaluationDataset[]>([])
-const profiles = ref<SearchProfile[]>([])
+const {
+  datasets,
+  profiles,
+  loading,
+  error,
+  load: loadEvaluationData
+} = useSearchEvaluation()
 const total = ref(0)
 const limit = ref(20)
 const offset = ref(0)
-const loading = ref(false)
-const error = ref<string | null>(null)
 
 const showCreateDataset = ref(false)
 const datasetForm = ref({ name: '', description: '' })
@@ -37,23 +40,8 @@ const runResult = ref<string | null>(null)
 
 async function loadDatasets() {
   if (!isSystemAdmin.value) return
-  loading.value = true
-  error.value = null
-  try {
-    const api = useSearchAdminApi()
-    const [dsRes, profRes] = await Promise.all([
-      api.listDatasets({ limit: limit.value, offset: offset.value }),
-      api.listProfiles({ limit: 100 })
-    ])
-    datasets.value = dsRes.datasets
-    total.value = dsRes.total
-    profiles.value = profRes.profiles
-  } catch (err) {
-    const apiErr = err as ApiError
-    error.value = apiErr.error || t('admin.loadEvaluationFailed')
-  } finally {
-    loading.value = false
-  }
+  await loadEvaluationData({ limit: limit.value, offset: offset.value })
+  total.value = datasets.value.length
 }
 
 onMounted(loadDatasets)

@@ -20,13 +20,13 @@ import (
 // 引入动机：RunEvaluation API 和 evaluate_profile job 需要将计算出的指标持久化，
 // 使管理员可查询历史评测结果和趋势。
 type EvaluationRunResult struct {
-	ID         string          `json:"id"`
-	DatasetID  string          `json:"dataset_id"`
-	ProfileID  string          `json:"profile_id"`
-	JobID      string          `json:"job_id,omitempty"`
-	Metrics    json.RawMessage `json:"metrics"`
-	ItemCount  int             `json:"item_count"`
-	CreatedAt  string          `json:"created_at"`
+	ID        string          `json:"id"`
+	DatasetID string          `json:"dataset_id"`
+	ProfileID string          `json:"profile_id"`
+	JobID     string          `json:"job_id,omitempty"`
+	Metrics   json.RawMessage `json:"metrics"`
+	ItemCount int             `json:"item_count"`
+	CreatedAt string          `json:"created_at"`
 }
 
 // ListResultsResult 是评测结果列表查询结果。
@@ -103,7 +103,7 @@ func (r *PGResultRepository) ListResults(ctx context.Context, datasetID string, 
 	}
 	defer rows.Close()
 
-	var results []EvaluationRunResult
+	results := make([]EvaluationRunResult, 0)
 	for rows.Next() {
 		var r EvaluationRunResult
 		if err := rows.Scan(&r.ID, &r.DatasetID, &r.ProfileID, &r.JobID, &r.Metrics, &r.ItemCount, &r.CreatedAt); err != nil {

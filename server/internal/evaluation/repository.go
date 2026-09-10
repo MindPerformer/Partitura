@@ -27,13 +27,13 @@ type Dataset struct {
 
 // Item 是评测条目记录。
 type Item struct {
-	ID                string            `json:"id"`
-	DatasetID         string            `json:"dataset_id"`
-	Query             string            `json:"query"`
+	ID                string             `json:"id"`
+	DatasetID         string             `json:"dataset_id"`
+	Query             string             `json:"query"`
 	ExpectedDocuments []ExpectedDocument `json:"expected_documents"`
-	RelevanceGrade    int               `json:"relevance_grade"`
-	QueryClass        string            `json:"query_class"`
-	CreatedAt         string            `json:"created_at"`
+	RelevanceGrade    int                `json:"relevance_grade"`
+	QueryClass        string             `json:"query_class"`
+	CreatedAt         string             `json:"created_at"`
 }
 
 // ListDatasetsResult 是数据集列表查询结果。
@@ -124,7 +124,7 @@ func (r *PGRepository) ListDatasets(ctx context.Context, statusFilter string, li
 	}
 	defer rows.Close()
 
-	var datasets []Dataset
+	datasets := make([]Dataset, 0)
 	for rows.Next() {
 		var ds Dataset
 		if err := rows.Scan(&ds.ID, &ds.Name, &ds.Description, &ds.Status, &ds.CreatedBy, &ds.CreatedAt, &ds.UpdatedAt); err != nil {
@@ -199,7 +199,7 @@ func (r *PGRepository) ListItems(ctx context.Context, datasetID string, limit, o
 	}
 	defer rows.Close()
 
-	var items []Item
+	items := make([]Item, 0)
 	for rows.Next() {
 		var item Item
 		if err := rows.Scan(&item.ID, &item.DatasetID, &item.Query, &item.ExpectedDocuments, &item.RelevanceGrade, &item.QueryClass, &item.CreatedAt); err != nil {
@@ -229,7 +229,7 @@ func (r *PGRepository) ListAllItems(ctx context.Context, datasetID string) ([]It
 	}
 	defer rows.Close()
 
-	var items []Item
+	items := make([]Item, 0)
 	for rows.Next() {
 		var item Item
 		if err := rows.Scan(&item.ID, &item.DatasetID, &item.Query, &item.ExpectedDocuments, &item.RelevanceGrade, &item.QueryClass, &item.CreatedAt); err != nil {
