@@ -602,6 +602,11 @@ type IndexJobHandler struct {
 	embConfigured func(ctx context.Context) bool
 	// profileRepo 用于获取 active profile
 	profileRepo ProfileRepo
+	// jobRepo 用于在维度不一致时投递 rebuild_index 并查询队列去重。
+	// 引入动机：index_document 的兜底路径（ensureAliasAndIndex）一旦发现 alias 指向的索引
+	// embedding 维度与 profile 不一致，写入必然被 ES 拒绝，必须自动请求一次全量重建；
+	// 同时需要通过查询队列避免重复入队多个 rebuild_index。
+	jobRepo JobEnqueuer
 	// revisionCleanupRepo 用于清理过期 revision
 	// 引入动机：cleanup_revisions job 需要调用 document.CleanupRevisions，
 	// 使用接口避免 job 包对 document 包的直接依赖。
@@ -612,7 +617,27 @@ type IndexJobHandler struct {
 // 引入动机：index job 需要获取 active profile 以确定 chunk 参数和 embedding 配置。
 type ProfileRepo interface {
 	GetActiveProfile(ctx context.Context) (*ProfileForJob, error)
+
+	// UpdateProfileESIndex 更新 profile 记录的 ES 索引名。
+	// 引入动机：rebuild 在维度不一致时会创建新索引并切换 alias，必须把新索引名回写到 profile，
+	// 否则 profile 记录与 alias 实际指向不一致，后续 rebuild/rollback 会再次选错索引。
+	UpdateProfileESIndex(ctx context.Context, id, indexName string) error
 }
+
+// JobEnqueuer 定义向 job 队列投递与查询任务的能力。
+// 引入动机：维度不一致时 index_document 需要自动请求一次全量重建，并需查询队列以避免重复入队。
+// job.NewPGRepository 已实现该接口，故生产环境直接注入即可。
+type JobEnqueuer interface {
+	// Enqueue 投递一个 job，返回 job ID。
+	Enqueue(ctx context.Context, jobType string, payload map[string]interface{}) (string, error)
+	// List 按状态过滤查询 job 列表，用于判断是否已有 rebuild_index 在队列中。
+	List(ctx context.Context, statusFilter string, limit, offset int) (*ListResult, error)
+}
+
+// 编译期确认本包的 PG 仓储实现满足 JobEnqueuer 注入契约。
+// 引入动机：IndexJobHandler 的 jobRepo 由组装层注入 PGRepository，若其 Enqueue/List 签名漂移，
+// 这里会直接编译失败，而不是等到运行时才发现无法投递重建任务。
+var _ JobEnqueuer = (*PGRepository)(nil)
 
 // RevisionCleanupRepo 定义清理过期 revision 的接口。
 // 引入动机：cleanup_revisions job 需要调用 document.CleanupRevisions，
@@ -644,14 +669,16 @@ type ProfileForJob struct {
 // 引入动机：C5 要求 index job 实际生成 embedding，需要注入 embedding provider 和 profile repo。
 // embEmbed 和 embConfigured 从 embedding.Provider 接口适配，避免 job 包导入 embedding 包。
 // embConfigured 只表示 provider 已配置，不执行网络健康检查。
+// jobRepo 用于维度不一致时投递 rebuild_index（可为 nil，但此时遇到维度不一致会显式报错而非静默跳过）。
 // revisionCleanupRepo 用于 cleanup_revisions job，可为 nil（当 revision 清理未启用时）。
-func NewIndexJobHandler(db *sql.DB, esClient es.Client, embEmbed func(ctx context.Context, texts []string) ([][]float32, error), embConfigured func(ctx context.Context) bool, profileRepo ProfileRepo, revisionCleanupRepo RevisionCleanupRepo) *IndexJobHandler {
+func NewIndexJobHandler(db *sql.DB, esClient es.Client, embEmbed func(ctx context.Context, texts []string) ([][]float32, error), embConfigured func(ctx context.Context) bool, profileRepo ProfileRepo, jobRepo JobEnqueuer, revisionCleanupRepo RevisionCleanupRepo) *IndexJobHandler {
 	return &IndexJobHandler{
 		db:                  db,
 		esClient:            esClient,
 		embEmbed:            embEmbed,
 		embConfigured:       embConfigured,
 		profileRepo:         profileRepo,
+		jobRepo:             jobRepo,
 		revisionCleanupRepo: revisionCleanupRepo,
 	}
 }
@@ -695,6 +722,7 @@ func (h *IndexJobHandler) handleIndexDocument(ctx context.Context, job *Job) err
 	var profileConfig *types.SearchProfileConfig
 	var dimensions int
 	var analyzer string
+	var profileID string
 	if h.profileRepo != nil {
 		p, err := h.profileRepo.GetActiveProfile(ctx)
 		if err == nil && p != nil {
@@ -707,6 +735,7 @@ func (h *IndexJobHandler) handleIndexDocument(ctx context.Context, job *Job) err
 			}
 			dimensions = p.EmbeddingDimensions
 			analyzer = p.Analyzer
+			profileID = p.ID
 		}
 	}
 
@@ -714,8 +743,9 @@ func (h *IndexJobHandler) handleIndexDocument(ctx context.Context, job *Job) err
 	// 引入动机：当 indexName 是 alias 且不存在时，直接写入会导致 ES 自动创建
 	// 同名具体索引（动态 mapping，无 embedding 字段）。必须先创建正确的
 	// versioned index 和 alias，再写入数据。
+	// profileID 用于在 alias 指向的索引维度与 profile 不一致时投递 rebuild_index。
 	if indexName == es.AliasName {
-		if err := h.ensureAliasAndIndex(ctx, dimensions, analyzer); err != nil {
+		if err := h.ensureAliasAndIndex(ctx, dimensions, analyzer, profileID); err != nil {
 			return fmt.Errorf("确保索引和 alias 存在: %w", err)
 		}
 	}
@@ -746,14 +776,37 @@ func (h *IndexJobHandler) handleIndexDocument(ctx context.Context, job *Job) err
 // 从 active profile 获取 dimensions 和 analyzer 配置。
 //
 // 约束：
-//   - 如果 alias 已存在，不做任何操作（alias 可能指向已有 index）。
+//   - 如果 alias 已存在，校验其指向索引的 embedding 维度与 profile 一致，不一致时
+//     投递一次 rebuild_index 并返回错误（fail fast）。
 //   - 如果 alias 不存在但存在同名具体索引，先删除该索引再创建 alias。
 //   - 创建新 index 时使用 active profile 的 dimensions 和 analyzer。
-func (h *IndexJobHandler) ensureAliasAndIndex(ctx context.Context, dimensions int, analyzer string) error {
+//
+// profileID 的引入动机：alias 指向的索引维度与 profile 不一致时需要按 profile 投递
+// rebuild_index 自动重建，profileID 用于标记待重建的 profile。
+func (h *IndexJobHandler) ensureAliasAndIndex(ctx context.Context, dimensions int, analyzer string, profileID string) error {
 	// 检查 alias 是否已存在
-	_, aliasErr := h.esClient.GetAliasIndex(ctx, es.AliasName)
+	aliasIndex, aliasErr := h.esClient.GetAliasIndex(ctx, es.AliasName)
 	if aliasErr == nil {
-		// alias 已存在，无需操作
+		// alias 已存在，校验维度。
+		//
+		// 引入动机：ES 的 dense_vector.dims 建好后不可变。若 alias 指向的索引维度与 profile
+		// 不一致（例如改了 profile 维度但没有重新激活/重建），写入新维度向量必然被 ES 以 400 拒绝。
+		// 这里 fail fast 并请求一次全量重建，避免 index_document 在错误索引上无限重试。
+		aliasDims, dimsErr := h.esClient.GetIndexDimensions(ctx, aliasIndex)
+		if dimsErr != nil {
+			return fmt.Errorf("读取 alias %s 指向索引 %s 的 embedding 维度: %w", es.AliasName, aliasIndex, dimsErr)
+		}
+		if aliasDims > 0 && dimensions > 0 && aliasDims != dimensions {
+			slog.Error("索引维度与 profile 不一致，触发自动重建",
+				"alias_index", aliasIndex, "index_dims", aliasDims, "profile_dims", dimensions)
+			if err := h.enqueueRebuildIfAbsent(ctx, profileID); err != nil {
+				return fmt.Errorf("索引 %s 维度 %d 与 profile 维度 %d 不一致，请求自动重建失败: %w",
+					aliasIndex, aliasDims, dimensions, err)
+			}
+			return fmt.Errorf("索引 %s 维度 %d 与 profile 维度 %d 不一致，已请求自动重建",
+				aliasIndex, aliasDims, dimensions)
+		}
+		// alias 已存在且维度一致，无需操作
 		return nil
 	}
 
@@ -775,7 +828,9 @@ func (h *IndexJobHandler) ensureAliasAndIndex(ctx context.Context, dimensions in
 		analyzer = "standard"
 	}
 	if dimensions <= 0 {
-		dimensions = 1024
+		// 移除原先的 dimensions = 1024 兜底（引入动机）：静默兜底正是本次维度事故的隐患来源，
+		// profile.embedding_dimensions 由 admin 接口校验 > 0，出现 <= 0 属数据异常，必须暴露。
+		return fmt.Errorf("profile embedding 维度无效(%d)，无法创建索引 %s", dimensions, es.AliasName)
 	}
 	versionedIndex := es.GenerateIndexName(1)
 	mapping := es.BuildIndexMapping(dimensions, analyzer)
@@ -796,6 +851,56 @@ func (h *IndexJobHandler) ensureAliasAndIndex(ctx context.Context, dimensions in
 	return nil
 }
 
+// rebuildAbsentListLimit 是判断"是否已有 rebuild_index 在队列中"时每次查询的条数上限。
+// 引入动机：去重只需检查最近一批 pending/running job，限定条数避免为一次判断拉取整张 jobs 表。
+const rebuildAbsentListLimit = 50
+
+// enqueueRebuildIfAbsent 在队列中不存在待执行或执行中的 rebuild_index 时投递一次全量重建。
+//
+// 引入动机：index_document 兜底路径发现索引维度与 profile 不一致时，必须让系统自动重建到
+// 正确维度，否则该文档的写入会永久失败。查询队列是为了避免每个 index_document 都重复入队。
+//
+// 去重为尽力而为：List 与 Enqueue 之间存在并发窗口，极端情况下可能入队 2 个 rebuild_index，
+// 但 rebuild 幂等（第二个会复用刚建好的索引），不会造成数据损坏，仅多一次空转。
+func (h *IndexJobHandler) enqueueRebuildIfAbsent(ctx context.Context, profileID string) error {
+	if h.jobRepo == nil {
+		// 不允许静默跳过：维度不一致已使当前索引不可写，若不投递重建，
+		// index_document 会永久失败且没有任何自愈路径。返回错误保证调用方与日志都能看到。
+		return fmt.Errorf("索引维度与 profile 不一致需要入队 %s，但 jobRepo 未注入", types.JobRebuildIndex)
+	}
+
+	for _, status := range []string{"pending", "running"} {
+		result, err := h.jobRepo.List(ctx, status, rebuildAbsentListLimit, 0)
+		if err != nil {
+			return fmt.Errorf("查询 %s 状态的 job 以判断是否已有 %s: %w", status, types.JobRebuildIndex, err)
+		}
+		if result == nil {
+			return fmt.Errorf("查询 %s 状态的 job 返回空结果集", status)
+		}
+		for _, existing := range result.Jobs {
+			if existing.Type == types.JobRebuildIndex {
+				slog.Info("已存在待执行/执行中的 rebuild_index，跳过重复入队",
+					"status", status, "existing_job_id", existing.ID)
+				return nil
+			}
+		}
+	}
+
+	nextIndexName, err := es.NextIndexName(ctx, h.esClient)
+	if err != nil {
+		return fmt.Errorf("计算重建目标索引名: %w", err)
+	}
+	if _, err := h.jobRepo.Enqueue(ctx, types.JobRebuildIndex, map[string]interface{}{
+		"index_name": nextIndexName,
+		"profile_id": profileID,
+	}); err != nil {
+		return fmt.Errorf("入队 %s（index_name=%s, profile_id=%s）: %w",
+			types.JobRebuildIndex, nextIndexName, profileID, err)
+	}
+	slog.Info("已入队 rebuild_index 以修复索引维度不一致", "index_name", nextIndexName, "profile_id", profileID)
+	return nil
+}
+
 // handleRebuildIndex 处理全量重建索引任务。
 // 引入动机：C7 要求 rebuild 基于新 profile 创建新 versioned index → reindex → refresh →
 // integrity validation → alias 原子切换 → PG 持久 profile indexname/status。
@@ -805,22 +910,24 @@ func (h *IndexJobHandler) ensureAliasAndIndex(ctx context.Context, dimensions in
 //     绝不依赖 ES auto-create 或手动预建。
 //   - 索引已存在时不重复创建，直接使用。
 //   - alias 切换使用 ES8 兼容的嵌套 JSON 格式（通过 AliasAction.MarshalJSON 实现）。
+//
+// 维度自愈（本次新增）：ES 的 dense_vector.dims 建好后不可变。当目标索引的 embedding 维度
+// 与 active profile 不一致时，复用该索引会让后续写入必然被 ES 以 400 拒绝。此时自动申请
+// 一个新索引名承载正确维度的 mapping，全量重建后切换 alias，并把新索引名回写 profile。
 func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) error {
 	indexName, _ := job.Payload["index_name"].(string)
 	workspaceID, _ := job.Payload["workspace_id"].(string)
 	profileID, _ := job.Payload["profile_id"].(string)
 
-	if indexName == "" {
-		return fmt.Errorf("缺少 index_name")
-	}
-
 	// 获取 profile 配置
 	var profileConfig *types.SearchProfileConfig
+	var activeProfile *ProfileForJob
 	var analyzer string
 	var dimensions int
 	if h.profileRepo != nil {
 		p, err := h.profileRepo.GetActiveProfile(ctx)
 		if err == nil && p != nil {
+			activeProfile = p
 			profileConfig = &types.SearchProfileConfig{
 				ChunkTargetSize:           p.ChunkTargetSize,
 				ChunkOverlap:              p.ChunkOverlap,
@@ -833,22 +940,56 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 		}
 	}
 
+	// 目标索引名：payload 未指定时回退到 active profile 记录的索引名。
+	// 引入动机：自动入队的 rebuild_index 可能不带 index_name（例如"激活 profile"链路），
+	// 此时必须能确定"当前正在使用的索引"，才能判断维度是否一致。
+	if indexName == "" {
+		if activeProfile == nil || activeProfile.ESIndexName == "" {
+			return fmt.Errorf("缺少 index_name 且 active profile 未提供 ES 索引名")
+		}
+		indexName = activeProfile.ESIndexName
+	}
+
 	// Phase 6 修复：目标索引不存在时显式创建正确 mapping。
 	// 引入动机：原实现依赖 ES auto-create 或外部预建索引，不符合设计要求。
 	// 现在通过 IndexExists 检查，不存在时使用 active profile 的 dimensions 和 analyzer
 	// 调用 BuildIndexMapping 创建正确 mapping，再 CreateIndex。
-	// 索引已存在时不重复创建，避免覆盖已有数据。
+	// 索引已存在且维度一致时不重复创建，避免覆盖已有数据。
 	exists, err := h.esClient.IndexExists(ctx, indexName)
 	if err != nil {
 		return fmt.Errorf("检查索引 %s 是否存在: %w", indexName, err)
 	}
-	if !exists {
+
+	// needCreate 表示是否必须新建索引。
+	needCreate := !exists
+	if exists && dimensions > 0 {
+		existingDims, dimsErr := h.esClient.GetIndexDimensions(ctx, indexName)
+		if dimsErr != nil {
+			return fmt.Errorf("读取索引 %s 的 embedding 维度: %w", indexName, dimsErr)
+		}
+		if existingDims > 0 && existingDims != dimensions {
+			// 维度不一致：旧索引的 dense_vector.dims 不可变，必须换用新索引名重建。
+			newIndexName, nextErr := es.NextIndexName(ctx, h.esClient)
+			if nextErr != nil {
+				return fmt.Errorf("为 %d 维 embedding 计算新索引名: %w", dimensions, nextErr)
+			}
+			slog.Warn("索引维度与 profile 不一致，自动创建新索引",
+				"old_index", indexName, "old_dims", existingDims,
+				"new_index", newIndexName, "profile_dims", dimensions)
+			indexName = newIndexName
+			needCreate = true
+		}
+	}
+
+	if needCreate {
 		// 确保有有效的 analyzer 和 dimensions
 		if analyzer == "" {
 			analyzer = "standard"
 		}
 		if dimensions <= 0 {
-			dimensions = 1024
+			// 移除原先的 dimensions = 1024 兜底（引入动机）：静默兜底正是本次维度事故的隐患来源，
+			// profile.embedding_dimensions 由 admin 接口校验 > 0，出现 <= 0 属数据异常，必须暴露。
+			return fmt.Errorf("profile embedding 维度无效(%d)，无法创建索引 %s", dimensions, indexName)
 		}
 		mapping := es.BuildIndexMapping(dimensions, analyzer)
 		if err := h.esClient.CreateIndex(ctx, indexName, mapping); err != nil {
@@ -960,6 +1101,25 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 	if err := es.SwitchAlias(ctx, h.esClient, es.AliasName, indexName); err != nil {
 		slog.Error("alias 切换失败，保留旧 alias 和旧索引", "index", indexName, "error", err)
 		return fmt.Errorf("alias 切换失败: %w", err)
+	}
+
+	// 回写 profile 的 es_index_name。
+	//
+	// 引入动机：维度不一致时 rebuild 会创建并切换到新索引（如 knowledge_v1 → knowledge_v2）。
+	// 若不把新索引名写回 profile，profile 记录与 alias 实际指向不一致，后续 rebuild/rollback
+	// 会再次基于旧索引名选错目标。因此回写失败必须让 job 失败，绝不吞掉。
+	if h.profileRepo != nil {
+		writebackProfileID := profileID
+		if writebackProfileID == "" && activeProfile != nil {
+			writebackProfileID = activeProfile.ID
+		}
+		if writebackProfileID == "" {
+			// 无法确定 profile 就无从回写，用 Warn 让该情况在日志中可见，而不是完全静默。
+			slog.Warn("rebuild 完成但无法确定 profile_id，跳过 es_index_name 回写",
+				"index", indexName, "payload_profile_id", profileID)
+		} else if err := h.profileRepo.UpdateProfileESIndex(ctx, writebackProfileID, indexName); err != nil {
+			return fmt.Errorf("回写 profile %s 的 es_index_name=%s: %w", writebackProfileID, indexName, err)
+		}
 	}
 
 	slog.Info("全量重建索引完成", "index", indexName, "documents", len(docs), "indexed", indexedCount, "failed", failedCount, "profile_id", profileID)

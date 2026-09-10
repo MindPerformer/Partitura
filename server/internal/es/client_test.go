@@ -21,14 +21,24 @@ type FakeClient struct {
 	aliasIndex string
 	docs       map[string]map[string]map[string]interface{} // index -> docID -> body
 	pingOK     bool
+
+	// indexDimensions 记录各索引的 embedding 维度，供 GetIndexDimensions 返回。
+	// 未记录的索引（含不存在的索引）返回 (0, nil)，与 HTTPClient 对 404
+	// 和缺少 embedding 字段的语义保持一致。
+	indexDimensions map[string]int
+	// listIndicesErr 非 nil 时 ListIndices 返回该错误，用于验证调用方不吞错误。
+	listIndicesErr error
+	// lastListPattern 记录最后一次 ListIndices 使用的 pattern，便于测试断言调用约定。
+	lastListPattern string
 }
 
 // NewFakeClient 创建测试用 fake ES 客户端。
 func NewFakeClient() *FakeClient {
 	return &FakeClient{
-		indices: make(map[string]bool),
-		docs:    make(map[string]map[string]map[string]interface{}),
-		pingOK:  true,
+		indices:         make(map[string]bool),
+		docs:            make(map[string]map[string]map[string]interface{}),
+		pingOK:          true,
+		indexDimensions: make(map[string]int),
 	}
 }
 
@@ -53,6 +63,23 @@ func (c *FakeClient) DeleteIndex(ctx context.Context, indexName string) error {
 
 func (c *FakeClient) IndexExists(ctx context.Context, indexName string) (bool, error) {
 	return c.indices[indexName], nil
+}
+
+// GetIndexDimensions 返回 fake 中记录的索引 embedding 维度。
+// 引入动机：测试需要在不依赖真实 ES 的前提下模拟"已存在索引的 mapping 维度为 N"，
+// 以及"索引不存在/无 embedding 字段 → (0, nil)"，用于验证调用方的维度不一致判断。
+func (c *FakeClient) GetIndexDimensions(ctx context.Context, indexName string) (int, error) {
+	return c.indexDimensions[indexName], nil
+}
+
+// SetIndexDimensions 设置某索引的 embedding 维度，模拟已存在索引的 mapping dims。
+func (c *FakeClient) SetIndexDimensions(indexName string, dims int) {
+	c.indexDimensions[indexName] = dims
+}
+
+// SetListIndicesErr 设置 ListIndices 是否返回错误，用于验证调用方不吞错误。
+func (c *FakeClient) SetListIndicesErr(err error) {
+	c.listIndicesErr = err
 }
 
 func (c *FakeClient) UpdateAlias(ctx context.Context, actions []AliasAction) error {
@@ -125,6 +152,10 @@ func (c *FakeClient) Refresh(ctx context.Context, indexName string) error {
 }
 
 func (c *FakeClient) ListIndices(ctx context.Context, pattern string) ([]string, error) {
+	c.lastListPattern = pattern
+	if c.listIndicesErr != nil {
+		return nil, c.listIndicesErr
+	}
 	// 简化：返回所有已创建的索引名，不做 pattern 匹配
 	// 测试场景中索引数量有限，直接返回全部即可
 	result := make([]string, 0, len(c.indices))
@@ -142,6 +173,7 @@ func (c *FakeClient) SetPingOK(ok bool) {
 // 错误定义
 var errFakeESUnavailable = &fakeError{msg: "ES 不可用"}
 var errFakeAliasNotFound = &fakeError{msg: "alias 不存在"}
+var errFakeListIndices = &fakeError{msg: "ListIndices 失败"}
 
 type fakeError struct{ msg string }
 
@@ -304,5 +336,237 @@ func TestHTTPClient_BulkIndexIncludesItemErrorDetails(t *testing.T) {
 	}
 	if strings.Contains(message, "do-not-log") {
 		t.Error("BulkIndex 错误不应泄露请求文档内容")
+	}
+}
+
+// var _ Client 在编译期断言 FakeClient 完整实现 Client 接口。
+// 引入动机：Client 接口新增方法后，若 fake 未同步实现，会让依赖该 fake 的测试静默失配。
+var _ Client = (*FakeClient)(nil)
+
+// TestGetIndexDimensions 验证 HTTPClient 从 _mapping 响应读取真实 embedding 维度。
+// 引入动机：index_document 需要据此检测 search profile 的 embedding 维度与既有索引
+// mapping 维度不一致，从而创建新索引重建，而不是把向量写入维度不可变的旧索引。
+func TestGetIndexDimensions(t *testing.T) {
+	tests := []struct {
+		name     string
+		status   int
+		body     string
+		wantDims int
+		wantErr  bool
+	}{
+		{
+			name:     "200 且 dims=4096 返回真实维度",
+			status:   http.StatusOK,
+			body:     `{"knowledge_v1":{"mappings":{"properties":{"embedding":{"type":"dense_vector","dims":4096}}}}}`,
+			wantDims: 4096,
+		},
+		{
+			name:     "404 索引不存在返回 0 且无错误",
+			status:   http.StatusNotFound,
+			body:     `{"error":{"type":"index_not_found_exception","reason":"no such index [knowledge_v1]"}}`,
+			wantDims: 0,
+		},
+		{
+			name:     "200 但无 embedding 字段返回 0 且无错误",
+			status:   http.StatusOK,
+			body:     `{"knowledge_current":{"mappings":{"properties":{"title":{"type":"text"}}}}}`,
+			wantDims: 0,
+		},
+		{
+			name:    "200 但非法 JSON 返回错误",
+			status:  http.StatusOK,
+			body:    `{"knowledge_v1":{"mappings":`,
+			wantErr: true,
+		},
+		{
+			name:    "200 但 dims 非正数返回错误",
+			status:  http.StatusOK,
+			body:    `{"knowledge_v1":{"mappings":{"properties":{"embedding":{"type":"dense_vector","dims":0}}}}}`,
+			wantErr: true,
+		},
+		{
+			name:    "200 但响应无索引条目返回错误",
+			status:  http.StatusOK,
+			body:    `{}`,
+			wantErr: true,
+		},
+		{
+			name:    "200 但含多个索引条目返回错误",
+			status:  http.StatusOK,
+			body:    `{"knowledge_v1":{"mappings":{"properties":{"embedding":{"dims":1024}}}},"knowledge_v2":{"mappings":{"properties":{"embedding":{"dims":4096}}}}}`,
+			wantErr: true,
+		},
+		{
+			name:    "500 返回错误",
+			status:  http.StatusInternalServerError,
+			body:    `{"error":"boom"}`,
+			wantErr: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("请求方法 = %s, 期望 GET", r.Method)
+				}
+				if r.URL.Path != "/knowledge_v1/_mapping" {
+					t.Errorf("请求路径 = %s, 期望 /knowledge_v1/_mapping", r.URL.Path)
+				}
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(tc.status)
+				_, _ = w.Write([]byte(tc.body))
+			}))
+			defer server.Close()
+
+			client := NewHTTPClient(server.URL, time.Second)
+			dims, err := client.GetIndexDimensions(context.Background(), "knowledge_v1")
+
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("应返回错误，但得到 dims=%d", dims)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("不应返回错误: %v", err)
+			}
+			if dims != tc.wantDims {
+				t.Errorf("dims = %d, 期望 %d", dims, tc.wantDims)
+			}
+		})
+	}
+}
+
+// TestNextIndexName 验证版本化索引名的递增计算。
+// 引入动机：维度不一致时需要一个新的 knowledge_v{n} 索引名承载正确维度的 mapping，
+// 必须与既有索引集不冲突。
+func TestNextIndexName(t *testing.T) {
+	t.Run("索引集为空返回 knowledge_v1", func(t *testing.T) {
+		client := NewFakeClient()
+
+		name, err := NextIndexName(context.Background(), client)
+		if err != nil {
+			t.Fatalf("NextIndexName 失败: %v", err)
+		}
+		if name != "knowledge_v1" {
+			t.Errorf("索引集为空应返回 knowledge_v1，得到 %s", name)
+		}
+		if client.lastListPattern != IndexNamePrefix+"*" {
+			t.Errorf("ListIndices pattern = %q, 期望 %q", client.lastListPattern, IndexNamePrefix+"*")
+		}
+	})
+
+	t.Run("返回最大版本号加一", func(t *testing.T) {
+		client := NewFakeClient()
+		ctx := context.Background()
+		for _, index := range []string{"knowledge_v1", "knowledge_v3"} {
+			if err := client.CreateIndex(ctx, index, nil); err != nil {
+				t.Fatalf("CreateIndex(%s) 失败: %v", index, err)
+			}
+		}
+
+		name, err := NextIndexName(ctx, client)
+		if err != nil {
+			t.Fatalf("NextIndexName 失败: %v", err)
+		}
+		if name != "knowledge_v4" {
+			t.Errorf("最大版本号为 3 时应返回 knowledge_v4，得到 %s", name)
+		}
+	})
+
+	t.Run("忽略非版本化索引名", func(t *testing.T) {
+		client := NewFakeClient()
+		ctx := context.Background()
+		// fake 的 ListIndices 不按 pattern 过滤，因此这里同时放入不匹配 pattern 的
+		// knowledge_current、other_v9，以及匹配 pattern 但非 knowledge_v{n} 形式的
+		// knowledge_v1_backup，三者都必须被忽略。
+		for _, index := range []string{"knowledge_v1", "knowledge_current", "knowledge_v1_backup", "other_v9"} {
+			if err := client.CreateIndex(ctx, index, nil); err != nil {
+				t.Fatalf("CreateIndex(%s) 失败: %v", index, err)
+			}
+		}
+
+		name, err := NextIndexName(ctx, client)
+		if err != nil {
+			t.Fatalf("NextIndexName 失败: %v", err)
+		}
+		if name != "knowledge_v2" {
+			t.Errorf("只有 knowledge_v1 是有效版本名，应返回 knowledge_v2，得到 %s", name)
+		}
+	})
+
+	t.Run("ListIndices 出错时不吞错误", func(t *testing.T) {
+		client := NewFakeClient()
+		client.SetListIndicesErr(errFakeListIndices)
+
+		name, err := NextIndexName(context.Background(), client)
+		if err == nil {
+			t.Fatal("ListIndices 出错时 NextIndexName 应返回错误")
+		}
+		if name != "" {
+			t.Errorf("出错时应返回空索引名，得到 %s", name)
+		}
+		if !strings.Contains(err.Error(), errFakeListIndices.Error()) {
+			t.Errorf("错误 %q 应包装底层错误 %q", err, errFakeListIndices.Error())
+		}
+	})
+}
+
+// TestParseIndexVersion 直接验证索引名版本号解析，包括必须被拒绝的畸形名字。
+func TestParseIndexVersion(t *testing.T) {
+	tests := []struct {
+		index       string
+		wantVersion int
+		wantOK      bool
+	}{
+		{index: "knowledge_v1", wantVersion: 1, wantOK: true},
+		{index: "knowledge_v12", wantVersion: 12, wantOK: true},
+		{index: "knowledge_current", wantOK: false},
+		{index: "knowledge_v", wantOK: false},
+		{index: "knowledge_v1_backup", wantOK: false},
+		{index: "knowledge_v-1", wantOK: false},
+		{index: "knowledge_vone", wantOK: false},
+		{index: "other_v2", wantOK: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.index, func(t *testing.T) {
+			version, ok := parseIndexVersion(tc.index)
+			if ok != tc.wantOK {
+				t.Fatalf("parseIndexVersion(%q) ok = %v, 期望 %v", tc.index, ok, tc.wantOK)
+			}
+			if version != tc.wantVersion {
+				t.Errorf("parseIndexVersion(%q) version = %d, 期望 %d", tc.index, version, tc.wantVersion)
+			}
+		})
+	}
+}
+
+// TestFakeClient_GetIndexDimensions 验证 fake 能表达"某索引 dims 为 N"和"索引不存在"。
+func TestFakeClient_GetIndexDimensions(t *testing.T) {
+	client := NewFakeClient()
+	ctx := context.Background()
+
+	if err := client.CreateIndex(ctx, "knowledge_v1", nil); err != nil {
+		t.Fatalf("CreateIndex 失败: %v", err)
+	}
+	client.SetIndexDimensions("knowledge_v1", 4096)
+
+	dims, err := client.GetIndexDimensions(ctx, "knowledge_v1")
+	if err != nil {
+		t.Fatalf("GetIndexDimensions 失败: %v", err)
+	}
+	if dims != 4096 {
+		t.Errorf("dims = %d, 期望 4096", dims)
+	}
+
+	// 未设置维度的索引（含不存在的索引）返回 (0, nil)，与 HTTPClient 的 404 语义一致。
+	dims, err = client.GetIndexDimensions(ctx, "knowledge_v2")
+	if err != nil {
+		t.Fatalf("索引不存在时不应返回错误: %v", err)
+	}
+	if dims != 0 {
+		t.Errorf("索引不存在时 dims = %d, 期望 0", dims)
 	}
 }

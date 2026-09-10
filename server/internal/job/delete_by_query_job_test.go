@@ -137,7 +137,7 @@ func TestHandleIndexDocument_NoIndexExists(t *testing.T) {
 		},
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,

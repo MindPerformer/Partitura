@@ -74,6 +74,14 @@ type mockProfileRepoExt struct {
 	activated   []string
 	candidates  []mockCandidateRecord
 	updatedCands []mockUpdatedCandidate
+	// updatedESIndex 记录 UpdateProfileESIndex 调用，保持 ProfileRepo 接口实现完整。
+	updatedESIndex []mockProfileIndexUpdate
+}
+
+// mockProfileIndexUpdate 记录一次 profile → ES 索引名回写。
+type mockProfileIndexUpdate struct {
+	ProfileID string
+	IndexName string
 }
 
 type mockCandidateRecord struct {
@@ -150,6 +158,14 @@ func (m *mockProfileRepoExt) CreateCandidateProfile(ctx context.Context, base *P
 
 func (m *mockProfileRepoExt) ActivateProfile(ctx context.Context, id string) error {
 	m.activated = append(m.activated, id)
+	return nil
+}
+
+// UpdateProfileESIndex 记录 profile 的 ES 索引名回写。
+// 引入动机：ProfileRepo 接口新增该方法以支持 rebuild 维度自愈后回写新索引名；
+// 本 mock 服务于 eval handler 测试，记录调用以便未来断言且保持接口完整。
+func (m *mockProfileRepoExt) UpdateProfileESIndex(ctx context.Context, id, indexName string) error {
+	m.updatedESIndex = append(m.updatedESIndex, mockProfileIndexUpdate{ProfileID: id, IndexName: indexName})
 	return nil
 }
 

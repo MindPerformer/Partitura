@@ -50,7 +50,7 @@ func TestHandleIndexDocument_EmbeddingFailure_ReturnsError(t *testing.T) {
 		return nil, fmt.Errorf("embedding API 调用失败: 连接超时")
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -113,7 +113,7 @@ func TestHandleRebuildIndex_EmbeddingFailure_Aborts(t *testing.T) {
 		return nil, fmt.Errorf("embedding API 503: service unavailable")
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,
@@ -169,7 +169,7 @@ func TestHandleIndexDocument_DimensionMismatch_Fails(t *testing.T) {
 		return vectors, nil
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -234,7 +234,7 @@ func TestHandleIndexDocument_CorrectDimensions_WritesChunks(t *testing.T) {
 		return vectors, nil
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -344,7 +344,7 @@ func TestHandleRebuildIndex_NoProvider_LexicalOnly(t *testing.T) {
 		return nil, fmt.Errorf("should not be called")
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,
@@ -398,7 +398,7 @@ func TestHandleIndexDocument_NoProvider_LexicalOnly(t *testing.T) {
 		return nil, fmt.Errorf("should not be called")
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -448,7 +448,7 @@ func TestHandleRebuildIndex_ESDeleteByQueryPreserved(t *testing.T) {
 		},
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,
@@ -493,7 +493,7 @@ func TestHandleIndexDocument_AliasSwitchPreserved(t *testing.T) {
 		},
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -551,7 +551,7 @@ func TestHandleIndexDocument_EmbeddingCountMismatch_Fails(t *testing.T) {
 		return vectors, nil
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -618,7 +618,7 @@ func TestHandleRebuildIndex_EmptyWorkspace_Succeeds(t *testing.T) {
 		},
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,

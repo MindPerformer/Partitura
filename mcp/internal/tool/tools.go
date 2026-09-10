@@ -162,6 +162,38 @@ func jsonResult(data interface{}) (*protocol.ToolResult, error) {
 	return textResult(string(jsonBytes)), nil
 }
 
+// stripContentMarkdown 递归移除响应中的 content_markdown 字段。
+// 引入动机：服务端文档响应携带完整正文，写操作把全文回传给 Agent 会占用大量上下文，
+// 而写操作的结果通常只需要 revision/hash 等元数据。
+// 递归处理是为了同时覆盖 patch 的 rebase 结果这类嵌套结构。
+func stripContentMarkdown(value interface{}) interface{} {
+	switch v := value.(type) {
+	case map[string]interface{}:
+		delete(v, "content_markdown")
+		for key, item := range v {
+			v[key] = stripContentMarkdown(item)
+		}
+		return v
+	case []interface{}:
+		for i, item := range v {
+			v[i] = stripContentMarkdown(item)
+		}
+		return v
+	default:
+		return value
+	}
+}
+
+// writeResult 构建写操作的工具结果。
+// 引入动机：写操作默认不回传 content_markdown，避免把整篇文档重新灌回 Agent 上下文；
+// 只有调用方显式传 verbose=true 时才返回完整响应。
+func writeResult(result interface{}, verbose bool) (*protocol.ToolResult, error) {
+	if !verbose {
+		result = stripContentMarkdown(result)
+	}
+	return jsonResult(result)
+}
+
 // computeHash 计算 SHA-256 十六进制摘要。
 // 引入动机：document_patch 需要本地计算 hash 用于 expected_hash。
 func computeHash(content string) string {
@@ -842,6 +874,10 @@ func (r *Registry) documentCreateTool() *protocol.Tool {
 					"type":        "string",
 					"description": "Markdown content",
 				},
+				"verbose": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+				},
 			},
 			"required": []string{"path", "title", "content_markdown"},
 		},
@@ -858,6 +894,7 @@ func (r *Registry) handleDocumentCreate(args json.RawMessage) (*protocol.ToolRes
 		Title           string `json:"title"`
 		Type            string `json:"type"`
 		ContentMarkdown string `json:"content_markdown"`
+		Verbose         bool   `json:"verbose"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -890,7 +927,7 @@ func (r *Registry) handleDocumentCreate(args json.RawMessage) (*protocol.ToolRes
 
 	// 失效缓存
 	r.cache.Invalidate(cacheKey(r.wsState.ID(), "list"))
-	return jsonResult(result)
+	return writeResult(result, params.Verbose)
 }
 
 func (r *Registry) documentReplaceTool() *protocol.Tool {
@@ -924,6 +961,10 @@ func (r *Registry) documentReplaceTool() *protocol.Tool {
 					"type":        "string",
 					"description": "Expected current content hash (optimistic concurrency control)",
 				},
+				"verbose": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+				},
 			},
 			"required": []string{"path", "title", "content_markdown", "expected_revision", "expected_hash"},
 		},
@@ -942,6 +983,7 @@ func (r *Registry) handleDocumentReplace(args json.RawMessage) (*protocol.ToolRe
 		ContentMarkdown  string `json:"content_markdown"`
 		ExpectedRevision int    `json:"expected_revision"`
 		ExpectedHash     string `json:"expected_hash"`
+		Verbose          bool   `json:"verbose"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -979,7 +1021,7 @@ func (r *Registry) handleDocumentReplace(args json.RawMessage) (*protocol.ToolRe
 	// 失效缓存
 	r.cache.Invalidate(cacheKey(r.wsState.ID(), "read:"+params.Path))
 	r.cache.Invalidate(cacheKey(r.wsState.ID(), "outline:"+params.Path))
-	return jsonResult(result)
+	return writeResult(result, params.Verbose)
 }
 
 // uploadDocumentFileTool defines the MCP tool for creating a Workspace document from a local file.
@@ -1011,6 +1053,10 @@ func (r *Registry) uploadDocumentFileTool() *protocol.Tool {
 					"type":        "string",
 					"description": "Document type (optional)",
 				},
+				"verbose": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+				},
 			},
 			"required": []string{"path", "file_path"},
 		},
@@ -1030,6 +1076,7 @@ func (r *Registry) handleUploadDocumentFile(args json.RawMessage) (*protocol.Too
 		Title     string `json:"title"`
 		Type      string `json:"type"`
 		Overwrite bool   `json:"overwrite"`
+		Verbose   bool   `json:"verbose"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -1112,7 +1159,7 @@ func (r *Registry) handleUploadDocumentFile(args json.RawMessage) (*protocol.Too
 		r.cache.Invalidate(cacheKey(r.wsState.ID(), "read:"+params.Path))
 		r.cache.Invalidate(cacheKey(r.wsState.ID(), "outline:"+params.Path))
 		slog.Info("overwrote document from local file", "path", params.Path, "bytes", len(contentBytes))
-		return jsonResult(result)
+		return writeResult(result, params.Verbose)
 	}
 
 	createURL := fmt.Sprintf("/api/workspaces/%s/documents", r.wsState.ID())
@@ -1131,7 +1178,7 @@ func (r *Registry) handleUploadDocumentFile(args json.RawMessage) (*protocol.Too
 
 	r.cache.Invalidate(cacheKey(r.wsState.ID(), "list"))
 	slog.Info("created document from local file", "path", params.Path, "bytes", len(contentBytes))
-	return jsonResult(result)
+	return writeResult(result, params.Verbose)
 }
 
 func (r *Registry) documentMoveTool() *protocol.Tool {
@@ -1157,6 +1204,10 @@ func (r *Registry) documentMoveTool() *protocol.Tool {
 					"type":        "string",
 					"description": "Expected current content hash",
 				},
+				"verbose": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+				},
 			},
 			"required": []string{"path", "new_path", "expected_revision", "expected_hash"},
 		},
@@ -1173,6 +1224,7 @@ func (r *Registry) handleDocumentMove(args json.RawMessage) (*protocol.ToolResul
 		NewPath          string `json:"new_path"`
 		ExpectedRevision int    `json:"expected_revision"`
 		ExpectedHash     string `json:"expected_hash"`
+		Verbose          bool   `json:"verbose"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -1206,7 +1258,7 @@ func (r *Registry) handleDocumentMove(args json.RawMessage) (*protocol.ToolResul
 	r.cache.Invalidate(cacheKey(r.wsState.ID(), "read:"+params.Path))
 	r.cache.Invalidate(cacheKey(r.wsState.ID(), "outline:"+params.Path))
 	r.cache.Invalidate(cacheKey(r.wsState.ID(), "list"))
-	return jsonResult(result)
+	return writeResult(result, params.Verbose)
 }
 
 func (r *Registry) documentArchiveTool() *protocol.Tool {
@@ -1232,6 +1284,10 @@ func (r *Registry) documentArchiveTool() *protocol.Tool {
 					"type":        "boolean",
 					"description": "When true, permanently delete the document instead of archiving it; requires owner permission and ignores expected_revision/expected_hash",
 				},
+				"verbose": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+				},
 			},
 			"required": []string{"path"},
 		},
@@ -1248,6 +1304,7 @@ func (r *Registry) handleDocumentArchive(args json.RawMessage) (*protocol.ToolRe
 		ExpectedRevision int    `json:"expected_revision"`
 		ExpectedHash     string `json:"expected_hash"`
 		Delete           bool   `json:"delete"`
+		Verbose          bool   `json:"verbose"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -1281,7 +1338,7 @@ func (r *Registry) handleDocumentArchive(args json.RawMessage) (*protocol.ToolRe
 		r.cache.Invalidate(cacheKey(wsID, "outline:"+params.Path))
 		r.cache.Invalidate(cacheKey(wsID, "list"))
 		slog.Info("permanently deleted document", "path", params.Path)
-		return jsonResult(result)
+		return writeResult(result, params.Verbose)
 	}
 
 	if params.ExpectedHash == "" || params.ExpectedRevision < 1 {
@@ -1304,7 +1361,7 @@ func (r *Registry) handleDocumentArchive(args json.RawMessage) (*protocol.ToolRe
 	r.cache.Invalidate(cacheKey(wsID, "read:"+params.Path))
 	r.cache.Invalidate(cacheKey(wsID, "outline:"+params.Path))
 	r.cache.Invalidate(cacheKey(wsID, "list"))
-	return jsonResult(result)
+	return writeResult(result, params.Verbose)
 }
 
 // --- document_patch 工具（核心：本地 patch 算法 + 409 一次 rebase）---
@@ -1328,6 +1385,10 @@ func (r *Registry) documentPatchTool() *protocol.Tool {
 					"type":        "string",
 					"description": "Replacement text",
 				},
+				"verbose": map[string]interface{}{
+					"type":        "boolean",
+					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+				},
 			},
 			"required": []string{"path", "old_text", "new_text"},
 		},
@@ -1343,6 +1404,7 @@ func (r *Registry) handleDocumentPatch(args json.RawMessage) (*protocol.ToolResu
 		Path    string `json:"path"`
 		OldText string `json:"old_text"`
 		NewText string `json:"new_text"`
+		Verbose bool   `json:"verbose"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -1406,7 +1468,7 @@ func (r *Registry) handleDocumentPatch(args json.RawMessage) (*protocol.ToolResu
 	// 失效缓存
 	r.cache.Invalidate(cacheKey)
 
-	return jsonResult(patchResult)
+	return writeResult(patchResult, params.Verbose)
 }
 
 // applyPatchAndUpload 执行 patch 的核心逻辑：验证唯一匹配 → 本地生成 candidate → 计算 hash → 上传。

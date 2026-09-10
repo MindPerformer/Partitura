@@ -23,6 +23,7 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -52,6 +53,12 @@ type Client interface {
 
 	// IndexExists 检查指定名称的索引是否存在。
 	IndexExists(ctx context.Context, indexName string) (bool, error)
+
+	// GetIndexDimensions 读取索引 mapping 中 embedding 字段的维度（dims）。
+	// 引入动机：当 search profile 的 embedding 维度与已存在索引的 mapping 维度不一致时，
+	// rebuild/index job 需要据此判断是否必须创建新索引，而非复用维度不可变的旧索引。
+	// 索引不存在或没有 embedding 字段时返回 (0, nil)，调用方据此视为"无已知维度"。
+	GetIndexDimensions(ctx context.Context, indexName string) (int, error)
 
 	// UpdateAlias 原子性地更新 alias 指向的索引。
 	// 引入动机：design/01-SEARCH.md §Index Version 要求 alias 原子切换。
@@ -362,6 +369,72 @@ func (c *HTTPClient) GetAliasIndex(ctx context.Context, alias string) (string, e
 	}
 
 	return "", fmt.Errorf("alias %s 响应为空", alias)
+}
+
+// GetIndexDimensions 读取索引 mapping 中 embedding 字段的维度（dims）。
+//
+// 引入动机：ES 的 dense_vector.dims 建好后不可变，必须能读取既有索引的真实维度，
+// 才能检测"search profile 的 embedding 维度与既有索引 mapping 维度不一致"，
+// 进而创建新索引并重建，而不是把新维度向量写入维度不可变的旧索引（写入必然失败）。
+//
+// 语义约定：
+//   - 索引不存在（HTTP 404）→ (0, nil)，调用方据此视为"无已知维度"
+//   - 索引存在但 mapping 中没有 embedding 字段 → (0, nil)，同样视为"无已知维度"
+//     （例如向 alias 名称直接写入时 ES 自动创建的空索引）
+//   - 其他非 200 状态码、响应不是唯一索引条目、JSON 解析失败、dims 非法 → 返回 error
+func (c *HTTPClient) GetIndexDimensions(ctx context.Context, indexName string) (int, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+"/"+indexName+"/_mapping", nil)
+	if err != nil {
+		return 0, fmt.Errorf("创建 get mapping 请求: %w", err)
+	}
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return 0, fmt.Errorf("查询 index %s mapping: %w", indexName, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNotFound {
+		// 索引不存在不是错误：调用方需要"无已知维度"这一结论来决定后续动作。
+		return 0, nil
+	}
+	if resp.StatusCode != http.StatusOK {
+		return 0, fmt.Errorf("查询 index %s mapping 返回状态码 %d", indexName, resp.StatusCode)
+	}
+
+	var result map[string]struct {
+		Mappings struct {
+			Properties struct {
+				Embedding struct {
+					// 用指针区分"字段缺失"与"字段为 0"：dims 缺失时返回"无已知维度"。
+					Dims *int `json:"dims"`
+				} `json:"embedding"`
+			} `json:"properties"`
+		} `json:"mappings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, fmt.Errorf("解析 index %s mapping 响应: %w", indexName, err)
+	}
+
+	if len(result) != 1 {
+		// ES 对存在的索引必然返回唯一索引条目；0 个或多个都说明响应不符合预期。
+		return 0, fmt.Errorf("查询 index %s mapping 返回 %d 个索引条目，期望唯一索引条目", indexName, len(result))
+	}
+
+	for indexKey, entry := range result {
+		dims := entry.Mappings.Properties.Embedding.Dims
+		if dims == nil {
+			slog.Warn("index mapping 缺少 embedding.dims，视为无已知维度", "index", indexKey)
+			return 0, nil
+		}
+		if *dims <= 0 {
+			// dense_vector 的 dims 必须为正整数，出现非正值说明 mapping 异常或响应被篡改。
+			return 0, fmt.Errorf("index %s mapping 的 embedding.dims 非法: %d", indexKey, *dims)
+		}
+		return *dims, nil
+	}
+
+	return 0, fmt.Errorf("查询 index %s mapping 未得到索引条目", indexName)
 }
 
 const (
@@ -751,6 +824,59 @@ func (c *HTTPClient) ListIndices(ctx context.Context, pattern string) ([]string,
 // 使用 profile 的版本号作为索引版本号。
 func GenerateIndexName(profileVersion int) string {
 	return fmt.Sprintf("%s%d", IndexNamePrefix, profileVersion)
+}
+
+// NextIndexName 返回下一个可用的版本化索引名（如 knowledge_v4）。
+// 引入动机：当既有索引的 embedding 维度与当前 profile 不一致时，需要一个新索引名来承载
+// 正确维度的 mapping，避免复用维度不可变的旧索引。基于 ES 中现有 knowledge_v* 索引的最大
+// 版本号 +1，保证与现有索引不冲突；索引集为空时返回 knowledge_v1。
+//
+// 非 knowledge_v{n} 形式的名字（如 knowledge_current 或 knowledge_v1_backup）会被忽略，
+// 不参与最大版本号计算。
+func NextIndexName(ctx context.Context, client Client) (string, error) {
+	indices, err := client.ListIndices(ctx, IndexNamePrefix+"*")
+	if err != nil {
+		return "", fmt.Errorf("列出 %s* 索引以计算下一个索引名: %w", IndexNamePrefix, err)
+	}
+
+	maxVersion := 0
+	for _, name := range indices {
+		version, ok := parseIndexVersion(name)
+		if !ok {
+			continue
+		}
+		if version > maxVersion {
+			maxVersion = version
+		}
+	}
+
+	return GenerateIndexName(maxVersion + 1), nil
+}
+
+// parseIndexVersion 从索引名解析版本号。
+// 引入动机：NextIndexName 需要忽略非 knowledge_v{n} 形式的名字（如 knowledge_current）。
+// 返回 (version, true) 表示解析成功。
+//
+// 只接受 knowledge_v 前缀后紧跟至少一位纯十进制数字的名字，
+// 因此 knowledge_v、knowledge_v1_backup、knowledge_v-1 都视为解析失败。
+func parseIndexVersion(name string) (int, bool) {
+	suffix, hasPrefix := strings.CutPrefix(name, IndexNamePrefix)
+	if !hasPrefix || suffix == "" {
+		return 0, false
+	}
+	for _, char := range suffix {
+		if char < '0' || char > '9' {
+			return 0, false
+		}
+	}
+
+	version, err := strconv.Atoi(suffix)
+	if err != nil {
+		// 全数字后缀仍转换失败只可能是整数溢出，不能静默当作有效版本号。
+		slog.Error("索引名版本号超出整数范围，忽略该索引", "index", name, "error", err)
+		return 0, false
+	}
+	return version, true
 }
 
 // BuildIndexMapping 根据 Search Profile 配置构建 ES index mapping。

@@ -978,6 +978,283 @@ func TestDocumentArchiveWithoutDeleteArchives(t *testing.T) {
 	}
 }
 
+// --- 写操作 verbose 语义 ---
+
+// newSwitchedRegistry 创建已 switch 到 ws-1 的注册中心。
+func newSwitchedRegistry(t *testing.T, fs *fakeServer) *Registry {
+	t.Helper()
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	return r
+}
+
+// writeLocalFile 写入测试用本地文件并返回绝对路径。
+func writeLocalFile(t *testing.T, name, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), name)
+	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+		t.Fatalf("写入测试文件失败: %v", err)
+	}
+	return path
+}
+
+// documentWriteResponse 是写接口返回的文档响应，故意包含完整正文。
+const documentWriteResponse = `{"path":"notes/target.md","title":"T","content_hash":"h","revision_number":3,"content_markdown":"# Very long body\n"}`
+
+// TestWriteToolsOmitContentUnlessVerbose 验证写操作默认不回传正文，避免上下文膨胀；
+// 只有 verbose=true 才返回 content_markdown。
+func TestWriteToolsOmitContentUnlessVerbose(t *testing.T) {
+	cases := []struct {
+		name    string
+		method  string
+		pattern string
+		tool    string
+		args    map[string]interface{}
+	}{
+		{
+			name:    "document_create",
+			method:  http.MethodPost,
+			pattern: "POST /api/workspaces/ws-1/documents",
+			tool:    "document_create",
+			args:    map[string]interface{}{"path": "notes/target.md", "title": "T", "content_markdown": "# Body\n"},
+		},
+		{
+			name:    "document_replace",
+			method:  http.MethodPut,
+			pattern: "PUT /api/workspaces/ws-1/documents",
+			tool:    "document_replace",
+			args: map[string]interface{}{
+				"path": "notes/target.md", "title": "T", "content_markdown": "# Body\n",
+				"expected_revision": 2, "expected_hash": "h",
+			},
+		},
+		{
+			name:    "document_move",
+			method:  http.MethodPost,
+			pattern: "POST /api/workspaces/ws-1/documents/move",
+			tool:    "document_move",
+			args: map[string]interface{}{
+				"path": "notes/target.md", "new_path": "notes/moved.md",
+				"expected_revision": 2, "expected_hash": "h",
+			},
+		},
+		{
+			name:    "document_archive",
+			method:  http.MethodPost,
+			pattern: "POST /api/workspaces/ws-1/documents/archive",
+			tool:    "document_archive",
+			args:    map[string]interface{}{"path": "notes/target.md", "expected_revision": 2, "expected_hash": "h"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := newFakeServer()
+			defer fs.close()
+			fs.mux.HandleFunc(tc.pattern, fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				_, _ = w.Write([]byte(documentWriteResponse))
+			}))
+
+			r := newSwitchedRegistry(t, fs)
+
+			// 默认：响应不含正文。
+			args, err := json.Marshal(tc.args)
+			if err != nil {
+				t.Fatalf("序列化参数失败: %v", err)
+			}
+			result, err := callToolByName(r, tc.tool, args)
+			if err != nil {
+				t.Fatalf("意外错误: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("调用失败: %s", result.Content[0].Text)
+			}
+			text := result.Content[0].Text
+			if strings.Contains(text, "content_markdown") {
+				t.Fatalf("默认响应不应包含 content_markdown: %s", text)
+			}
+			if !strings.Contains(text, `"revision_number": 3`) {
+				t.Fatalf("默认响应应保留元数据: %s", text)
+			}
+
+			// verbose=true：响应包含正文。
+			verboseArgs := make(map[string]interface{}, len(tc.args)+1)
+			for k, v := range tc.args {
+				verboseArgs[k] = v
+			}
+			verboseArgs["verbose"] = true
+			args, err = json.Marshal(verboseArgs)
+			if err != nil {
+				t.Fatalf("序列化参数失败: %v", err)
+			}
+			result, err = callToolByName(r, tc.tool, args)
+			if err != nil {
+				t.Fatalf("意外错误: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("调用失败: %s", result.Content[0].Text)
+			}
+			if !strings.Contains(result.Content[0].Text, "# Very long body") {
+				t.Fatalf("verbose=true 应包含正文: %s", result.Content[0].Text)
+			}
+		})
+	}
+}
+
+// TestUploadDocumentFileOmitContentUnlessVerbose 验证 upload 的创建与覆盖两条分支
+// 都遵循默认不回传正文的约定。
+func TestUploadDocumentFileOmitContentUnlessVerbose(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	fs.mux.HandleFunc("GET /api/workspaces/ws-1/documents/read", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"title":"T","type":"guide","content_hash":"h","revision_number":2}`))
+	}))
+	fs.mux.HandleFunc("POST /api/workspaces/ws-1/documents", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(documentWriteResponse))
+	}))
+	fs.mux.HandleFunc("PUT /api/workspaces/ws-1/documents", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(documentWriteResponse))
+	}))
+
+	localPath := writeLocalFile(t, "source.md", "# Body\n")
+	r := newSwitchedRegistry(t, fs)
+
+	for _, overwrite := range []bool{false, true} {
+		name := "create"
+		if overwrite {
+			name = "overwrite"
+		}
+		t.Run(name, func(t *testing.T) {
+			args, _ := json.Marshal(map[string]interface{}{
+				"path":      "notes/target.md",
+				"file_path": localPath,
+				"overwrite": overwrite,
+			})
+			result, err := callToolByName(r, "upload_document_file", args)
+			if err != nil {
+				t.Fatalf("意外错误: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("调用失败: %s", result.Content[0].Text)
+			}
+			if strings.Contains(result.Content[0].Text, "content_markdown") {
+				t.Fatalf("默认响应不应包含 content_markdown: %s", result.Content[0].Text)
+			}
+
+			verboseArgs, _ := json.Marshal(map[string]interface{}{
+				"path":      "notes/target.md",
+				"file_path": localPath,
+				"overwrite": overwrite,
+				"verbose":   true,
+			})
+			result, err = callToolByName(r, "upload_document_file", verboseArgs)
+			if err != nil {
+				t.Fatalf("意外错误: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("调用失败: %s", result.Content[0].Text)
+			}
+			if !strings.Contains(result.Content[0].Text, "# Very long body") {
+				t.Fatalf("verbose=true 应包含正文: %s", result.Content[0].Text)
+			}
+		})
+	}
+}
+
+// TestDocumentPatchOmitContentUnlessVerbose 验证 patch 成功路径同样默认不回传正文。
+func TestDocumentPatchOmitContentUnlessVerbose(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+	fs.mux.HandleFunc("GET /api/workspaces/ws-1/documents/read", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"content_markdown":"# Test\n","content_hash":"base-hash","revision_number":1}`))
+	}))
+	fs.mux.HandleFunc("PATCH /api/workspaces/ws-1/documents", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(documentWriteResponse))
+	}))
+
+	r := newSwitchedRegistry(t, fs)
+
+	args, _ := json.Marshal(map[string]string{
+		"path":     "notes/target.md",
+		"old_text": "# Test",
+		"new_text": "# Patched",
+	})
+	result, err := callToolByName(r, "document_patch", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("patch 失败: %s", result.Content[0].Text)
+	}
+	if strings.Contains(result.Content[0].Text, "content_markdown") {
+		t.Fatalf("默认响应不应包含 content_markdown: %s", result.Content[0].Text)
+	}
+
+	verboseArgs, _ := json.Marshal(map[string]interface{}{
+		"path":     "notes/target.md",
+		"old_text": "# Test",
+		"new_text": "# Patched",
+		"verbose":  true,
+	})
+	result, err = callToolByName(r, "document_patch", verboseArgs)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("patch 失败: %s", result.Content[0].Text)
+	}
+	if !strings.Contains(result.Content[0].Text, "# Very long body") {
+		t.Fatalf("verbose=true 应包含正文: %s", result.Content[0].Text)
+	}
+}
+
+// TestStripContentMarkdownHandlesNestedStructures 验证剥离逻辑覆盖嵌套 map 与数组，
+// 因为 patch 的 rebase 结果会把文档响应嵌在 result 字段里。
+func TestStripContentMarkdownHandlesNestedStructures(t *testing.T) {
+	input := map[string]interface{}{
+		"rebased": true,
+		"result": map[string]interface{}{
+			"content_markdown": "# Nested\n",
+			"revision_number":  2,
+		},
+		"entries": []interface{}{
+			map[string]interface{}{"content_markdown": "# Listed\n", "path": "a.md"},
+		},
+	}
+
+	stripped := stripContentMarkdown(input)
+
+	if _, exists := stripped.(map[string]interface{})["content_markdown"]; exists {
+		t.Fatal("顶层 content_markdown 未被移除")
+	}
+	nested := stripped.(map[string]interface{})["result"].(map[string]interface{})
+	if _, exists := nested["content_markdown"]; exists {
+		t.Fatal("嵌套 content_markdown 未被移除")
+	}
+	if nested["revision_number"] != 2 {
+		t.Fatalf("嵌套元数据被误删: %#v", nested)
+	}
+	entry := stripped.(map[string]interface{})["entries"].([]interface{})[0].(map[string]interface{})
+	if _, exists := entry["content_markdown"]; exists {
+		t.Fatal("数组内 content_markdown 未被移除")
+	}
+	if entry["path"] != "a.md" {
+		t.Fatalf("数组内元数据被误删: %#v", entry)
+	}
+}
+
 // --- tools/list 契约 ---
 
 // registeredTool 是 tools/list 响应中的单个工具，字段与 MCP 协议保持一致。
@@ -1140,8 +1417,12 @@ func TestToolsListContractIsEnglishAndComplete(t *testing.T) {
 				t.Errorf("工具 %s 属性 %s 不是对象", tool.Name, name)
 				continue
 			}
-			if typ, _ := prop["type"].(string); typ == "" {
+			typ, _ := prop["type"].(string)
+			if typ == "" {
 				t.Errorf("工具 %s 属性 %s 缺少 type", tool.Name, name)
+			}
+			if name == "verbose" && typ != "boolean" {
+				t.Errorf("工具 %s 的 verbose 类型应为 boolean, 得到 %v", tool.Name, typ)
 			}
 			if desc, _ := prop["description"].(string); strings.TrimSpace(desc) == "" {
 				t.Errorf("工具 %s 属性 %s 缺少 description", tool.Name, name)
@@ -1156,7 +1437,7 @@ func TestToolsListContractIsEnglishAndComplete(t *testing.T) {
 
 	// upload_document_file：本地文件导入参数，overwrite 控制是否覆盖已有文档。
 	upload := findTool(t, listResp.Result.Tools, "upload_document_file")
-	wantUploadProps := []string{"file_path", "overwrite", "path", "title", "type"}
+	wantUploadProps := []string{"file_path", "overwrite", "path", "title", "type", "verbose"}
 	if got := toolPropertyNames(t, upload); !reflect.DeepEqual(got, wantUploadProps) {
 		t.Errorf("upload_document_file properties = %v, 期望 %v", got, wantUploadProps)
 	}
@@ -1173,7 +1454,7 @@ func TestToolsListContractIsEnglishAndComplete(t *testing.T) {
 
 	// document_archive：delete 控制归档还是永久删除，required 只含 path。
 	archive := findTool(t, listResp.Result.Tools, "document_archive")
-	wantArchiveProps := []string{"delete", "expected_hash", "expected_revision", "path"}
+	wantArchiveProps := []string{"delete", "expected_hash", "expected_revision", "path", "verbose"}
 	if got := toolPropertyNames(t, archive); !reflect.DeepEqual(got, wantArchiveProps) {
 		t.Errorf("document_archive properties = %v, 期望 %v", got, wantArchiveProps)
 	}

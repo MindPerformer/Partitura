@@ -42,7 +42,7 @@ func TestHandleJob_CleanupRevisions(t *testing.T) {
 		cleanedCount:  5,
 	}
 
-	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, mockRepo)
+	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, nil, mockRepo)
 
 	job := &Job{
 		ID:      "test-job-1",
@@ -77,7 +77,7 @@ func TestHandleJob_CleanupRevisions(t *testing.T) {
 
 // TestHandleJob_CleanupRevisions_NoRepo 验证 revisionCleanupRepo 为 nil 时返回错误。
 func TestHandleJob_CleanupRevisions_NoRepo(t *testing.T) {
-	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, nil)
+	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, nil, nil)
 
 	job := &Job{
 		ID:      "test-job-2",
@@ -96,7 +96,7 @@ func TestHandleJob_CleanupRevisions_NoRepo(t *testing.T) {
 // TestHandleJob_CleanupRevisions_MissingWorkspaceID 验证缺少 workspace_id 时返回错误。
 func TestHandleJob_CleanupRevisions_MissingWorkspaceID(t *testing.T) {
 	mockRepo := &mockRevisionCleanupRepo{}
-	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, mockRepo)
+	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, nil, mockRepo)
 
 	job := &Job{
 		ID:      "test-job-3",
@@ -114,7 +114,7 @@ func TestHandleJob_CleanupRevisions_MissingWorkspaceID(t *testing.T) {
 
 // TestHandleJob_UnknownType 验证未知 job 类型返回错误。
 func TestHandleJob_UnknownType(t *testing.T) {
-	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, nil)
+	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, nil, nil)
 
 	job := &Job{
 		ID:      "test-job-4",
@@ -141,7 +141,7 @@ func TestHandleJob_CleanupRevisions_AllDocuments(t *testing.T) {
 	_ = mockRepo
 
 	// 验证 EvalJobHandler 也能分发 cleanup_revisions
-	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, mockRepo)
+	handler := NewIndexJobHandler(nil, nil, nil, nil, nil, nil, mockRepo)
 	evalHandler := NewEvalJobHandler(handler, nil, nil, nil, nil)
 
 	job := &Job{

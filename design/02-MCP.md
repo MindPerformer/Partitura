@@ -230,6 +230,24 @@ section_path 使用结构化数组，避免同名 heading 冲突。
 
 限制最大行数，防止一次返回超大内容。
 
+## 写操作响应与 verbose
+
+写操作工具：
+
+- document_create
+- document_replace
+- document_patch
+- document_move
+- document_archive
+- upload_document_file
+
+这些工具都接受可选参数 `verbose`（boolean，默认 false）。
+
+- 默认 false：响应移除 `content_markdown`，只返回 revision/hash/path 等元数据，避免把整篇文档重新灌回 Agent 上下文。
+- `verbose: true`：返回服务端完整响应，包含 `content_markdown`。
+
+只读工具（document_read / document_read_section / document_read_lines / document_revision）不适用该参数，它们的存在意义就是返回正文。
+
 ## document_patch
 
 Local MCP：

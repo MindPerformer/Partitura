@@ -35,6 +35,7 @@ const MCPGuidance = `# Knowledge Workspace MCP — Agent Working Rules
 - upload_document_file creates a new document by default and never overwrites unless overwrite is set to true.
 - Always pass an absolute file_path; the path is resolved by the machine running MCP, using that operating system's native path format.
 - document_archive archives a document; pass delete=true only when permanent deletion is intended, which requires owner permission.
+- Write tools (document_create, document_replace, document_patch, document_move, document_archive, upload_document_file) omit content_markdown from their response by default. Pass verbose=true only when the full content is actually needed, because returning it consumes a lot of context.
 - After a conflict, read the latest content again before retrying.
 - Do not store chain-of-thought or temporary debug noise.
 - Do not copy complete source code into the knowledge base.

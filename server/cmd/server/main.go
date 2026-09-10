@@ -377,7 +377,11 @@ func runServer(ctx context.Context, runner *migration.Runner, cfg *config.Config
 		}
 		// 将 profile.PGRepository 适配为 job.ProfileRepo
 		jobProfileRepo := &profileRepoAdapter{repo: profileRepo}
-		baseJobHandler := job.NewIndexJobHandler(database, esClient, embEmbed, embConfigured, jobProfileRepo, docRepo)
+		// 第 6 个实参注入 jobRepo（*job.PGRepository，已满足 job.JobEnqueuer）。
+		// 引入动机：index_document 兜底路径一旦发现 alias 指向索引的 embedding 维度与
+		// profile 不一致，写入必被 ES 拒绝，需要自动投递一次 rebuild_index，
+		// 并通过查询队列避免重复入队。
+		baseJobHandler := job.NewIndexJobHandler(database, esClient, embEmbed, embConfigured, jobProfileRepo, jobRepo, docRepo)
 
 		// 构建带评测能力的 job handler
 		profileRepoExt := &profileRepoExtAdapter{repo: profileRepo}
@@ -534,6 +538,13 @@ func (a *profileRepoAdapter) GetActiveProfile(ctx context.Context) (*job.Profile
 	}, nil
 }
 
+// UpdateProfileESIndex 将 rebuild 维度自愈后产生的新索引名回写到 profile。
+// 引入动机：rebuild 在 embedding 维度不一致时会创建新索引并切换 alias，
+// 组装层需把该能力桥接给 job 层，否则 profile 记录会与 alias 实际指向不一致。
+func (a *profileRepoAdapter) UpdateProfileESIndex(ctx context.Context, id, indexName string) error {
+	return a.repo.UpdateProfileESIndex(ctx, id, indexName)
+}
+
 // profileRepoExtAdapter 将 profile.PGRepository 适配为 job.ProfileRepoExtended 接口。
 // 引入动机：optimize_profile job 需要完整的 profile 操作（获取/创建候选/激活/记录状态），
 // main.go 作为组装层负责将 profile.PGRepository 适配为 job.ProfileRepoExtended。
@@ -543,6 +554,15 @@ type profileRepoExtAdapter struct {
 
 func (a *profileRepoExtAdapter) GetActiveProfile(ctx context.Context) (*job.ProfileForJob, error) {
 	return (&profileRepoAdapter{repo: a.repo}).GetActiveProfile(ctx)
+}
+
+// UpdateProfileESIndex 将 rebuild 维度自愈后产生的新索引名回写到 profile。
+// 引入动机：job.ProfileRepoExtended 内嵌了 job.ProfileRepo，因此该适配器必须一并实现
+// UpdateProfileESIndex，否则无法作为 job.ProfileRepoExtended 注入 NewEvalJobHandler；
+// 同时 optimize_profile 触发的 rebuild 若回写索引名失败，候选 profile 的 es_index_name
+// 会与 alias 实际指向不一致，故必须如实转调底层仓储而不是静默丢弃。
+func (a *profileRepoExtAdapter) UpdateProfileESIndex(ctx context.Context, id, indexName string) error {
+	return a.repo.UpdateProfileESIndex(ctx, id, indexName)
 }
 
 func (a *profileRepoExtAdapter) GetProfileByID(ctx context.Context, id string) (*job.ProfileForJobExtended, error) {

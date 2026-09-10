@@ -49,6 +49,16 @@ type fakeESClient struct {
 	deleteByQueryCalls []deleteByQueryCall
 	bulkIndexCalls     []bulkIndexCall
 	searchCalls         []searchCall
+	// indexDims 记录各索引的 embedding 维度，供 GetIndexDimensions 返回。
+	// 引入动机：维度自愈测试需要 fake 表达"某索引 dims=1024/4096"，
+	// 未登记维度的索引返回 0，表示"无已知维度"（与真实 ES 无 embedding 字段一致）。
+	indexDims map[string]int
+	// getIndexDimensionsCalls 记录 GetIndexDimensions 被查询过的索引名。
+	getIndexDimensionsCalls []string
+	// createIndexMappings 记录 CreateIndex 收到的 mapping，便于断言新索引的维度是否正确。
+	createIndexMappings map[string]map[string]interface{}
+	// createIndexCalls 按顺序记录 CreateIndex 的索引名，便于断言"是否发生了创建"。
+	createIndexCalls []string
 }
 
 // deleteByQueryCall 记录一次 DeleteByQuery 调用的参数。
@@ -71,9 +81,11 @@ type searchCall struct {
 
 func newFakeESClient() *fakeESClient {
 	return &fakeESClient{
-		indices: make(map[string]bool),
-		docs:    make(map[string]map[string]map[string]interface{}),
-		pingOK:  true,
+		indices:             make(map[string]bool),
+		docs:                make(map[string]map[string]map[string]interface{}),
+		pingOK:              true,
+		indexDims:           make(map[string]int),
+		createIndexMappings: make(map[string]map[string]interface{}),
 	}
 }
 
@@ -87,7 +99,45 @@ func (c *fakeESClient) Ping(ctx context.Context) error {
 func (c *fakeESClient) CreateIndex(ctx context.Context, indexName string, mapping map[string]interface{}) error {
 	c.indices[indexName] = true
 	c.docs[indexName] = make(map[string]map[string]interface{})
+	c.createIndexMappings[indexName] = mapping
+	c.createIndexCalls = append(c.createIndexCalls, indexName)
+	// 真实 ES 会从 mapping 中读取 embedding.dims 作为索引维度，fake 保持一致，
+	// 使"新建索引后维度即已知"这一语义在测试中成立。
+	if dims := mappingEmbeddingDims(mapping); dims > 0 {
+		c.indexDims[indexName] = dims
+	}
 	return nil
+}
+
+// mappingEmbeddingDims 从 mapping 中提取 mappings.properties.embedding.dims。
+// 引入动机：fake CreateIndex 需要像真实 ES 一样从 mapping 派生索引维度；
+// 无 embedding 字段（如 nil mapping 或动态 mapping）时返回 0 表示"无已知维度"。
+func mappingEmbeddingDims(mapping map[string]interface{}) int {
+	mappings, ok := mapping["mappings"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	properties, ok := mappings["properties"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	embedding, ok := properties["embedding"].(map[string]interface{})
+	if !ok {
+		return 0
+	}
+	dims, ok := embedding["dims"].(int)
+	if !ok {
+		return 0
+	}
+	return dims
+}
+
+// GetIndexDimensions 返回 fake 登记的索引 embedding 维度。
+// 引入动机：es.Client 接口新增该方法以支持 job 包的维度自愈；
+// 未登记维度的索引返回 (0, nil)，表达"无已知维度"，与真实客户端语义一致。
+func (c *fakeESClient) GetIndexDimensions(ctx context.Context, indexName string) (int, error) {
+	c.getIndexDimensionsCalls = append(c.getIndexDimensionsCalls, indexName)
+	return c.indexDims[indexName], nil
 }
 
 func (c *fakeESClient) DeleteIndex(ctx context.Context, indexName string) error {
@@ -994,7 +1044,7 @@ func TestHandleRebuildIndex_LexicalFailure_NoAliasSwitch(t *testing.T) {
 	}
 
 	// Provider 未配置（lexical-only）
-	handler := NewIndexJobHandler(db, failingES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, failingES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,
@@ -1053,7 +1103,7 @@ func TestHandleRebuildIndex_RepairFailure_NoAliasSwitch(t *testing.T) {
 		},
 	}
 
-	handler := NewIndexJobHandler(db, failingES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, failingES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,

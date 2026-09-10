@@ -24,10 +24,28 @@ import (
 // 使用 fake 避免对 PG 的依赖，使测试在无数据库环境下也能运行。
 type fakeProfileRepo struct {
 	profile *ProfileForJob
+	// updatedIndexes 按顺序记录 UpdateProfileESIndex 的调用参数。
+	// 引入动机：维度不一致自愈后必须把新索引名回写到 profile，
+	// 测试需要断言回写的 profileID 与索引名完全符合预期。
+	updatedIndexes []profileIndexUpdate
+	// updateErr 非 nil 时 UpdateProfileESIndex 返回该错误，
+	// 用于验证回写失败会让 job 失败（不得吞掉错误）。
+	updateErr error
+}
+
+// profileIndexUpdate 记录一次 profile → ES 索引名的回写调用。
+type profileIndexUpdate struct {
+	ProfileID string
+	IndexName string
 }
 
 func (f *fakeProfileRepo) GetActiveProfile(ctx context.Context) (*ProfileForJob, error) {
 	return f.profile, nil
+}
+
+func (f *fakeProfileRepo) UpdateProfileESIndex(ctx context.Context, id, indexName string) error {
+	f.updatedIndexes = append(f.updatedIndexes, profileIndexUpdate{ProfileID: id, IndexName: indexName})
+	return f.updateErr
 }
 
 // TestHandleRebuildIndex_CreatesIndexWithCorrectMapping 验证目标索引不存在时
@@ -56,7 +74,7 @@ func TestHandleRebuildIndex_CreatesIndexWithCorrectMapping(t *testing.T) {
 	}
 
 	// 创建 handler，不注入 embedding（测试 lexical-only 路径）
-	handler := NewIndexJobHandler(nil, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(nil, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,
@@ -108,7 +126,7 @@ func TestHandleRebuildIndex_DoesNotCreateExistingIndex(t *testing.T) {
 		},
 	}
 
-	handler := NewIndexJobHandler(nil, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(nil, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,
@@ -163,7 +181,7 @@ func TestHandleRebuildIndex_AliasSwitch(t *testing.T) {
 		},
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobRebuildIndex,

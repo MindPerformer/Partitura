@@ -22,13 +22,18 @@ type fakeESClient struct {
 	aliasIndex string
 	docs       map[string]map[string]map[string]interface{}
 	pingOK     bool
+	// indexDims 记录各索引的 embedding 维度，供 GetIndexDimensions 返回。
+	// 引入动机：搜索管线本身不消费维度信息，但 es.Client 接口要求实现该方法；
+	// 保留可配置的维度表使 fake 与真实 ES 语义一致（未配置 → 0 表示"无已知维度"）。
+	indexDims map[string]int
 }
 
 func newFakeESClient() *fakeESClient {
 	return &fakeESClient{
-		indices: make(map[string]bool),
-		docs:    make(map[string]map[string]map[string]interface{}),
-		pingOK:  true,
+		indices:   make(map[string]bool),
+		docs:      make(map[string]map[string]map[string]interface{}),
+		pingOK:    true,
+		indexDims: make(map[string]int),
 	}
 }
 
@@ -61,6 +66,14 @@ func (c *fakeESClient) ListIndices(ctx context.Context, pattern string) ([]strin
 
 func (c *fakeESClient) IndexExists(ctx context.Context, indexName string) (bool, error) {
 	return c.indices[indexName], nil
+}
+
+// GetIndexDimensions 返回 fake 中为指定索引配置的 embedding 维度。
+// 引入动机：es.Client 接口新增该方法以支持 job 包的维度自愈；
+// 搜索管线不涉及维度判断，未配置维度的索引返回 (0, nil)，与真实客户端的
+// "索引不存在或没有 embedding 字段 → 无已知维度"语义一致。
+func (c *fakeESClient) GetIndexDimensions(ctx context.Context, indexName string) (int, error) {
+	return c.indexDims[indexName], nil
 }
 
 func (c *fakeESClient) UpdateAlias(ctx context.Context, actions []es.AliasAction) error {

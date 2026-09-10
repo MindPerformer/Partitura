@@ -204,7 +204,7 @@ func TestHandleIndexDocument_EnsureAliasAndIndex(t *testing.T) {
 	}
 
 	// 不注入 embedding（测试 alias/index 确保逻辑，不依赖外部 Provider）
-	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -272,7 +272,7 @@ func TestHandleIndexDocument_EnsureAliasAndIndex_DeletesExistingConcreteIndex(t 
 		},
 	}
 
-	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, nil, nil, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
@@ -337,7 +337,7 @@ func TestHandleIndexDocument_ProviderHealthyButNoProfile_Fails(t *testing.T) {
 
 	// NewIndexJobHandler 需要 profileRepo 实现 ProfileRepo 接口
 	// fakeProfileRepo.GetActiveProfile 返回 nil, nil
-	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil)
+	handler := NewIndexJobHandler(db, fakeES, embEmbed, embAvailable, fakeRepo, nil, nil)
 
 	job := &Job{
 		Type: types.JobIndexDocument,
