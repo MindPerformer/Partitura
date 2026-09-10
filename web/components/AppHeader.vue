@@ -140,10 +140,11 @@ const userItems = computed<DropdownMenuItem[][]>(() => {
 
 <template>
   <header class="sticky top-0 z-40 border-b border-default bg-default">
-    <div class="flex items-center justify-between px-4 h-14">
-      <!-- Left: Logo + Workspace switcher -->
-      <div class="flex items-center gap-4">
-        <NuxtLink to="/" class="flex items-center gap-2 font-semibold text-highlighted">
+    <div class="flex h-14 items-center justify-between gap-2 px-2 sm:px-4">
+      <!-- Left: optional page control + logo + workspace switcher -->
+      <div class="flex min-w-0 items-center gap-2 sm:gap-4">
+        <slot name="leading" />
+        <NuxtLink to="/" class="flex shrink-0 items-center gap-2 font-semibold text-highlighted">
           <UIcon name="i-lucide-book-open" class="w-5 h-5 text-primary" />
           <span class="hidden sm:inline">PKW</span>
         </NuxtLink>
@@ -164,7 +165,7 @@ const userItems = computed<DropdownMenuItem[][]>(() => {
       </div>
 
       <!-- Center: Search (only in workspace context) -->
-      <div v-if="workspaceId" class="flex-1 max-w-md mx-4">
+      <div v-if="workspaceId" class="mx-2 hidden max-w-md flex-1 sm:block lg:mx-4">
         <UInput
           v-model="searchQuery"
           :placeholder="t('search.searchInWorkspace')"
@@ -173,6 +174,15 @@ const userItems = computed<DropdownMenuItem[][]>(() => {
           @keyup.enter="performSearch"
         />
       </div>
+      <UButton
+        v-if="workspaceId"
+        class="sm:hidden"
+        color="neutral"
+        variant="ghost"
+        icon="i-lucide-search"
+        :aria-label="t('common.search')"
+        :to="`/workspaces/${workspaceId}/search`"
+      />
 
       <!-- Right: Language switcher + User menu -->
       <div class="flex items-center gap-2">

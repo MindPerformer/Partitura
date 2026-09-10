@@ -74,18 +74,30 @@ type Repository interface {
 }
 
 // Job 是从数据库读取的任务记录。
+//
+// 引入动机：admin handler 的 ListJobs/GetByID 直接把本结构体交给 encoding/json
+// 序列化作为 API 响应体，而 web 端契约（web/types/api.ts 的 Job）使用 snake_case。
+// 结构体原先没有 json tag，encoding/json 会按 Go 字段名输出（ID/AttemptCount/...），
+// 前端读到的是 undefined，进而在渲染期抛异常导致索引任务页整体白屏。
+// 因此这里为每个字段显式声明 json tag，与前端契约逐字段对齐；
+// 注意 attempts / error 并非字段名的简单小写化，前端契约就是这两个 key。
+// 不使用 omitempty：前端类型声明这些字段恒存在，缺字段会重新引入 undefined 渲染风险。
 type Job struct {
-	ID           string
-	Type         string
-	Payload      map[string]interface{}
-	Status       string
-	LockedBy     string
-	AttemptCount int
-	MaxAttempts  int
-	LastError    string
-	CreatedAt    string
-	StartedAt    string
-	CompletedAt  string
+	ID           string                 `json:"id"`
+	Type         string                 `json:"type"`
+	Payload      map[string]interface{} `json:"payload"`
+	Status       string                 `json:"status"`
+	LockedBy     string                 `json:"locked_by"`
+	AttemptCount int                    `json:"attempts"`
+	MaxAttempts  int                    `json:"max_attempts"`
+	LastError    string                 `json:"error"`
+	CreatedAt    string                 `json:"created_at"`
+	// UpdatedAt 引入动机：前端 Job 契约声明了 updated_at（jobs 表有
+	// updated_at TIMESTAMPTZ NOT NULL DEFAULT now()），索引任务页需要展示最近更新时间，
+	// 由 List / GetByID 两个查询一并选出。
+	UpdatedAt   string `json:"updated_at"`
+	StartedAt   string `json:"started_at"`
+	CompletedAt string `json:"completed_at"`
 }
 
 // ListResult 是任务列表查询结果。
@@ -270,6 +282,7 @@ func (r *PGRepository) List(ctx context.Context, statusFilter string, limit, off
 		`SELECT id, type, payload, status, COALESCE(locked_by::text, ''),
 			attempt_count, max_attempts, COALESCE(last_error, ''),
 			to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+			to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
 			COALESCE(to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
 			COALESCE(to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 		 FROM jobs%s ORDER BY created_at DESC LIMIT $%d OFFSET $%d`,
@@ -283,14 +296,17 @@ func (r *PGRepository) List(ctx context.Context, statusFilter string, limit, off
 	}
 	defer rows.Close()
 
-	var jobs []Job
+	// 修复说明：显式初始化为空 slice（而非 nil），使无任务时序列化为 [] 而不是 null。
+	// nil slice 会让 API 返回 "jobs": null，前端对 null 做 .length / v-for 会抛异常，
+	// 与"空列表就是空数组"的契约不符。
+	jobs := make([]Job, 0)
 	for rows.Next() {
 		var j Job
 		var payloadBytes []byte
 		if err := rows.Scan(
 			&j.ID, &j.Type, &payloadBytes, &j.Status, &j.LockedBy,
 			&j.AttemptCount, &j.MaxAttempts, &j.LastError,
-			&j.CreatedAt, &j.StartedAt, &j.CompletedAt,
+			&j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.CompletedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描 job 行: %w", err)
 		}
@@ -316,10 +332,12 @@ func (r *PGRepository) List(ctx context.Context, statusFilter string, limit, off
 func (r *PGRepository) GetByID(ctx context.Context, id string) (*Job, error) {
 	var j Job
 	var payloadBytes []byte
+	// updated_at 与 List 保持一致：前端 Job 契约声明了该字段，缺失会重新造成 undefined。
 	err := r.db.QueryRowContext(ctx,
 		`SELECT id, type, payload, status, COALESCE(locked_by::text, ''),
 			attempt_count, max_attempts, COALESCE(last_error, ''),
 			to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
+			to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
 			COALESCE(to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
 			COALESCE(to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
 		 FROM jobs WHERE id = $1`,
@@ -327,7 +345,7 @@ func (r *PGRepository) GetByID(ctx context.Context, id string) (*Job, error) {
 	).Scan(
 		&j.ID, &j.Type, &payloadBytes, &j.Status, &j.LockedBy,
 		&j.AttemptCount, &j.MaxAttempts, &j.LastError,
-		&j.CreatedAt, &j.StartedAt, &j.CompletedAt,
+		&j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.CompletedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "查询 job")

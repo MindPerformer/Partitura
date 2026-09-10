@@ -151,7 +151,7 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
               <UBadge
                 :color="member.role === 'owner' ? 'warning' : member.role === 'admin' ? 'info' : member.role === 'editor' ? 'success' : 'neutral'"
                 variant="subtle"
-                size="xs"
+                size="sm"
               >{{ member.role }}</UBadge>
               <USelect
                 v-if="canManageMembers && member.role !== 'owner'"

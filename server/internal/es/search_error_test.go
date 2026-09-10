@@ -24,13 +24,17 @@ func TestHTTPClient_SearchReportsESErrorBody(t *testing.T) {
 		body     string
 		wantType string
 		wantWhy  string
+		// wantCause 是 ES 层次化错误里真正定位问题的原因（root_cause/caused_by 摘要），
+		// 必须出现在返回的 error 中；为空表示该用例的错误体没有层次化原因。
+		wantCause string
 	}{
 		{
-			name:     "400 维度不匹配",
-			status:   http.StatusBadRequest,
-			body:     `{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"Vector dimension error: expected dim: 1024, got 4096"}],"type":"search_phase_execution_exception","reason":"all shards failed"},"status":400}`,
-			wantType: "search_phase_execution_exception",
-			wantWhy:  "all shards failed",
+			name:      "400 维度不匹配",
+			status:    http.StatusBadRequest,
+			body:      `{"error":{"root_cause":[{"type":"illegal_argument_exception","reason":"Vector dimension error: expected dim: 1024, got 4096"}],"type":"search_phase_execution_exception","reason":"all shards failed"},"status":400}`,
+			wantType:  "search_phase_execution_exception",
+			wantWhy:   "all shards failed",
+			wantCause: "root_cause: illegal_argument_exception: Vector dimension error: expected dim: 1024, got 4096",
 		},
 		{
 			name:     "429 写入/查询限流",
@@ -93,7 +97,58 @@ func TestHTTPClient_SearchReportsESErrorBody(t *testing.T) {
 					t.Errorf("错误 %q 应包含完整诊断 %q", message, wantDetail)
 				}
 			}
+			if tc.wantCause != "" {
+				// 外层 "all shards failed" 不含真实原因，root_cause 必须被带进错误信息，否则日志无法定位。
+				if !strings.Contains(message, tc.wantCause) {
+					t.Errorf("错误 %q 应包含 root_cause 摘要 %q", message, tc.wantCause)
+				}
+				// 原有 "<type>: <reason>" 连续子串必须保持完整，原因细节只能追加在其后。
+				wantFull := fmt.Sprintf("search 返回状态码 %d: %s: %s（%s）", tc.status, tc.wantType, tc.wantWhy, tc.wantCause)
+				if !strings.Contains(message, wantFull) {
+					t.Errorf("错误 %q 应包含向后兼容前缀 + 追加原因 %q", message, wantFull)
+				}
+			}
 		})
+	}
+}
+
+// TestHTTPClient_SearchReportsNestedCausedBy 验证 error.caused_by 的嵌套链会被完整
+// 带进返回的 error，且原有 "type: reason" 前缀保持连续。
+//
+// 引入动机：ES 常见形态是外层 search_phase_execution_exception，真正原因藏在 caused_by
+// 内并可继续嵌套（如 illegal_argument_exception 由 number_format_exception 引起）；
+// 只保留最外层会让线上日志无法定位，因此必须覆盖嵌套链。
+func TestHTTPClient_SearchReportsNestedCausedBy(t *testing.T) {
+	const body = `{"error":{"type":"search_phase_execution_exception","reason":"all shards failed","caused_by":{"type":"illegal_argument_exception","reason":"failed to parse query","caused_by":{"type":"number_format_exception","reason":"For input string: \"abc\""}}},"status":400}`
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte(body))
+	}))
+	defer server.Close()
+
+	client := NewHTTPClient(server.URL, time.Second)
+	_, err := client.Search(context.Background(), "knowledge_v1", nil)
+	if err == nil {
+		t.Fatal("非 200 状态码应返回错误")
+	}
+
+	message := err.Error()
+	wantPrefix := "search 返回状态码 400: search_phase_execution_exception: all shards failed"
+	if !strings.Contains(message, wantPrefix) {
+		t.Errorf("错误 %q 应包含向后兼容前缀 %q", message, wantPrefix)
+	}
+	for _, want := range []string{
+		"caused_by: illegal_argument_exception: failed to parse query",
+		"caused_by: number_format_exception: For input string: \"abc\"",
+	} {
+		if !strings.Contains(message, want) {
+			t.Errorf("错误 %q 应包含嵌套原因 %q", message, want)
+		}
+	}
+	if !strings.Contains(message, wantPrefix+"（caused_by:") {
+		t.Errorf("错误 %q 应在原有前缀之后追加 caused_by 细节", message)
 	}
 }
 

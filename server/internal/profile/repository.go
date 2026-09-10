@@ -1,4 +1,4 @@
-// Package profile 实现 Search Profile 版本管理：CRUD、激活、回滚、alias 原子切换。
+// Package profile 实现 Search Profile 版本管理：CRUD、激活、归档、回滚、alias 原子切换。
 //
 // 引入动机：design/01-SEARCH.md §Search Profile 要求版本化，
 // §Index Version 要求 alias 原子切换，禁止原地破坏 active index。
@@ -26,6 +26,13 @@ import (
 	types "partitura/server/internal/search/types"
 )
 
+// ErrProfileNotArchivable 表示归档被守卫拒绝：目标 profile 不存在，或处于 active 状态。
+//
+// 引入动机：ArchiveProfile 使用带守卫的 UPDATE（status <> 'active'），影响 0 行时必须
+// 显式失败而不是静默成功。调用方需要一个可判别错误来返回准确的 HTTP 语义（409），
+// 而不是把并发状态变化伪装成"内部错误"。
+var ErrProfileNotArchivable = errors.New("profile 不存在或处于 active 状态，无法归档")
+
 // Repository 定义 Search Profile 的数据访问接口。
 // 引入动机：profile handler 和 job worker 依赖此接口而非具体 PG 实现。
 type Repository interface {
@@ -47,6 +54,12 @@ type Repository interface {
 
 	// DeactivateProfile 将指定 Profile 设为 inactive。
 	DeactivateProfile(ctx context.Context, id string) error
+
+	// ArchiveProfile 将指定 Profile 置为 archived，保留记录（不物理删除）。
+	// 引入动机：归档是 profile 生命周期的可逆下线操作，与既有"回滚 = 激活 archived profile"
+	// 自洽，因此不能删除数据；归档后仍可由 ActivateProfile 重新激活。
+	// 守卫：active profile 不可归档；影响 0 行时返回 ErrProfileNotArchivable。
+	ArchiveProfile(ctx context.Context, id string) error
 
 	// UpdateProfileESIndex 更新 Profile 的 ES 索引名称。
 	// 引入动机：rebuild job 创建新 index 后需要更新 profile 的 es_index_name。
@@ -179,20 +192,21 @@ type CreateProfileInput struct {
 }
 
 // CandidateRecord 是调优候选记录。
+// 使用 snake_case JSON 标签保证与 REST 契约一致。
 type CandidateRecord struct {
-	ID                 string
-	BaseProfileID      string
-	CandidateProfileID string
-	TuningLevel        int
-	ParameterChanges   json.RawMessage
-	EvaluationResult   json.RawMessage
-	GatePassed         bool
-	GateDetails        json.RawMessage
-	Status             string
-	AdminConfirmed     bool
-	AdminConfirmedBy   string
-	AdminConfirmedAt   string
-	CreatedAt          string
+	ID                 string          `json:"id"`
+	BaseProfileID      string          `json:"base_profile_id"`
+	CandidateProfileID string          `json:"candidate_profile_id"`
+	TuningLevel        int             `json:"tuning_level"`
+	ParameterChanges   json.RawMessage `json:"parameter_changes"`
+	EvaluationResult   json.RawMessage `json:"evaluation_result"`
+	GatePassed         bool            `json:"gate_passed"`
+	GateDetails        json.RawMessage `json:"gate_details"`
+	Status             string          `json:"status"`
+	AdminConfirmed     bool            `json:"admin_confirmed"`
+	AdminConfirmedBy   string          `json:"admin_confirmed_by"`
+	AdminConfirmedAt   string          `json:"admin_confirmed_at"`
+	CreatedAt          string          `json:"created_at"`
 }
 
 // ListProfilesResult 是 Profile 列表查询结果。
@@ -490,6 +504,37 @@ func (r *PGRepository) DeactivateProfile(ctx context.Context, id string) error {
 	if err != nil {
 		return mapDBError(err, "取消激活 profile")
 	}
+	return nil
+}
+
+// ArchiveProfile 将指定 Profile 置为 archived，保留记录。
+//
+// 引入动机：profile 需要可逆的下线能力——归档后记录仍在，仍可被 ActivateProfile 重新激活
+// （即既有 rollback 语义），因此绝不物理删除。
+//
+// 守卫：WHERE status <> 'active'。归档 active profile 会让系统失去当前生效配置，
+// 必须先激活其它 profile（原 active 自动转 inactive）才能归档。
+//
+// 注意：search_profiles 表（M003）没有 updated_at 列，仅更新 status，与
+// DeactivateProfile/ActivateProfile 的约定一致。
+// 影响 0 行表示 id 不存在或并发下状态已变为 active，此时返回 ErrProfileNotArchivable
+// 而不是静默成功，保证调用方不会误判归档已生效。
+func (r *PGRepository) ArchiveProfile(ctx context.Context, id string) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE search_profiles SET status = 'archived' WHERE id = $1 AND status <> 'active'`,
+		id,
+	)
+	if err != nil {
+		return mapDBError(err, "归档 profile")
+	}
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("读取归档 profile 影响行数: %w", err)
+	}
+	if affected == 0 {
+		return fmt.Errorf("%w: id=%s", ErrProfileNotArchivable, id)
+	}
+	slog.Info("search profile 已归档", "profile_id", id)
 	return nil
 }
 

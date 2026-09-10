@@ -132,6 +132,9 @@ type SearchOutput struct {
 // 降级行为：
 //   - ES 不可用：返回 degraded 响应
 //   - Embedding 不可用：仅使用 BM25 lexical 检索
+//   - vector 检索失败：按 DegradationReason 细分为 vector_dimension_mismatch
+//     （索引维度与查询向量维度不一致）、vector_field_missing（索引无 embedding 字段）
+//     与 vector_search_failed（维度读取失败或原因不明）
 //   - Reranker 不可用：直接返回 RRF 结果
 func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput, error) {
 	startTime := time.Now()
@@ -243,12 +246,33 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 				// 修复说明：原实现忽略 searchVector 返回错误，ES knn 查询失败（如 400 参数错误）
 				// 时静默产生 0 命中且 degraded=false。现在记录错误：semantic 模式直接降级失败；
 				// hybrid 模式降级为 lexical-only 检索，避免无声空结果。
+				//
+				// 细分降级原因（线上事故修复说明）：原先所有 vector 失败都被统一归因为
+				// vector_search_failed，无法与"ES 抖动"区分；线上真实原因是索引 embedding 维度与
+				// 查询向量维度不一致（索引 dims=1024、查询向量 4096）。此处结合索引 mapping 的
+				// 真实维度做分类，分类只补充诊断信息，原始 vecErr 始终原样写入日志，
+				// 不被分类结果替换、掩盖或吞掉。
 				var vecErr error
 				vectorResults, vecErr = p.searchVector(ctx, indexName, input, workspaceFilter, queryVec[0])
 				if vecErr != nil {
-					slog.Warn("vector 检索失败", "error", vecErr, "mode", mode)
+					queryDims := len(queryVec[0])
+					reason, indexDims, dimsErr := p.classifyVectorFailure(ctx, indexName, queryDims)
+					logArgs := []any{
+						"error", vecErr,
+						"mode", mode,
+						"index", indexName,
+						"index_dims", indexDims,
+						"query_dims", queryDims,
+						"reason", reason,
+					}
+					if dimsErr != nil {
+						// 维度读取自身失败也必须留痕：此时分类已退化为 vector_search_failed，
+						// 若再静默丢弃该错误，排查现场将无任何可用线索。
+						logArgs = append(logArgs, "index_dims_error", dimsErr)
+					}
+					slog.Warn("vector 检索失败", logArgs...)
 					output.Degraded = true
-					output.DegradationReason = "vector_search_failed"
+					output.DegradationReason = reason
 					if mode == "semantic" {
 						// semantic 仅依赖向量检索，失败即无可返回结果
 						output.LatencyMs = int(time.Since(startTime).Milliseconds())
@@ -324,6 +348,43 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 	output.LatencyMs = int(time.Since(startTime).Milliseconds())
 
 	return output, nil
+}
+
+// classifyVectorFailure 细分 vector 检索失败的降级原因。
+//
+// 引入动机：线上事故中 vector 检索失败被统一归因为 vector_search_failed，
+// 无法与 ES 抖动区分，真正原因（查询向量维度与索引 embedding 维度不一致，
+// 例如索引 dims=1024 而查询向量 4096）在管线层完全看不出来。此处结合索引 mapping 的
+// 真实 embedding 维度与查询向量维度进行分类：
+//
+//   - dims > 0 且 dims != queryDims → "vector_dimension_mismatch"
+//     （索引维度与查询向量维度不一致，例如索引 dims=1024 而查询向量 4096）
+//   - dims == 0 → "vector_field_missing"
+//     （索引不存在或没有 dense_vector 的 embedding 字段，与 es.Client.GetIndexDimensions 语义一致）
+//   - 读取维度报错，或 dims == queryDims（维度一致但检索仍失败，原因不明）→ "vector_search_failed"
+//
+// 返回值说明：
+//   - reason 是最终写入 SearchOutput.DegradationReason 的降级原因；
+//   - indexDims 是读取到的索引维度（读取失败时为 0），仅供调用方写入日志；
+//   - dimsErr 是 GetIndexDimensions 的原始错误，返回给调用方记录日志，绝不静默忽略。
+//
+// 本函数只产出诊断分类，不吞掉、不替换、不包装原始的 vector 检索错误；
+// 原始错误由调用方原样记录。
+func (p *Pipeline) classifyVectorFailure(ctx context.Context, indexName string, queryDims int) (reason string, indexDims int, dimsErr error) {
+	dims, err := p.esClient.GetIndexDimensions(ctx, indexName)
+	if err != nil {
+		// 维度读取失败时无法判定具体原因，保持既有的笼统归因。
+		return "vector_search_failed", 0, err
+	}
+
+	switch {
+	case dims == 0:
+		return "vector_field_missing", dims, nil
+	case dims != queryDims:
+		return "vector_dimension_mismatch", dims, nil
+	default:
+		return "vector_search_failed", dims, nil
+	}
 }
 
 // searchBM25 执行 BM25 multi-field 检索。

@@ -323,7 +323,7 @@ useHead({ title: () => (isEditMode.value ? t('document.editDocument') : t('docum
             >
               <div class="flex-1">
                 <div class="flex items-center gap-2 mb-1">
-                  <UBadge variant="subtle" size="xs">{{ src.source_type }}</UBadge>
+                  <UBadge variant="subtle" size="sm">{{ src.source_type }}</UBadge>
                   <span v-if="src.title" class="text-sm font-medium">{{ src.title }}</span>
                 </div>
                 <p class="text-sm text-muted break-all">{{ src.value }}</p>

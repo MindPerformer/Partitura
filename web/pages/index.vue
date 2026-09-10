@@ -122,7 +122,7 @@ useHead({ title: () => t('workspace.workspaces') + ' · ' + t('common.appName') 
               v-if="ws.status === 'archived'"
               color="neutral"
               variant="subtle"
-              size="xs"
+              size="sm"
             >{{ t('workspace.archived') }}</UBadge>
           </div>
           <h3 class="font-medium text-highlighted truncate">{{ ws.display_name }}</h3>

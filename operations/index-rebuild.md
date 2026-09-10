@@ -16,12 +16,27 @@
 
 ### 通过 Admin API
 
+端点是 `POST /api/admin/jobs/rebuild`，仅 `system_admin` 可调用。请求体是两个可选字段组成的 JSON 对象：
+
+- `index_name`：目标索引名。留空时回退到 active profile 的 `es_index_name`。
+- `workspace_id`：限定工作区。留空表示不限定。
+
+请求体必须是合法 JSON 对象，且只允许上述字段（未知字段会被拒绝）。成功时返回 `202 Accepted`，响应体为 `{"status":"enqueued"}`；真正的重建由 job worker 异步执行。
+
+该端点受 CSRF 保护：使用 cookie session 认证时必须在请求头携带 `X-CSRF-Token`，值为登录时下发的非 HttpOnly `csrf` cookie（header 名与 cookie 名可分别通过 `CSRF_HEADER_NAME`、`CSRF_COOKIE_NAME` 覆盖）。使用 Bearer token 认证时不需要 CSRF 头。
+
 ```bash
-# 获取 admin token（需要 system_admin 用户）
-# 然后调用 rebuild API
-curl -X POST http://localhost/api/admin/search/rebuild \
-  -H "Authorization: Bearer <admin_token>" \
+# cookie session 认证（需要 system_admin 用户）
+curl -X POST http://localhost/api/admin/jobs/rebuild \
   -H "X-CSRF-Token: <csrf_token>" \
+  -H "Content-Type: application/json" \
+  -d '{}'
+```
+
+```bash
+# Bearer token 认证（不需要 CSRF 头）
+curl -X POST http://localhost/api/admin/jobs/rebuild \
+  -H "Authorization: Bearer <admin_token>" \
   -H "Content-Type: application/json" \
   -d '{"index_name": "knowledge_v1"}'
 ```

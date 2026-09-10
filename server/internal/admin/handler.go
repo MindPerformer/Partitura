@@ -18,6 +18,7 @@ package admin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -113,6 +114,37 @@ type createProfileRequest struct {
 	MaxRerankerCostPerQuery  float32 `json:"max_reranker_cost_per_query"`
 }
 
+// validateProfileParams 校验 profile 可调参数的核心约束。
+//
+// 引入动机：CreateProfile 与 CreateProfileVersion 必须对同一组参数施加同一套约束口径，
+// 否则会出现"创建时合法、建新版本时非法"（或反之）的漂移。抽出单一实现，两个 handler 共用。
+//
+// 返回值即 HTTP 400 的响应体，调用方直接透出；文案与既有 CreateProfile 校验保持一致，
+// 避免前端按错误文案分支时出现两套口径。
+func validateProfileParams(name string, embeddingDimensions, lexicalTopK, vectorTopK, rrfK int) error {
+	if name == "" {
+		return errors.New("name 不能为空")
+	}
+	if embeddingDimensions <= 0 {
+		return errors.New("embedding_dimensions 必须为正整数")
+	}
+	if lexicalTopK <= 0 || vectorTopK <= 0 || rrfK <= 0 {
+		return errors.New("top_k 和 rrf_k 必须为正整数")
+	}
+	return nil
+}
+
+// applyOverride 在请求提供了覆盖值时改写目标字段；override 为 nil 表示继承，不做修改。
+//
+// 引入动机：新建版本允许"部分覆盖"，必须能区分"未提供（继承源 profile）"与"显式传零值"
+// （例如把 title_boost 覆盖为 0、把 merge_adjacent_chunks 覆盖为 false），
+// 因此请求体字段用指针表达并在此统一合并。
+func applyOverride[T any](dst *T, override *T) {
+	if override != nil {
+		*dst = *override
+	}
+}
+
 // ListProfiles 处理 GET /api/admin/search-profiles。
 func (h *Handler) ListProfiles(w http.ResponseWriter, r *http.Request) {
 	limit, offset, err := parsePagination(r)
@@ -151,16 +183,8 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.Name == "" {
-		writeAdminError(w, http.StatusBadRequest, "name 不能为空")
-		return
-	}
-	if req.EmbeddingDimensions <= 0 {
-		writeAdminError(w, http.StatusBadRequest, "embedding_dimensions 必须为正整数")
-		return
-	}
-	if req.LexicalTopK <= 0 || req.VectorTopK <= 0 || req.RRFK <= 0 {
-		writeAdminError(w, http.StatusBadRequest, "top_k 和 rrf_k 必须为正整数")
+	if err := validateProfileParams(req.Name, req.EmbeddingDimensions, req.LexicalTopK, req.VectorTopK, req.RRFK); err != nil {
+		writeAdminError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 
@@ -202,6 +226,162 @@ func (h *Handler) CreateProfile(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("search profile 已创建", "id", p.ID, "name", p.Name, "version", p.Version, "user_id", id.UserID)
 	h.recordAudit(r, id.UserID, "admin.profile.create", "search_profile", p.ID, map[string]string{"name": p.Name})
+	writeAdminJSON(w, http.StatusCreated, p)
+}
+
+// createProfileVersionRequest 是"新建 profile 版本"的请求体，所有可调参数均可选。
+//
+// 引入动机：需求要求以指定 profile 为基底复制全部可调参数，并允许局部覆盖。
+// 因此除 name 外的字段全部使用指针：nil 表示"未提供，继承源 profile"，非 nil 表示"显式覆盖"。
+//
+// 设计约束：
+//   - name 为普通 string：为空时继承源 profile 的名称。源 profile 的 name 在数据库中非空，
+//     因此最终 name 永远不会为空，不会绕过 validateProfileParams 的"name 不能为空"约束。
+//   - version/status/es_index_name/created_by/created_at/activated_at 不接受客户端指定：
+//     它们不在本结构体中；decodeJSONStrict 开启 DisallowUnknownFields，
+//     请求体出现这些字段会直接返回 400，而不会静默忽略。
+type createProfileVersionRequest struct {
+	Name                      string   `json:"name"`
+	EmbeddingProvider         *string  `json:"embedding_provider"`
+	EmbeddingModel            *string  `json:"embedding_model"`
+	EmbeddingDimensions       *int     `json:"embedding_dimensions"`
+	EmbeddingQueryInstruction *string  `json:"embedding_query_instruction"`
+	EmbeddingDocInstruction   *string  `json:"embedding_document_instruction"`
+	ChunkTargetSize           *int     `json:"chunk_target_size"`
+	ChunkOverlap              *int     `json:"chunk_overlap"`
+	TitleBoost                *float32 `json:"title_boost"`
+	HeadingBoost              *float32 `json:"heading_boost"`
+	PathBoost                 *float32 `json:"path_boost"`
+	TagsBoost                 *float32 `json:"tags_boost"`
+	BodyBoost                 *float32 `json:"body_boost"`
+	Analyzer                  *string  `json:"analyzer"`
+	LexicalTopK               *int     `json:"lexical_top_k"`
+	VectorTopK                *int     `json:"vector_top_k"`
+	RRFK                      *int     `json:"rrf_k"`
+	RerankerProvider          *string  `json:"reranker_provider"`
+	RerankerModel             *string  `json:"reranker_model"`
+	RerankerCandidateCount    *int     `json:"reranker_candidate_count"`
+	RerankerFinalCount        *int     `json:"reranker_final_count"`
+	MaxChunksPerDocument      *int     `json:"max_chunks_per_document"`
+	MergeAdjacentChunks       *bool    `json:"merge_adjacent_chunks"`
+	MaxP95LatencyMs           *int     `json:"max_p95_latency_ms"`
+	MaxRerankerCostPerQuery   *float32 `json:"max_reranker_cost_per_query"`
+}
+
+// CreateProfileVersion 处理 POST /api/admin/search-profiles/{id}/versions。
+//
+// 引入动机：Search Profile 是版本化的（UNIQUE (name, version)），调参必须在不影响当前
+// active profile 的前提下产出新版本草稿，因此需要"以源 profile 为基底复制参数 + 允许局部覆盖"，
+// 并复用 CreateProfile 的服务端语义（version = 同名最大版本 + 1、es_index_name 自动生成、
+// status 固定为 draft）。
+//
+// 设计约束：
+//   - 绝不自动激活：本 handler 不调用 ActivateProfile，也不入队 rebuild_index job；
+//     新版本要生效必须由管理员显式调用 activate 端点，避免一次调参请求意外切换线上配置。
+//   - created_by 记录当前认证用户，而不是源 profile 的创建者：新版本的责任人是本次操作者。
+func (h *Handler) CreateProfileVersion(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeAdminError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+
+	profileID := r.PathValue("id")
+	if profileID == "" {
+		writeAdminError(w, http.StatusBadRequest, "缺少 profile ID")
+		return
+	}
+
+	var req createProfileVersionRequest
+	if err := decodeJSONStrict(r, &req); err != nil {
+		writeAdminError(w, http.StatusBadRequest, fmt.Sprintf("请求体解析失败: %v", err))
+		return
+	}
+
+	// 源 profile 必须存在：不存在就无从继承参数，返回 404。
+	src, err := h.profileRepo.GetProfileByID(r.Context(), profileID)
+	if err != nil {
+		writeAdminError(w, http.StatusNotFound, "profile 不存在")
+		return
+	}
+
+	// 先完整继承源 profile 的全部可调参数。
+	input := &profile.CreateProfileInput{
+		Name:                      src.Name,
+		EmbeddingProvider:         src.EmbeddingProvider,
+		EmbeddingModel:            src.EmbeddingModel,
+		EmbeddingDimensions:       src.EmbeddingDimensions,
+		EmbeddingQueryInstruction: src.EmbeddingQueryInstruction,
+		EmbeddingDocInstruction:   src.EmbeddingDocInstruction,
+		ChunkTargetSize:           src.ChunkTargetSize,
+		ChunkOverlap:              src.ChunkOverlap,
+		TitleBoost:                src.TitleBoost,
+		HeadingBoost:              src.HeadingBoost,
+		PathBoost:                 src.PathBoost,
+		TagsBoost:                 src.TagsBoost,
+		BodyBoost:                 src.BodyBoost,
+		Analyzer:                  src.Analyzer,
+		LexicalTopK:               src.LexicalTopK,
+		VectorTopK:                src.VectorTopK,
+		RRFK:                      src.RRFK,
+		RerankerProvider:          src.RerankerProvider,
+		RerankerModel:             src.RerankerModel,
+		RerankerCandidateCount:    src.RerankerCandidateCount,
+		RerankerFinalCount:        src.RerankerFinalCount,
+		MaxChunksPerDocument:      src.MaxChunksPerDocument,
+		MergeAdjacentChunks:       src.MergeAdjacentChunks,
+		MaxP95LatencyMs:           src.MaxP95LatencyMs,
+		MaxRerankerCostPerQuery:   src.MaxRerankerCostPerQuery,
+		CreatedBy:                 id.UserID,
+	}
+
+	// 再按请求逐字段覆盖：nil = 继承。
+	if req.Name != "" {
+		input.Name = req.Name
+	}
+	applyOverride(&input.EmbeddingProvider, req.EmbeddingProvider)
+	applyOverride(&input.EmbeddingModel, req.EmbeddingModel)
+	applyOverride(&input.EmbeddingDimensions, req.EmbeddingDimensions)
+	applyOverride(&input.EmbeddingQueryInstruction, req.EmbeddingQueryInstruction)
+	applyOverride(&input.EmbeddingDocInstruction, req.EmbeddingDocInstruction)
+	applyOverride(&input.ChunkTargetSize, req.ChunkTargetSize)
+	applyOverride(&input.ChunkOverlap, req.ChunkOverlap)
+	applyOverride(&input.TitleBoost, req.TitleBoost)
+	applyOverride(&input.HeadingBoost, req.HeadingBoost)
+	applyOverride(&input.PathBoost, req.PathBoost)
+	applyOverride(&input.TagsBoost, req.TagsBoost)
+	applyOverride(&input.BodyBoost, req.BodyBoost)
+	applyOverride(&input.Analyzer, req.Analyzer)
+	applyOverride(&input.LexicalTopK, req.LexicalTopK)
+	applyOverride(&input.VectorTopK, req.VectorTopK)
+	applyOverride(&input.RRFK, req.RRFK)
+	applyOverride(&input.RerankerProvider, req.RerankerProvider)
+	applyOverride(&input.RerankerModel, req.RerankerModel)
+	applyOverride(&input.RerankerCandidateCount, req.RerankerCandidateCount)
+	applyOverride(&input.RerankerFinalCount, req.RerankerFinalCount)
+	applyOverride(&input.MaxChunksPerDocument, req.MaxChunksPerDocument)
+	applyOverride(&input.MergeAdjacentChunks, req.MergeAdjacentChunks)
+	applyOverride(&input.MaxP95LatencyMs, req.MaxP95LatencyMs)
+	applyOverride(&input.MaxRerankerCostPerQuery, req.MaxRerankerCostPerQuery)
+
+	// 与 CreateProfile 复用同一套校验，保证"覆盖后的参数"不会绕过既有约束。
+	if err := validateProfileParams(input.Name, input.EmbeddingDimensions, input.LexicalTopK, input.VectorTopK, input.RRFK); err != nil {
+		writeAdminError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	// 复用 CreateProfile：version、es_index_name 由仓储层计算，status 固定为 draft。
+	p, err := h.profileRepo.CreateProfile(r.Context(), input)
+	if err != nil {
+		slog.Error("创建 profile 新版本失败", "error", err, "source_profile_id", profileID)
+		writeAdminError(w, http.StatusInternalServerError, "创建失败")
+		return
+	}
+
+	slog.Info("search profile 新版本已创建",
+		"source_profile_id", profileID, "id", p.ID, "name", p.Name, "version", p.Version, "user_id", id.UserID)
+	h.recordAudit(r, id.UserID, "admin.profile.create_version", "search_profile", p.ID,
+		map[string]string{"source_profile_id": profileID, "name": p.Name})
 	writeAdminJSON(w, http.StatusCreated, p)
 }
 
@@ -302,6 +482,58 @@ func (h *Handler) RollbackProfile(w http.ResponseWriter, r *http.Request) {
 	slog.Info("search profile 已回滚，rebuild job 已入队", "profile_id", profileID, "name", p.Name, "user_id", id.UserID)
 	h.recordAudit(r, id.UserID, "admin.profile.rollback", "search_profile", profileID, map[string]string{"name": p.Name})
 	writeAdminJSON(w, http.StatusOK, map[string]string{"status": "rolled_back"})
+}
+
+// ArchiveProfile 处理 POST /api/admin/search-profiles/{id}/archive。
+//
+// 引入动机：Search Profile 需要可逆的下线操作——归档保留记录但不再参与搜索，
+// 与既有"回滚 = 激活 archived profile"自洽，因此归档不是删除。
+//
+// 设计约束：status='active' 的 profile 不允许归档，归档 active 会让系统失去当前生效配置。
+// 该约束在两处实现，职责不同：
+//   - handler 先读取 profile 给出清晰的 409 语义（不依赖竞态）；
+//   - 仓储层的带守卫 UPDATE 抵御并发（读取后状态被其它事务改为 active）。
+//
+// 本接口不接收请求体，与 activate/rollback 一致，id 取自路径参数。
+func (h *Handler) ArchiveProfile(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeAdminError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+
+	profileID := r.PathValue("id")
+	if profileID == "" {
+		writeAdminError(w, http.StatusBadRequest, "缺少 profile ID")
+		return
+	}
+
+	p, err := h.profileRepo.GetProfileByID(r.Context(), profileID)
+	if err != nil {
+		writeAdminError(w, http.StatusNotFound, "profile 不存在")
+		return
+	}
+
+	if p.Status == "active" {
+		writeAdminError(w, http.StatusConflict, "active profile 不能归档，请先激活其它 profile")
+		return
+	}
+
+	if err := h.profileRepo.ArchiveProfile(r.Context(), profileID); err != nil {
+		// 仓储层守卫在并发下可能拒绝归档（状态已被其它事务改为 active，或记录已被删除）。
+		// 这类拒绝必须如实返回 409，而不是伪装成 500 内部错误。
+		if errors.Is(err, profile.ErrProfileNotArchivable) {
+			writeAdminError(w, http.StatusConflict, "active profile 不能归档，请先激活其它 profile")
+			return
+		}
+		slog.Error("归档 profile 失败", "error", err, "profile_id", profileID)
+		writeAdminError(w, http.StatusInternalServerError, "归档失败")
+		return
+	}
+
+	slog.Info("search profile 已归档", "profile_id", profileID, "name", p.Name, "user_id", id.UserID)
+	h.recordAudit(r, id.UserID, "admin.profile.archive", "search_profile", profileID, map[string]string{"name": p.Name})
+	writeAdminJSON(w, http.StatusOK, map[string]string{"status": "archived"})
 }
 
 // ListCandidates 处理 GET /api/admin/search-profiles/candidates。
@@ -675,7 +907,9 @@ func (h *Handler) ListEvaluationResults(w http.ResponseWriter, r *http.Request) 
 // 路由清单：
 //   - GET  /api/admin/search-profiles — system_admin，Profile 列表
 //   - POST /api/admin/search-profiles — system_admin，创建 Profile
+//   - POST /api/admin/search-profiles/{id}/versions — system_admin，以指定 Profile 为基底新建版本
 //   - POST /api/admin/search-profiles/{id}/activate — system_admin，激活 Profile
+//   - POST /api/admin/search-profiles/{id}/archive — system_admin，归档 Profile（active 不可归档）
 //   - POST /api/admin/search-profiles/{id}/rollback — system_admin，回滚 Profile
 //   - GET  /api/admin/search-profiles/candidates — system_admin，候选列表
 //   - POST /api/admin/search-profiles/candidates/{id}/confirm — system_admin，确认候选
@@ -716,6 +950,19 @@ func RegisterRoutes(
 		),
 	)
 
+	// POST /api/admin/search-profiles/{id}/versions — system_admin + CSRF
+	mux.Handle("POST /api/admin/search-profiles/{id}/versions",
+		auth.AuthMiddleware(authRepo, authCfg)(
+			auth.RequireAuth(
+				auth.RequireCSRF(authRepo, authCfg)(
+					workspace.RequireSystemAdmin(
+						http.HandlerFunc(handler.CreateProfileVersion),
+					),
+				),
+			),
+		),
+	)
+
 	// POST /api/admin/search-profiles/{id}/activate — system_admin + CSRF
 	mux.Handle("POST /api/admin/search-profiles/{id}/activate",
 		auth.AuthMiddleware(authRepo, authCfg)(
@@ -723,6 +970,19 @@ func RegisterRoutes(
 				auth.RequireCSRF(authRepo, authCfg)(
 					workspace.RequireSystemAdmin(
 						http.HandlerFunc(handler.ActivateProfile),
+					),
+				),
+			),
+		),
+	)
+
+	// POST /api/admin/search-profiles/{id}/archive — system_admin + CSRF
+	mux.Handle("POST /api/admin/search-profiles/{id}/archive",
+		auth.AuthMiddleware(authRepo, authCfg)(
+			auth.RequireAuth(
+				auth.RequireCSRF(authRepo, authCfg)(
+					workspace.RequireSystemAdmin(
+						http.HandlerFunc(handler.ArchiveProfile),
 					),
 				),
 			),

@@ -4,7 +4,8 @@
 // Topbar workspace/search/user, Sidebar document tree, Main Markdown, Right ToC/metadata/sources/revision。
 -->
 <script setup lang="ts">
-import type { Document, OutlineResponse, Heading, Source, ApiError } from '~/types/api'
+import type { Document, Source, ApiError } from '~/types/api'
+import type { MarkdownHeading } from '~/utils/markdown'
 
 definePageMeta({
   middleware: ['auth']
@@ -15,12 +16,12 @@ const route = useRoute()
 const workspaceId = computed(() => route.params.id as string)
 const docPath = computed(() => route.query.path as string)
 
-const { workspace, canEdit, canArchive, currentMemberRole, isOwner } = useWorkspaceContext(workspaceId)
+const { canEdit, canArchive } = useWorkspaceContext(workspaceId)
 const { formatDate: formatDateUtil } = useFormatDate()
 
 // 文档内容
 const doc = ref<Document | null>(null)
-const outline = ref<Heading[]>([])
+const headings = ref<MarkdownHeading[]>([])
 const sources = ref<Source[]>([])
 const loading = ref(false)
 const error = ref<string | null>(null)
@@ -30,18 +31,16 @@ async function loadDocument() {
   loading.value = true
   error.value = null
   doc.value = null
-  outline.value = []
+  headings.value = []
   sources.value = []
 
   try {
     const api = useDocumentApi()
-    const [docRes, outlineRes, sourcesRes] = await Promise.all([
+    const [docRes, sourcesRes] = await Promise.all([
       api.read(workspaceId.value, docPath.value),
-      api.outline(workspaceId.value, docPath.value),
       api.listSources(workspaceId.value, docPath.value, { limit: 50 }).catch(() => ({ sources: [], total: 0, limit: 50, offset: 0 }))
     ])
     doc.value = docRes
-    outline.value = outlineRes.outline
     sources.value = sourcesRes.sources
   } catch (err) {
     const apiErr = err as ApiError
@@ -59,12 +58,29 @@ async function loadDocument() {
 
 watch([workspaceId, docPath], () => loadDocument(), { immediate: true })
 
+function handleHeadings(value: MarkdownHeading[]) {
+  headings.value = value
+}
+
+function handleTocClick(id: string) {
+  const target = document.getElementById(id)
+  if (!target) {
+    console.error(`[read.vue] 目录目标不存在: ${id}`)
+    return
+  }
+  target.scrollIntoView({ behavior: 'smooth', block: 'start' })
+}
+
+function handleMobileTocClick(id: string) {
+  handleTocClick(id)
+  mobilePanelOpen.value = false
+}
+
 function handleSelectDoc(path: string) {
   navigateTo(`/workspaces/${workspaceId.value}/documents/read?path=${encodeURIComponent(path)}`)
 }
 
-// 右侧面板标签
-const rightTab = ref<'toc' | 'meta' | 'sources'>('toc')
+const mobilePanelOpen = ref(false)
 
 function formatDate(s: string): string {
   return formatDateUtil(s)
@@ -111,7 +127,15 @@ useHead({ title: () => (doc.value?.title || t('document.documents')) + ' · ' + 
                 <h1 class="text-2xl font-bold text-highlighted">{{ doc.title }}</h1>
                 <p class="text-sm text-muted mt-1">{{ doc.path }}</p>
               </div>
-              <div class="flex items-center gap-1">
+              <div class="flex flex-wrap items-center justify-end gap-1">
+                <UButton
+                  class="lg:hidden"
+                  size="xs"
+                  variant="ghost"
+                  icon="i-lucide-list"
+                  :aria-label="t('document.tableOfContents')"
+                  @click="mobilePanelOpen = true"
+                >{{ t('document.tableOfContents') }}</UButton>
                 <UButton
                   v-if="canEdit"
                   size="xs"
@@ -139,99 +163,49 @@ useHead({ title: () => (doc.value?.title || t('document.documents')) + ' · ' + 
               <span>{{ t('document.revision') }} {{ doc.revision_number }}</span>
               <span>·</span>
               <span>{{ t('document.updated') }} {{ formatDate(doc.updated_at) }}</span>
-              <UBadge v-if="doc.is_special" variant="subtle" size="xs" color="info">{{ t('document.special') }}</UBadge>
-              <UBadge v-if="doc.type" variant="subtle" size="xs">{{ doc.type }}</UBadge>
+              <UBadge v-if="doc.is_special" variant="subtle" size="sm" color="info">{{ t('document.special') }}</UBadge>
+              <UBadge v-if="doc.type" variant="subtle" size="sm">{{ doc.type }}</UBadge>
             </div>
           </div>
 
           <!-- Markdown content -->
-          <MarkdownRenderer :content="doc.content_markdown" />
+          <MarkdownRenderer :content="doc.content_markdown" @headings="handleHeadings" />
         </div>
       </div>
 
-      <!-- Right panel: ToC / Metadata / Sources -->
-      <aside v-if="doc" class="w-64 flex-shrink-0 border-l border-default bg-default overflow-y-auto hidden lg:block">
-        <div class="px-3 py-2 border-b border-default">
-          <div class="flex gap-1">
-            <UButton size="xs" :variant="rightTab === 'toc' ? 'solid' : 'ghost'" @click="rightTab = 'toc'">{{ t('document.tableOfContents') }}</UButton>
-            <UButton size="xs" :variant="rightTab === 'meta' ? 'solid' : 'ghost'" @click="rightTab = 'meta'">{{ t('document.info') }}</UButton>
-            <UButton size="xs" :variant="rightTab === 'sources' ? 'solid' : 'ghost'" @click="rightTab = 'sources'">{{ t('document.sources') }}</UButton>
-          </div>
-        </div>
-
-        <!-- ToC -->
-        <div v-if="rightTab === 'toc'" class="p-3">
-          <ul v-if="outline.length > 0" class="space-y-1 text-sm">
-            <li
-              v-for="heading in outline"
-              :key="heading.start_line"
-              :style="{ paddingLeft: `${(heading.level - 1) * 12 + 4}px` }"
-              class="text-muted hover:text-primary cursor-pointer truncate"
-            >
-              {{ heading.text }}
-            </li>
-          </ul>
-          <p v-else class="text-xs text-muted">{{ t('document.noHeadings') }}</p>
-        </div>
-
-        <!-- Metadata -->
-        <div v-if="rightTab === 'meta'" class="p-3 space-y-2 text-sm">
-          <div>
-            <p class="text-xs text-muted uppercase">{{ t('document.path') }}</p>
-            <p class="text-default break-all">{{ doc.path }}</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted uppercase">{{ t('document.type') }}</p>
-            <p class="text-default">{{ doc.type || 'N/A' }}</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted uppercase">{{ t('workspace.status') }}</p>
-            <p class="text-default">{{ doc.status }}</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted uppercase">{{ t('document.revision') }}</p>
-            <p class="text-default">#{{ doc.revision_number }}</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted uppercase">{{ t('document.hash') }}</p>
-            <p class="text-default font-mono text-xs break-all">{{ doc.content_hash.substring(0, 16) }}...</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted uppercase">{{ t('document.created') }}</p>
-            <p class="text-default">{{ formatDate(doc.created_at) }}</p>
-          </div>
-          <div>
-            <p class="text-xs text-muted uppercase">{{ t('document.updated') }}</p>
-            <p class="text-default">{{ formatDate(doc.updated_at) }}</p>
-          </div>
-        </div>
-
-        <!-- Sources -->
-        <div v-if="rightTab === 'sources'" class="p-3">
-          <div v-if="sources.length > 0" class="space-y-2">
-            <div
-              v-for="src in sources"
-              :key="src.id"
-              class="text-sm border border-default rounded p-2"
-            >
-              <div class="flex items-center gap-1 mb-1">
-                <UBadge variant="subtle" size="xs">{{ src.source_type }}</UBadge>
-              </div>
-              <p class="text-default break-all text-xs">{{ src.value }}</p>
-              <p v-if="src.title" class="text-muted text-xs mt-1">{{ src.title }}</p>
-            </div>
-          </div>
-          <p v-else class="text-xs text-muted">{{ t('document.noSources') }}</p>
-          <UButton
-            v-if="canEdit"
-            size="xs"
-            variant="ghost"
-            block
-            class="mt-3"
-            :to="`/workspaces/${workspaceId}/documents/edit?path=${encodeURIComponent(docPath!)}&tab=sources`"
-          >{{ t('document.addSource') }}</UButton>
-        </div>
+      <!-- Desktop right panel -->
+      <aside v-if="doc" class="hidden w-64 flex-shrink-0 overflow-hidden border-l border-default bg-default lg:block">
+        <DocumentSidePanel
+          :doc="doc"
+          :headings="headings"
+          :sources="sources"
+          :workspace-id="workspaceId"
+          :doc-path="docPath"
+          :can-edit="canEdit"
+          @toc-click="handleTocClick"
+        />
       </aside>
+
+      <!-- Mobile right panel -->
+      <USlideover
+        v-if="doc"
+        v-model:open="mobilePanelOpen"
+        side="right"
+        :title="t('document.tableOfContents')"
+        :ui="{ content: 'w-[min(24rem,calc(100vw-2rem))]' }"
+      >
+        <template #body>
+          <DocumentSidePanel
+            :doc="doc"
+            :headings="headings"
+            :sources="sources"
+            :workspace-id="workspaceId"
+            :doc-path="docPath"
+            :can-edit="canEdit"
+            @toc-click="handleMobileTocClick"
+          />
+        </template>
+      </USlideover>
     </div>
 
     <!-- Archive confirm -->

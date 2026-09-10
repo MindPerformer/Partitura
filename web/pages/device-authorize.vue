@@ -142,7 +142,7 @@ useHead({ title: () => t('device.authorize') + ' · ' + t('common.appName') })
             </div>
             <div>
               <p class="text-xs text-muted mb-1">{{ t('device.status') }}</p>
-              <UBadge :color="info.status === 'pending' ? 'warning' : info.status === 'authorized' || info.status === 'completed' ? 'success' : 'error'" variant="subtle">
+              <UBadge :color="info.status === 'pending' ? 'warning' : info.status === 'authorized' || info.status === 'completed' ? 'success' : 'error'" variant="subtle" size="sm">
                 {{ statusLabel }}
               </UBadge>
             </div>

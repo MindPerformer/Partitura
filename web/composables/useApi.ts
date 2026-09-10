@@ -50,6 +50,7 @@ import type {
   SearchProfile,
   ListProfilesResponse,
   CreateProfileRequest,
+  CreateProfileVersionRequest,
   EvaluationDataset,
   ListDatasetsResponse,
   CreateDatasetRequest,
@@ -416,6 +417,14 @@ export function useSearchAdminApi() {
 
     createProfile: (req: CreateProfileRequest) =>
       apiFetch<SearchProfile>('/admin/search-profiles', { method: 'POST', body: req }),
+
+    // 新建版本：基于现有 profile 派生新 draft 版本，未提供的字段由服务端继承源 profile。
+    createProfileVersion: (id: string, req: CreateProfileVersionRequest) =>
+      apiFetch<SearchProfile>(`/admin/search-profiles/${id}/versions`, { method: 'POST', body: req }),
+
+    // 归档：保留记录不物理删除，归档后可通过 rollback 重新激活。
+    archiveProfile: (id: string) =>
+      apiFetch<{ status: string }>(`/admin/search-profiles/${id}/archive`, { method: 'POST' }),
 
     activateProfile: (id: string) =>
       apiFetch<{ status: string }>(`/admin/search-profiles/${id}/activate`, { method: 'POST' }),

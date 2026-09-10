@@ -59,6 +59,25 @@ type fakeESClient struct {
 	createIndexMappings map[string]map[string]interface{}
 	// createIndexCalls 按顺序记录 CreateIndex 的索引名，便于断言"是否发生了创建"。
 	createIndexCalls []string
+	// deleteIndexCalls 按顺序记录 DeleteIndex 的索引名。
+	// 引入动机：rebuild 失败时必须回收"本次自己新建"的索引、且绝不能删除复用的索引，
+	// 测试需要精确断言删除发生了、删的是哪一个（或根本没有删除）。
+	deleteIndexCalls []string
+	// deleteIndexErr 非 nil 时 DeleteIndex 返回该错误，
+	// 用于验证回收失败被记录且不掩盖原始错误。
+	deleteIndexErr error
+	// updateAliasErr 非 nil 时 UpdateAlias 返回该错误，
+	// 用于让 es.SwitchAlias 失败，验证"alias 切换失败"路径的回收行为。
+	updateAliasErr error
+	// deleteByQueryErr 非 nil 时 DeleteByQuery 返回该错误，
+	// 用于驱动"逐文档索引失败"这一发生在创建索引之后、alias 切换之前的失败路径。
+	deleteByQueryErr error
+	// lastListPattern 记录最后一次 ListIndices 使用的 pattern，
+	// 用于断言复用候选查询使用的是版本化索引前缀。
+	lastListPattern string
+	// listIndicesErr 非 nil 时 ListIndices 返回该错误，
+	// 用于验证"列出候选失败"时 rebuild 直接失败，而不是静默退回新建索引。
+	listIndicesErr error
 }
 
 // deleteByQueryCall 记录一次 DeleteByQuery 调用的参数。
@@ -141,6 +160,10 @@ func (c *fakeESClient) GetIndexDimensions(ctx context.Context, indexName string)
 }
 
 func (c *fakeESClient) DeleteIndex(ctx context.Context, indexName string) error {
+	c.deleteIndexCalls = append(c.deleteIndexCalls, indexName)
+	if c.deleteIndexErr != nil {
+		return c.deleteIndexErr
+	}
 	delete(c.indices, indexName)
 	delete(c.docs, indexName)
 	return nil
@@ -151,6 +174,9 @@ func (c *fakeESClient) IndexExists(ctx context.Context, indexName string) (bool,
 }
 
 func (c *fakeESClient) UpdateAlias(ctx context.Context, actions []es.AliasAction) error {
+	if c.updateAliasErr != nil {
+		return c.updateAliasErr
+	}
 	for _, a := range actions {
 		if a.Action == "add" {
 			c.aliasIndex = a.Index
@@ -179,6 +205,9 @@ func (c *fakeESClient) BulkIndex(ctx context.Context, indexName string, docs []e
 
 func (c *fakeESClient) DeleteByQuery(ctx context.Context, indexName string, query map[string]interface{}) error {
 	c.deleteByQueryCalls = append(c.deleteByQueryCalls, deleteByQueryCall{IndexName: indexName, Query: query})
+	if c.deleteByQueryErr != nil {
+		return c.deleteByQueryErr
+	}
 	if c.docs[indexName] != nil {
 		// 简化：按 document_id term 删除匹配文档
 		if term, ok := query["term"].(map[string]interface{}); ok {
@@ -434,6 +463,10 @@ func (c *fakeESClient) Refresh(ctx context.Context, indexName string) error {
 }
 
 func (c *fakeESClient) ListIndices(ctx context.Context, pattern string) ([]string, error) {
+	c.lastListPattern = pattern
+	if c.listIndicesErr != nil {
+		return nil, c.listIndicesErr
+	}
 	result := make([]string, 0, len(c.indices))
 	for name := range c.indices {
 		result = append(result, name)

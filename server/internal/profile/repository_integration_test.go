@@ -11,6 +11,7 @@
 //   - 激活后目标 profile 状态为 active 且 activated_at 非空
 //   - DeactivateProfile 能成功执行
 //   - UpdateProfileESIndex 能成功执行
+//   - ArchiveProfile 的 SQL 守卫在真实 schema 下生效（active 拒绝、影响 0 行报错）
 //
 // 测试需要 TEST_DATABASE_URL 环境变量，未设置时自动跳过。
 package profile
@@ -18,6 +19,7 @@ package profile
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -25,6 +27,7 @@ import (
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"partitura/server/internal/db/migration"
+	"partitura/server/internal/es"
 )
 
 // profileAdvisoryLockKey 是跨进程 advisory lock 的固定键值。
@@ -371,5 +374,132 @@ func TestGetActiveProfile_AfterActivate(t *testing.T) {
 	}
 	if active.ID != profileID {
 		t.Errorf("active profile ID 应为 %s，实际为 %s", profileID, active.ID)
+	}
+}
+
+// TestCreateProfile_ServerSideDraftVersionAndIndex 验证 CreateProfile 的服务端语义：
+// 版本号按同名 profile 递增、es_index_name 按版本号生成、status 固定为 draft、activated_at 为空。
+//
+// 引入动机："新建版本"端点直接复用 CreateProfile，其契约（草稿/递增版本/服务端索引名）
+// 由仓储层承担；handler 层测试只能观察传入参数，必须在真实 M003 schema 下验证落库结果，
+// 否则"新版本一定不会被自动激活"这一关键约束就没有端到端证据。
+func TestCreateProfile_ServerSideDraftVersionAndIndex(t *testing.T) {
+	db := setupProfileTestDB(t)
+	ctx := context.Background()
+	repo := NewPGRepository(db)
+
+	firstID := createTestUserAndProfile(t, db)
+	first, err := repo.GetProfileByID(ctx, firstID)
+	if err != nil {
+		t.Fatalf("查询首个 profile 失败: %v", err)
+	}
+	if first.Version != 1 {
+		t.Errorf("首个版本 version 应为 1，实际 %d", first.Version)
+	}
+	if first.Status != "draft" {
+		t.Errorf("CreateProfile 应落库为 draft，实际 %s", first.Status)
+	}
+	if first.ActivatedAt != "" {
+		t.Errorf("新建 profile 不应有 activated_at，实际 %q", first.ActivatedAt)
+	}
+	if first.ESIndexName != es.GenerateIndexName(1) {
+		t.Errorf("es_index_name 应为 %s，实际 %s", es.GenerateIndexName(1), first.ESIndexName)
+	}
+
+	// 以同名创建第二个版本，验证版本递增与索引名随之变化
+	second, err := repo.CreateProfile(ctx, &CreateProfileInput{
+		Name:                    "test_profile",
+		EmbeddingProvider:       "openai-compatible",
+		EmbeddingModel:          "qwen3-embedding",
+		EmbeddingDimensions:     1024,
+		ChunkTargetSize:         512,
+		ChunkOverlap:            64,
+		Analyzer:                "standard",
+		LexicalTopK:             50,
+		VectorTopK:              50,
+		RRFK:                    60,
+		RerankerProvider:        "openai-compatible",
+		RerankerModel:           "qwen3-reranker",
+		RerankerCandidateCount:  20,
+		RerankerFinalCount:      10,
+		MaxChunksPerDocument:    3,
+		MergeAdjacentChunks:     true,
+		MaxP95LatencyMs:         2000,
+		MaxRerankerCostPerQuery: 0.01,
+		CreatedBy:               first.CreatedBy,
+	})
+	if err != nil {
+		t.Fatalf("创建第二个版本失败: %v", err)
+	}
+	if second.Version != 2 {
+		t.Errorf("第二个版本 version 应为 2，实际 %d", second.Version)
+	}
+	if second.Status != "draft" {
+		t.Errorf("第二个版本应为 draft，实际 %s", second.Status)
+	}
+	if second.ESIndexName != es.GenerateIndexName(2) {
+		t.Errorf("第二个版本 es_index_name 应为 %s，实际 %s", es.GenerateIndexName(2), second.ESIndexName)
+	}
+}
+
+// TestArchiveProfile_GuardAndRetention 验证归档守卫与记录保留在真实 schema 下的行为。
+//
+// 引入动机：ArchiveProfile 的 UPDATE 带 status <> 'active' 守卫，影响 0 行时必须返回错误
+// 而不是静默成功（并发状态变化或 id 不存在）。fake 不执行 SQL，无法覆盖该语义，
+// 因此必须在真实 M003 schema 下验证：draft/inactive 可归档、active 被拒、记录保留、id 不存在报错。
+func TestArchiveProfile_GuardAndRetention(t *testing.T) {
+	db := setupProfileTestDB(t)
+	ctx := context.Background()
+	repo := NewPGRepository(db)
+
+	profileID := createTestUserAndProfile(t, db)
+
+	// draft → archived 成功，且记录保留
+	if err := repo.ArchiveProfile(ctx, profileID); err != nil {
+		t.Fatalf("归档 draft profile 应成功，实际失败: %v", err)
+	}
+	p, err := repo.GetProfileByID(ctx, profileID)
+	if err != nil {
+		t.Fatalf("归档后记录应保留，实际查询失败: %v", err)
+	}
+	if p.Status != "archived" {
+		t.Errorf("归档后 status 应为 archived，实际 %s", p.Status)
+	}
+
+	// 归档是可逆的：archived 可被重新激活（既有 rollback 语义）
+	if err := repo.ActivateProfile(ctx, profileID); err != nil {
+		t.Fatalf("激活 archived profile 失败: %v", err)
+	}
+
+	// active → 被守卫拒绝，且状态不变
+	if err := repo.ArchiveProfile(ctx, profileID); !errors.Is(err, ErrProfileNotArchivable) {
+		t.Fatalf("active profile 归档应返回 ErrProfileNotArchivable，实际 %v", err)
+	}
+	p, err = repo.GetProfileByID(ctx, profileID)
+	if err != nil {
+		t.Fatalf("查询 profile 失败: %v", err)
+	}
+	if p.Status != "active" {
+		t.Errorf("被拒绝的归档不应改变状态，实际 %s", p.Status)
+	}
+
+	// inactive → archived 成功
+	if err := repo.DeactivateProfile(ctx, profileID); err != nil {
+		t.Fatalf("停用 profile 失败: %v", err)
+	}
+	if err := repo.ArchiveProfile(ctx, profileID); err != nil {
+		t.Fatalf("归档 inactive profile 应成功，实际失败: %v", err)
+	}
+	p, err = repo.GetProfileByID(ctx, profileID)
+	if err != nil {
+		t.Fatalf("查询 profile 失败: %v", err)
+	}
+	if p.Status != "archived" {
+		t.Errorf("归档 inactive profile 后 status 应为 archived，实际 %s", p.Status)
+	}
+
+	// id 不存在 → 影响 0 行 → 必须报错而不是静默成功
+	if err := repo.ArchiveProfile(ctx, "00000000-0000-0000-0000-000000000000"); !errors.Is(err, ErrProfileNotArchivable) {
+		t.Fatalf("不存在 id 归档应返回 ErrProfileNotArchivable，实际 %v", err)
 	}
 }

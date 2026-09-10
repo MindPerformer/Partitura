@@ -18,6 +18,8 @@ import (
 	"database/sql"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 
 	"partitura/server/internal/es"
 	"partitura/server/internal/search/chunking"
@@ -852,10 +854,22 @@ func (h *IndexJobHandler) ensureAliasAndIndex(ctx context.Context, dimensions in
 }
 
 // rebuildAbsentListLimit 是判断"是否已有 rebuild_index 在队列中"时每次查询的条数上限。
-// 引入动机：去重只需检查最近一批 pending/running job，限定条数避免为一次判断拉取整张 jobs 表。
+// 引入动机：去重只需检查最近一批 job，限定条数避免为一次判断拉取整张 jobs 表。
 const rebuildAbsentListLimit = 50
 
-// enqueueRebuildIfAbsent 在队列中不存在待执行或执行中的 rebuild_index 时投递一次全量重建。
+// rebuildAbsentStatuses 是判断"是否已有 rebuild_index 需要处理"时查询的 job 状态集合。
+//
+// 引入动机（缺陷 C 修复）：原实现只查 pending/running，而 PGRepository.Fail 在重试次数耗尽时
+// 会把 job 置为终态 'dead'（未耗尽时为 'pending'）——因此 dead 是 pending/running 之外唯一需要
+// 额外覆盖的终态。一旦某次 rebuild 变成 dead，下一次 index_document 就会再入队一个全新的
+// rebuild_index（经 es.NextIndexName 把索引名再推高一位），形成"无限自建、无限失败"。
+//
+// 取舍动机：自动重复入队并不能解决 rebuild 本身的失败原因（例如 bulk 429），只会让每次重建都
+// 产出新的 knowledge_v{N+1}，把集群索引越堆越多。终态失败因此必须交给人工显式处置
+// （管理端 job 重试，或人工触发一次显式 rebuild），而不是让系统自动无限重建。
+var rebuildAbsentStatuses = []string{"pending", "running", "dead"}
+
+// enqueueRebuildIfAbsent 在队列中不存在待处理、执行中或终态失败的 rebuild_index 时投递一次全量重建。
 //
 // 引入动机：index_document 兜底路径发现索引维度与 profile 不一致时，必须让系统自动重建到
 // 正确维度，否则该文档的写入会永久失败。查询队列是为了避免每个 index_document 都重复入队。
@@ -869,7 +883,7 @@ func (h *IndexJobHandler) enqueueRebuildIfAbsent(ctx context.Context, profileID 
 		return fmt.Errorf("索引维度与 profile 不一致需要入队 %s，但 jobRepo 未注入", types.JobRebuildIndex)
 	}
 
-	for _, status := range []string{"pending", "running"} {
+	for _, status := range rebuildAbsentStatuses {
 		result, err := h.jobRepo.List(ctx, status, rebuildAbsentListLimit, 0)
 		if err != nil {
 			return fmt.Errorf("查询 %s 状态的 job 以判断是否已有 %s: %w", status, types.JobRebuildIndex, err)
@@ -879,8 +893,14 @@ func (h *IndexJobHandler) enqueueRebuildIfAbsent(ctx context.Context, profileID 
 		}
 		for _, existing := range result.Jobs {
 			if existing.Type == types.JobRebuildIndex {
-				slog.Info("已存在待执行/执行中的 rebuild_index，跳过重复入队",
-					"status", status, "existing_job_id", existing.ID)
+				if status == "dead" {
+					// 终态失败不自动重建：见 rebuildAbsentStatuses 的取舍动机。
+					slog.Warn("已存在终态(dead) rebuild_index，跳过重复入队，需人工显式重试或手动重建",
+						"status", status, "existing_job_id", existing.ID)
+				} else {
+					slog.Info("已存在待执行/执行中的 rebuild_index，跳过重复入队",
+						"status", status, "existing_job_id", existing.ID)
+				}
 				return nil
 			}
 		}
@@ -901,6 +921,89 @@ func (h *IndexJobHandler) enqueueRebuildIfAbsent(ctx context.Context, profileID 
 	return nil
 }
 
+// listVersionedIndexes 列出集群中所有版本化索引（knowledge_v*）。
+// 引入动机：统计"已有版本化索引数量"（缺陷 D）与挑选可复用索引（缺陷 A）都需要这份列表，
+// 统一走这里避免两处的 pattern 约定漂移。es.IndexNamePrefix 的前缀过滤天然排除了
+// knowledge_current 这类非版本化名字（alias 名）。
+func (h *IndexJobHandler) listVersionedIndexes(ctx context.Context) ([]string, error) {
+	indices, err := h.esClient.ListIndices(ctx, es.IndexNamePrefix+"*")
+	if err != nil {
+		return nil, fmt.Errorf("列出 %s* 索引: %w", es.IndexNamePrefix, err)
+	}
+	return indices, nil
+}
+
+// findReusableIndex 在已存在的版本化索引中挑选一个 embedding 维度与 profile 完全一致的索引，返回其名字。
+//
+// 引入动机（缺陷 A 修复）：rebuild 发现目标索引维度与 profile 不一致时，原实现无条件新建
+// knowledge_v{max+1}，导致每次重建都新增一个索引。只要集群中已经存在一个维度正确的索引
+// （例如上一次重建已成功创建、但在 alias 切换之前失败的产物），就应该直接复用它。
+//
+// 确定性取舍：多个候选都匹配时取版本号最大的一个。动机：
+//   - 版本号最大 = 最近一次构建的产物，其 analyzer 等 mapping 设置最接近当前 profile；
+//   - 选择必须确定：同一现场无论重试多少次、由哪个 worker 执行，都必须复用同一个索引，
+//     否则 alias 会在多个同维度索引之间来回漂移，旧索引清理也无从判断保留谁。
+//
+// 候选过滤规则：
+//   - 候选来自 es.IndexNamePrefix+"*"，因此 knowledge_current 这类不含前缀的名字不会出现；
+//   - GetIndexDimensions 对"索引不存在"或"没有 embedding 字段"返回 (0, nil)，这类候选必须跳过，
+//     不能把 0 当作匹配（dimensions <= 0 已在调用方被拒绝，不存在 0 == dimensions 的合法情形）；
+//   - 维度不一致的候选一律跳过，因此那个"维度不对的原目标索引"绝不会被选中；
+//   - 名字无法解析出版本号时跳过并 Warn，不参与"最大版本"比较（不让不可比较的候选影响确定性）。
+//
+// 返回空字符串表示没有可复用的索引，调用方应退回新建路径。
+func (h *IndexJobHandler) findReusableIndex(ctx context.Context, dimensions int) (string, error) {
+	indices, err := h.listVersionedIndexes(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	reusableIndex := ""
+	reusableVersion := 0
+	for _, candidate := range indices {
+		dims, dimsErr := h.esClient.GetIndexDimensions(ctx, candidate)
+		if dimsErr != nil {
+			return "", fmt.Errorf("读取索引 %s 的 embedding 维度: %w", candidate, dimsErr)
+		}
+		if dims != dimensions {
+			continue
+		}
+		version, ok := esIndexVersion(candidate)
+		if !ok {
+			slog.Warn("跳过无法解析版本号的索引候选", "index", candidate, "dimensions", dims)
+			continue
+		}
+		if version > reusableVersion {
+			reusableIndex = candidate
+			reusableVersion = version
+		}
+	}
+	return reusableIndex, nil
+}
+
+// esIndexVersion 从索引名解析版本号（knowledge_v{n} → n）。
+// 引入动机：findReusableIndex 需要"取版本号最大者"这一确定性取舍，而版本号比较只在 job 包内使用；
+// es 包的 parseIndexVersion 未导出，为不改动并行修改中的 es 包，这里按同一规则本地实现：
+// 前缀之后必须是非空纯十进制数字，knowledge_v、knowledge_v1_backup、knowledge_v-1 都视为解析失败。
+func esIndexVersion(name string) (int, bool) {
+	suffix, hasPrefix := strings.CutPrefix(name, es.IndexNamePrefix)
+	if !hasPrefix || suffix == "" {
+		return 0, false
+	}
+	for _, char := range suffix {
+		if char < '0' || char > '9' {
+			return 0, false
+		}
+	}
+	version, err := strconv.Atoi(suffix)
+	if err != nil {
+		// 全数字后缀仍转换失败只可能是整数溢出，不能静默当作有效版本号。
+		slog.Error("索引名版本号超出整数范围，忽略该索引", "index", name, "error", err)
+		return 0, false
+	}
+	return version, true
+}
+
 // handleRebuildIndex 处理全量重建索引任务。
 // 引入动机：C7 要求 rebuild 基于新 profile 创建新 versioned index → reindex → refresh →
 // integrity validation → alias 原子切换 → PG 持久 profile indexname/status。
@@ -911,9 +1014,15 @@ func (h *IndexJobHandler) enqueueRebuildIfAbsent(ctx context.Context, profileID 
 //   - 索引已存在时不重复创建，直接使用。
 //   - alias 切换使用 ES8 兼容的嵌套 JSON 格式（通过 AliasAction.MarshalJSON 实现）。
 //
-// 维度自愈（本次新增）：ES 的 dense_vector.dims 建好后不可变。当目标索引的 embedding 维度
-// 与 active profile 不一致时，复用该索引会让后续写入必然被 ES 以 400 拒绝。此时自动申请
-// 一个新索引名承载正确维度的 mapping，全量重建后切换 alias，并把新索引名回写 profile。
+// 维度自愈：ES 的 dense_vector.dims 建好后不可变。当目标索引的 embedding 维度与 active profile
+// 不一致时，复用该索引会让后续写入必然被 ES 以 400 拒绝。此时先尝试复用集群中已存在的、维度正确的
+// 索引（缺陷 A），找不到才新建一个索引名承载正确维度的 mapping，全量重建后切换 alias，
+// 并把索引名回写 profile。
+//
+// 失败回收：本次 job 自己创建的索引，在 alias 切换成功之前的任何失败都会由本函数回收
+// （缺陷 B），避免失败重试不断在集群里堆积无人引用的 knowledge_vN。
+//
+// 增长可见：新建索引时把已有版本化索引数量记入日志（缺陷 D），使失控增长在日志中可直接观察。
 func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) error {
 	indexName, _ := job.Payload["index_name"].(string)
 	workspaceID, _ := job.Payload["workspace_id"].(string)
@@ -968,17 +1077,66 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 			return fmt.Errorf("读取索引 %s 的 embedding 维度: %w", indexName, dimsErr)
 		}
 		if existingDims > 0 && existingDims != dimensions {
-			// 维度不一致：旧索引的 dense_vector.dims 不可变，必须换用新索引名重建。
-			newIndexName, nextErr := es.NextIndexName(ctx, h.esClient)
-			if nextErr != nil {
-				return fmt.Errorf("为 %d 维 embedding 计算新索引名: %w", dimensions, nextErr)
+			// 维度不一致：旧索引的 dense_vector.dims 不可变，不能继续往它里面写新维度向量。
+			//
+			// 缺陷 A 修复说明：原实现在这里无条件调用 es.NextIndexName 取"最大版本号 + 1"的新名字，
+			// 从不检查集群中是否已存在一个维度正确的索引可复用。线上事故中每次 rebuild 都产出
+			// knowledge_v{N+1}，失败后又不回收，索引被堆到 knowledge_v7，而 alias 始终指向最老的
+			// knowledge_v1（1024 维）。现在优先复用已存在的、维度正确的索引；只有确实找不到
+			// 可复用的索引时才退回"新建下一个版本化索引"。
+			reusableIndex, reuseErr := h.findReusableIndex(ctx, dimensions)
+			if reuseErr != nil {
+				return reuseErr
 			}
-			slog.Warn("索引维度与 profile 不一致，自动创建新索引",
-				"old_index", indexName, "old_dims", existingDims,
-				"new_index", newIndexName, "profile_dims", dimensions)
-			indexName = newIndexName
-			needCreate = true
+			if reusableIndex != "" {
+				slog.Info("rebuild：复用已存在且维度正确的索引，不再新建",
+					"reused_index", reusableIndex, "reused_dims", dimensions,
+					"mismatched_index", indexName, "mismatched_dims", existingDims)
+				indexName = reusableIndex
+				needCreate = false
+			} else {
+				newIndexName, nextErr := es.NextIndexName(ctx, h.esClient)
+				if nextErr != nil {
+					return fmt.Errorf("为 %d 维 embedding 计算新索引名: %w", dimensions, nextErr)
+				}
+				slog.Warn("索引维度与 profile 不一致且无可复用索引，自动创建新索引",
+					"old_index", indexName, "old_dims", existingDims,
+					"new_index", newIndexName, "profile_dims", dimensions)
+				indexName = newIndexName
+				needCreate = true
+			}
 		}
+	}
+
+	// createdIndexName 记录"本次 job 自己创建"的索引名；非空表示失败时必须由本函数回收。
+	//
+	// 缺陷 B 修复说明：原实现把 CreateIndex 放在 alias 切换之前，中间任何一步失败（逐文档索引、
+	// integrity check、repair、SwitchAlias）都会把新索引遗留在集群里且 alias 未切换——下一次重试
+	// 再建一个，这正是索引失控增长的放大器。复用的索引绝不会进入这里：它可能正是 alias 当前
+	// 指向的索引，删除它会直接造成检索不可用。
+	createdIndexName := ""
+
+	// recycleCreatedIndexOnFailure 统一回收本次新建的索引，并把原始错误原样返回给 job 层。
+	//
+	// 引入动机：失败路径分散在逐文档索引、integrity check、repair、SwitchAlias 等多处，
+	// 每个 return 点各写一遍回收代码极易漏掉其中一处；集中到此 helper，新增失败分支时按同一模式处理。
+	//
+	// 约束：
+	//   - createdIndexName 为空（复用已有索引 / 本次未创建）时直接返回原始错误，绝不删除任何已有索引；
+	//   - 回收失败必须 Error 记录（索引会残留并继续被后续 rebuild 看到），但绝不替换原始错误：
+	//     job 层需要看到真实失败原因，才能正确决定重试与人工处置。
+	recycleCreatedIndexOnFailure := func(cause error) error {
+		if createdIndexName == "" {
+			return cause
+		}
+		if delErr := h.esClient.DeleteIndex(ctx, createdIndexName); delErr != nil {
+			slog.Error("rebuild 失败后回收本次新建的索引失败，索引残留在集群中",
+				"index", createdIndexName, "cause", cause, "delete_error", delErr)
+			return cause
+		}
+		slog.Warn("rebuild 未完成 alias 切换，已回收本次新建的索引",
+			"index", createdIndexName, "cause", cause)
+		return cause
 	}
 
 	if needCreate {
@@ -991,11 +1149,21 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 			// profile.embedding_dimensions 由 admin 接口校验 > 0，出现 <= 0 属数据异常，必须暴露。
 			return fmt.Errorf("profile embedding 维度无效(%d)，无法创建索引 %s", dimensions, indexName)
 		}
+		// 缺陷 D 修复说明：把"创建前已有的版本化索引数量"一并记入日志。
+		// 引入动机：事故期间日志里只有零散的"已创建新索引"，无法直接看出索引数量在失控增长；
+		// 有了这个字段，knowledge_v7 这类堆积可以在日志中一眼观察到。统计失败即报错（fail fast），
+		// 不做静默降级。
+		existingVersioned, listErr := h.listVersionedIndexes(ctx)
+		if listErr != nil {
+			return listErr
+		}
 		mapping := es.BuildIndexMapping(dimensions, analyzer)
 		if err := h.esClient.CreateIndex(ctx, indexName, mapping); err != nil {
 			return fmt.Errorf("创建索引 %s（dimensions=%d, analyzer=%s）: %w", indexName, dimensions, analyzer, err)
 		}
-		slog.Info("rebuild：已创建新索引", "index", indexName, "dimensions", dimensions, "analyzer", analyzer)
+		createdIndexName = indexName
+		slog.Info("rebuild：已创建新索引", "index", indexName, "dimensions", dimensions,
+			"analyzer", analyzer, "existing_versioned_indexes", len(existingVersioned))
 	} else {
 		slog.Info("rebuild：目标索引已存在，跳过创建", "index", indexName)
 	}
@@ -1010,7 +1178,7 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 	var embFunc embeddingProviderFunc
 	if h.embEmbed != nil && h.embConfigured != nil && h.embConfigured(ctx) {
 		if profileConfig == nil {
-			return fmt.Errorf("embedding provider 已配置但无法获取 active profile 配置，无法生成向量")
+			return recycleCreatedIndexOnFailure(fmt.Errorf("embedding provider 已配置但无法获取 active profile 配置，无法生成向量"))
 		}
 		embFunc = h.embEmbed
 	}
@@ -1018,7 +1186,7 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 	// 从 PG 读取所有非特殊文件、非 archived 文档
 	docs, err := readPGDocuments(ctx, h.db, workspaceID)
 	if err != nil {
-		return fmt.Errorf("读取 PG 文档: %w", err)
+		return recycleCreatedIndexOnFailure(fmt.Errorf("读取 PG 文档: %w", err))
 	}
 
 	// 逐文档索引
@@ -1037,7 +1205,7 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 			slog.Error("重建索引时文档索引失败", "doc_id", doc.ID, "error", err)
 			if embFunc != nil {
 				// Provider 已配置但索引失败（含 embedding 失败），必须中止
-				return fmt.Errorf("重建索引时文档 %s 索引失败: %w", doc.ID, err)
+				return recycleCreatedIndexOnFailure(fmt.Errorf("重建索引时文档 %s 索引失败: %w", doc.ID, err))
 			}
 			// Provider 未配置时，仅 lexical 索引失败可跳过，但记录失败
 			failedCount++
@@ -1052,7 +1220,7 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 	if failedCount > 0 {
 		slog.Error("rebuild 有文档索引失败，不切换 alias",
 			"index", indexName, "indexed", indexedCount, "failed", failedCount)
-		return fmt.Errorf("rebuild 有 %d 个文档索引失败，不切换 alias（索引不完整）", failedCount)
+		return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild 有 %d 个文档索引失败，不切换 alias（索引不完整）", failedCount))
 	}
 
 	// 刷新索引
@@ -1071,10 +1239,10 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 	integrityResult, err := CheckIntegrity(ctx, h.db, h.esClient, indexName, workspaceID, chunkTargetSize, chunkOverlap)
 	if err != nil {
 		slog.Error("rebuild 后 integrity check 失败", "index", indexName, "error", err)
-		return fmt.Errorf("rebuild 后 integrity check: %w", err)
+		return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild 后 integrity check: %w", err))
 	}
 	if !integrityResult.CheckedOK {
-		return fmt.Errorf("rebuild 后 integrity check 未完成，ES 可能不可用")
+		return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild 后 integrity check 未完成，ES 可能不可用"))
 	}
 	if len(integrityResult.Issues) > 0 {
 		slog.Warn("rebuild 后发现 integrity 问题", "index", indexName, "issues", len(integrityResult.Issues))
@@ -1091,7 +1259,7 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 		if repairFailed > 0 {
 			slog.Error("rebuild 后 integrity 修复失败，不切换 alias",
 				"index", indexName, "total_issues", len(integrityResult.Issues), "repair_failed", repairFailed)
-			return fmt.Errorf("rebuild 后 %d 个 integrity 问题修复失败，不切换 alias", repairFailed)
+			return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild 后 %d 个 integrity 问题修复失败，不切换 alias", repairFailed))
 		}
 	}
 
@@ -1100,7 +1268,8 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 	// 保留旧索引以支持 rollback。新索引构建失败不切换旧 alias。
 	if err := es.SwitchAlias(ctx, h.esClient, es.AliasName, indexName); err != nil {
 		slog.Error("alias 切换失败，保留旧 alias 和旧索引", "index", indexName, "error", err)
-		return fmt.Errorf("alias 切换失败: %w", err)
+		// alias 未切换成功，本次新建的索引没有被任何 alias 引用，必须回收（复用的索引不受影响）。
+		return recycleCreatedIndexOnFailure(fmt.Errorf("alias 切换失败: %w", err))
 	}
 
 	// 回写 profile 的 es_index_name。

@@ -47,6 +47,9 @@ func (m *mockProfileRepo) GetActiveProfile(ctx context.Context) (*profile.Profil
 }
 func (m *mockProfileRepo) ActivateProfile(ctx context.Context, id string) error { return nil }
 func (m *mockProfileRepo) DeactivateProfile(ctx context.Context, id string) error { return nil }
+
+// ArchiveProfile 补齐 profile.Repository 接口；搜索 handler 不涉及归档，返回 nil。
+func (m *mockProfileRepo) ArchiveProfile(ctx context.Context, id string) error { return nil }
 func (m *mockProfileRepo) UpdateProfileESIndex(ctx context.Context, id, indexName string) error {
 	return nil
 }

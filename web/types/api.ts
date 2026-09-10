@@ -485,6 +485,16 @@ export interface CreateProfileRequest {
   max_reranker_cost_per_query: number
 }
 
+/**
+ * 新建配置版本（POST /admin/search-profiles/{id}/versions）的请求体。
+ *
+ * 引入动机：搜索配置不支持原地修改，"修改"的语义是基于现有配置派生新版本。
+ * 服务端会继承源 profile 中本请求体未提供的字段，因此这里的每个可覆盖字段都是可选的：
+ * 前端只发送界面上真正暴露给用户的字段，其余字段留在服务端继承。
+ * 该类型不改变 CreateProfileRequest / SearchProfile 的既有字段语义。
+ */
+export type CreateProfileVersionRequest = Partial<CreateProfileRequest>
+
 // ============================================================
 // Admin — Evaluation
 // ============================================================

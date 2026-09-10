@@ -5,13 +5,22 @@
 // 通过 v-html 渲染净化后的 HTML 是安全的。
 -->
 <script setup lang="ts">
-import { renderMarkdown } from '~/utils/markdown'
+import { renderMarkdownWithOutline, type MarkdownHeading } from '~/utils/markdown'
 
 const props = defineProps<{
   content: string
 }>()
 
-const html = computed(() => renderMarkdown(props.content))
+const emit = defineEmits<{
+  headings: [headings: MarkdownHeading[]]
+}>()
+
+const rendered = computed(() => renderMarkdownWithOutline(props.content))
+const html = computed(() => rendered.value.html)
+
+watch(rendered, (value) => {
+  emit('headings', value.headings)
+}, { immediate: true, flush: 'post' })
 </script>
 
 <template>
@@ -23,6 +32,10 @@ const html = computed(() => renderMarkdown(props.content))
 
 .markdown-body {
   @apply text-default leading-7;
+}
+
+.markdown-body :where(h1, h2, h3, h4, h5, h6) {
+  scroll-margin-top: 5rem;
 }
 
 .markdown-body h1 {

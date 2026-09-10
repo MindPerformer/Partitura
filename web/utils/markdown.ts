@@ -20,14 +20,38 @@
 // - 客户端直接使用浏览器原生 window
 // - 不存在空 catch 静默降级：如果 DOMPurify 初始化失败，抛出错误而非返回未净化 HTML
 
-import { marked } from 'marked'
+import { Marked, marked } from 'marked'
 import DOMPurify from 'dompurify'
 
-// 配置 marked
+// 配置全局 marked，保持现有 renderMarkdown 调用方的解析行为。
 marked.setOptions({
   gfm: true,
   breaks: false
 })
+
+/** MarkdownRenderer 与目录共用的标题信息。 */
+export interface MarkdownHeading {
+  id: string
+  level: number
+  text: string
+}
+
+/**
+ * 将标题文本转换为稳定的 HTML 锚点 id。
+ *
+ * 保留中文、日文、韩文等 Unicode 字母和数字，避免中文标题生成空 id。
+ */
+export function slugify(text: string): string {
+  const slug = text
+    .normalize('NFKC')
+    .toLocaleLowerCase()
+    .trim()
+    .replace(/[^\p{L}\p{N}\s-]/gu, '')
+    .replace(/[\s-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+
+  return slug || 'section'
+}
 
 /**
  * 判断当前是否在真实浏览器环境中。
@@ -190,58 +214,88 @@ function getDOMPurifyInstance(): typeof DOMPurify {
   return instance
 }
 
+/** Markdown 内容净化配置。标题 id 在白名单中，确保目录锚点不会被移除。 */
+const MARKDOWN_SANITIZE_CONFIG = {
+  ALLOWED_TAGS: [
+    'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
+    'p', 'br', 'hr',
+    'ul', 'ol', 'li',
+    'blockquote', 'code', 'pre',
+    'a', 'strong', 'em', 'del', 's',
+    'table', 'thead', 'tbody', 'tr', 'th', 'td',
+    'img', 'span', 'div',
+    'input'
+  ],
+  ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'id', 'type', 'checked', 'disabled'],
+  ALLOW_DATA_ATTR: false,
+  ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):)/i
+}
+
+function sanitizeMarkdownHtml(rawHtml: string): string {
+  const purifier = getDOMPurifyInstance()
+  return purifier.sanitize(rawHtml, MARKDOWN_SANITIZE_CONFIG) as string
+}
+
+function extractHeadingText(inlineHtml: string): string {
+  const document = getDOMWindow().document
+  const container = document.createElement('div')
+  container.innerHTML = inlineHtml
+  return container.textContent?.trim() || ''
+}
+
+/**
+ * 解析并安全渲染 Markdown，同时返回与真实 HTML heading 一一对应的目录数据。
+ *
+ * 引入动机：目录必须跳转到渲染后的标题，不能依赖可能与 marked 解析结果不一致的
+ * 服务端 outline。使用同一个 Marked 实例生成 heading id 和 headings 列表，保证两者一致。
+ *
+ * @param markdown — Markdown 原始文本
+ * @returns 净化后的 HTML 与标题目录
+ * @throws 如果 Markdown 解析或 DOMPurify 净化失败，直接抛出错误
+ */
+export function renderMarkdownWithOutline(markdown: string): { html: string; headings: MarkdownHeading[] } {
+  if (!markdown) {
+    return { html: '', headings: [] }
+  }
+
+  const headings: MarkdownHeading[] = []
+  const usedIds = new Map<string, number>()
+  const parser = new Marked({
+    gfm: true,
+    breaks: false,
+    renderer: {
+      heading({ tokens, depth }) {
+        const inlineHtml = this.parser.parseInline(tokens) as string
+        const text = extractHeadingText(inlineHtml)
+        const baseId = `heading-${slugify(text)}`
+        const occurrence = usedIds.get(baseId) ?? 0
+        usedIds.set(baseId, occurrence + 1)
+        const id = occurrence === 0 ? baseId : `${baseId}-${occurrence}`
+
+        headings.push({ id, level: depth, text })
+        return `<h${depth} id="${id}">${inlineHtml}</h${depth}>\n`
+      }
+    }
+  })
+
+  const rawHtml = parser.parse(markdown, { async: false }) as string
+  return {
+    html: sanitizeMarkdownHtml(rawHtml),
+    headings
+  }
+}
+
 /**
  * 安全渲染 Markdown 为 HTML 字符串。
  *
- * 引入动机：所有 Markdown 内容来自用户输入，必须净化后才能渲染。
- * 使用 v-html 渲染此函数的返回值是安全的，因为 HTML 已经过 DOMPurify 净化。
- *
- * 安全保障：
- * - marked 解析 Markdown 为 HTML
- * - DOMPurify 使用白名单净化（ALLOWED_TAGS + ALLOWED_ATTR）
- * - 链接协议仅允许 http/https/mailto（ALLOWED_URI_REGEXP + data: URI hook）
- * - 禁止 data 属性（ALLOW_DATA_ATTR: false）
- * - SSR 和客户端均使用真正的 DOM 型净化，不依赖正则
+ * 保持既有 API 不变；需要目录数据时使用 renderMarkdownWithOutline。
  *
  * @param markdown — Markdown 原始文本
  * @returns 净化后的 HTML 字符串
- * @throws 如果 DOMPurify 净化失败，抛出错误（不返回未净化 HTML）
+ * @throws 如果 Markdown 解析或 DOMPurify 净化失败，直接抛出错误
  */
 export function renderMarkdown(markdown: string): string {
-  if (!markdown) {
-    return ''
-  }
-
-  // 解析 Markdown 为 HTML
-  const rawHtml = marked.parse(markdown, { async: false }) as string
-
-  // DOMPurify 净化配置
-  // 注意：ALLOWED_TAGS 和 FORBID_TAGS 不能同时使用，否则行为未定义。
-  // 只使用 ALLOWED_TAGS（白名单）+ ALLOWED_ATTR + ALLOWED_URI_REGEXP。
-  // data: URI 通过 uponSanitizeAttribute hook 额外拦截（DOMPurify 默认允许 img 的 data: URI）。
-  const config = {
-    ALLOWED_TAGS: [
-      'h1', 'h2', 'h3', 'h4', 'h5', 'h6',
-      'p', 'br', 'hr',
-      'ul', 'ol', 'li',
-      'blockquote', 'code', 'pre',
-      'a', 'strong', 'em', 'del', 's',
-      'table', 'thead', 'tbody', 'tr', 'th', 'td',
-      'img', 'span', 'div',
-      'input' // for checkbox lists
-    ],
-    ALLOWED_ATTR: ['href', 'src', 'alt', 'title', 'class', 'id', 'type', 'checked', 'disabled'],
-    ALLOW_DATA_ATTR: false,
-    ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):)/i
-  }
-
-  // 获取绑定到当前环境 window 的 DOMPurify 实例（含 data: URI 拦截 hook）
-  const purifier = getDOMPurifyInstance()
-
-  // 执行净化 — 不使用 try/catch 静默降级，出错则抛出
-  const sanitized = purifier.sanitize(rawHtml, config) as string
-
-  return sanitized
+  return renderMarkdownWithOutline(markdown).html
 }
 
 /**

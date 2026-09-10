@@ -89,7 +89,7 @@ useHead({ title: () => t('admin.auditLog') + ' · ' + t('common.appName') })
             >
               <div class="flex items-start justify-between mb-1">
                 <div class="flex items-center gap-2">
-                  <UBadge variant="subtle" size="xs">{{ entry.action }}</UBadge>
+                  <UBadge variant="subtle" size="sm">{{ entry.action }}</UBadge>
                   <span class="text-xs text-muted">{{ entry.resource_type }}</span>
                 </div>
                 <span class="text-xs text-dimmed">{{ formatDate(entry.created_at) }}</span>

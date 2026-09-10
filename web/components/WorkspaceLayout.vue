@@ -71,12 +71,14 @@ watch(workspace, () => {
 }, { immediate: true })
 
 const sidebarOpen = ref(true)
+const mobileSidebarOpen = ref(false)
 
 function toggleSidebar() {
   sidebarOpen.value = !sidebarOpen.value
 }
 
 function handleSelectDoc(path: string) {
+  mobileSidebarOpen.value = false
   navigateTo(`/workspaces/${workspaceId.value}/documents/read?path=${encodeURIComponent(path)}`)
 }
 </script>
@@ -86,7 +88,18 @@ function handleSelectDoc(path: string) {
     <AppHeader
       :workspace-id="workspaceId"
       :workspace-name="workspace?.display_name"
-    />
+    >
+      <template #leading>
+        <UButton
+          class="md:hidden"
+          color="neutral"
+          variant="ghost"
+          icon="i-lucide-menu"
+          :aria-label="t('workspace.openSidebar')"
+          @click="mobileSidebarOpen = true"
+        />
+      </template>
+    </AppHeader>
 
     <!-- Workspace loading -->
     <div v-if="loading" class="flex-1 flex items-center justify-center">
@@ -100,62 +113,33 @@ function handleSelectDoc(path: string) {
 
     <!-- Workspace content -->
     <div v-else-if="workspace" class="flex-1 flex overflow-hidden">
-      <!-- Sidebar toggle button -->
+      <!-- Desktop sidebar toggle -->
       <button
-        class="flex-shrink-0 w-6 flex items-center justify-center border-r border-default bg-default hover:bg-elevated transition-colors"
+        class="hidden w-6 flex-shrink-0 items-center justify-center border-r border-default bg-default transition-colors hover:bg-elevated md:flex"
         :aria-label="sidebarOpen ? t('workspace.collapseSidebar') : t('workspace.expandSidebar')"
         @click="toggleSidebar"
       >
-        <UIcon :name="sidebarOpen ? 'i-lucide-panel-left-close' : 'i-lucide-panel-left-open'" class="w-4 h-4 text-muted" />
+        <UIcon :name="sidebarOpen ? 'i-lucide-panel-left-close' : 'i-lucide-panel-left-open'" class="h-4 w-4 text-muted" />
       </button>
-      <!-- Sidebar -->
+
+      <!-- Desktop sidebar -->
       <aside
         v-if="sidebarOpen"
-        class="w-64 flex-shrink-0 border-r border-default bg-default overflow-y-auto"
+        class="hidden w-64 min-h-0 flex-shrink-0 overflow-y-auto border-r border-default bg-default md:block"
       >
-        <!-- 主页 / 统计 固定入口 -->
-        <nav class="px-3 py-2 border-b border-default space-y-1">
-          <NuxtLink
-            :to="`/workspaces/${workspaceId}`"
-            class="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm transition-colors"
-            :class="route.path === `/workspaces/${workspaceId}` ? 'bg-primary/10 text-primary font-medium' : 'text-default hover:bg-elevated'"
-          >
-            <UIcon name="i-lucide-home" class="w-4 h-4" />
-            {{ t('workspace.home') }}
-          </NuxtLink>
-          <NuxtLink
-            :to="`/workspaces/${workspaceId}`"
-            class="flex items-center gap-2 px-2 py-1.5 rounded-md text-sm transition-colors"
-            :class="route.path === `/workspaces/${workspaceId}` ? 'bg-primary/10 text-primary font-medium' : 'text-default hover:bg-elevated'"
-          >
-            <UIcon name="i-lucide-bar-chart-3" class="w-4 h-4" />
-            {{ t('workspace.stats') }}
-          </NuxtLink>
-        </nav>
-
-        <!-- 文档树 -->
-        <div class="px-3 py-2 border-b border-default flex items-center justify-between">
-          <span class="text-xs font-medium text-muted uppercase">{{ t('document.documents') }}</span>
-          <UButton
-            v-if="canEdit"
-            size="xs"
-            variant="ghost"
-            icon="i-lucide-plus"
-            :to="`/workspaces/${workspaceId}/documents/edit`"
-          />
-        </div>
-        <div class="px-3 py-2">
-          <ErrorDisplay v-if="docsError" :message="docsError" />
-          <div v-if="docsLoading" class="flex items-center justify-center py-4">
-            <UIcon name="i-lucide-loader-circle" class="w-4 h-4 animate-spin text-muted" />
-          </div>
-        </div>
-        <AppSidebar
-          :documents="documents"
+        <WorkspaceSidebar
           :workspace-id="workspaceId"
+          :documents="documents"
           :current-path="route.query.path as string"
+          :can-edit="canEdit"
           @select="handleSelectDoc"
         />
+        <div class="border-t border-default px-3 py-2">
+          <ErrorDisplay v-if="docsError" :message="docsError" />
+          <div v-if="docsLoading" class="flex items-center justify-center py-4">
+            <UIcon name="i-lucide-loader-circle" class="h-4 w-4 animate-spin text-muted" />
+          </div>
+        </div>
       </aside>
 
       <!-- Main content -->
@@ -168,5 +152,29 @@ function handleSelectDoc(path: string) {
     <div v-else class="flex-1 flex items-center justify-center">
       <p class="text-muted">{{ t('workspace.workspaceNotFound') }}</p>
     </div>
+
+    <!-- Mobile sidebar drawer -->
+    <USlideover
+      v-model:open="mobileSidebarOpen"
+      side="left"
+      :title="workspace?.display_name || t('workspace.home')"
+      :ui="{ content: 'w-[min(20rem,calc(100vw-2rem))]' }"
+    >
+      <template #body>
+        <WorkspaceSidebar
+          :workspace-id="workspaceId"
+          :documents="documents"
+          :current-path="route.query.path as string"
+          :can-edit="canEdit"
+          @select="handleSelectDoc"
+        />
+        <div class="border-t border-default px-3 py-2">
+          <ErrorDisplay v-if="docsError" :message="docsError" />
+          <div v-if="docsLoading" class="flex items-center justify-center py-4">
+            <UIcon name="i-lucide-loader-circle" class="h-4 w-4 animate-spin text-muted" />
+          </div>
+        </div>
+      </template>
+    </USlideover>
   </div>
 </template>

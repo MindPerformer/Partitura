@@ -1,10 +1,10 @@
 // tests/workspace-navigation.test.ts — workspace 导航和分页文档树测试
 //
 // 引入动机：计划要求所有 workspace 页面使用统一左侧文档树，
-// 侧栏顶部有固定"主页/统计"入口，文档树必须完整分页加载。
+// 侧栏顶部保留固定"主页"入口，文档树必须完整分页加载。
 // 此测试验证：
 // 1. WorkspaceLayout 分页加载所有文档（超过 100 篇）
-// 2. 主页/统计导航入口存在
+// 2. workspace stats API 可用并在主页数据中合并展示
 // 3. 路由切换保持正确 workspace
 
 import { describe, it, expect, beforeEach } from 'vitest'

@@ -492,35 +492,95 @@ func diagnosticBodySummary(body []byte) string {
 	return text
 }
 
+// esErrorCause 是 ES 错误体中可递归嵌套的原因节点。
+// 引入动机：ES 的层次化错误（典型如 search_phase_execution_exception: all shards failed）
+// 把真实原因放在 error.root_cause[] 与 error.caused_by 中，而 caused_by 还可以继续嵌套
+// （例如 illegal_argument_exception 由 number_format_exception 引起）。
+// 只解析顶层 type/reason 会把 "Vector dimension error: expected dim: 1024, got 4096"
+// 这类可定位的根因完全丢掉，线上只能看到 "all shards failed"。
+type esErrorCause struct {
+	Type     string        `json:"type"`
+	Reason   string        `json:"reason"`
+	CausedBy *esErrorCause `json:"caused_by"`
+}
+
 // esErrorBody 是 ES 标准错误响应体的结构。
-// 引入动机：ES 在 4xx/5xx 时返回 {"error":{"type":"...","reason":"..."},"status":400}，
-// 只有解析出 type/reason 才能在不把整个响应体写进日志的前提下定位真实失败原因
+// 引入动机：ES 在 4xx/5xx 时返回
+// {"error":{"type":"...","reason":"...","root_cause":[...],"caused_by":{...}},"status":400}，
+// 只有解析出 type/reason 及其层次化原因，才能在不把整个响应体写进日志的前提下定位真实失败原因
 // （例如 dense_vector 维度不匹配、index_not_found_exception）。
 type esErrorBody struct {
 	Error struct {
-		Type   string `json:"type"`
-		Reason string `json:"reason"`
+		Type      string         `json:"type"`
+		Reason    string         `json:"reason"`
+		RootCause []esErrorCause `json:"root_cause"`
+		CausedBy  *esErrorCause  `json:"caused_by"`
 	} `json:"error"`
 }
 
-// parseESErrorBody 解析 ES 标准错误响应体，返回 (error.type, error.reason)。
+// esErrorInfo 是从 ES 标准错误体中提取出的诊断信息。
+// 引入动机：Search 既要保留既有的 "type: reason" 单行摘要（错误信息前缀必须向后兼容），
+// 又需要把 root_cause / caused_by 这些真正定位问题的原因一并带给日志与调用方。
+type esErrorInfo struct {
+	Type      string         // 顶层 error.type
+	Reason    string         // 顶层 error.reason
+	RootCause []esErrorCause // error.root_cause[]：ES 层次化错误的真实原因
+	CausedBy  *esErrorCause  // error.caused_by：可能是嵌套链的起点
+}
+
+// parseESErrorBody 解析 ES 标准错误响应体，返回其中可诊断的错误信息。
 //
 // 引入动机：Search 等操作需要把 ES 的真实失败原因带进返回的 error 与 slog 日志，
-// 只报告 HTTP 状态码无法诊断线上问题（如 400 的维度不匹配）。
+// 只报告 HTTP 状态码无法诊断线上问题（如 400 的维度不匹配），
+// 而 root_cause / caused_by 往往才是真正的根因。
 //
-// 语义：ok=false 表示响应体不是 ES 标准错误结构（非 JSON，或 type/reason 均为空），
-// 调用方应退化为 diagnosticBodySummary 的截断摘要，保证错误信息在任何情况下都可定位。
-func parseESErrorBody(body []byte) (errorType, reason string, ok bool) {
+// 语义：ok=false 表示响应体不是 ES 标准错误结构（非 JSON、error 不是对象，
+// 或 type/reason/root_cause/caused_by 全为空），调用方应退化为
+// diagnosticBodySummary 的截断摘要，保证错误信息在任何情况下都可定位。
+func parseESErrorBody(body []byte) (esErrorInfo, bool) {
 	var parsed esErrorBody
 	if err := json.Unmarshal(body, &parsed); err != nil {
-		return "", "", false
+		return esErrorInfo{}, false
 	}
-	errorType = strings.TrimSpace(parsed.Error.Type)
-	reason = strings.TrimSpace(parsed.Error.Reason)
-	if errorType == "" && reason == "" {
-		return "", "", false
+	info := esErrorInfo{
+		Type:      strings.TrimSpace(parsed.Error.Type),
+		Reason:    strings.TrimSpace(parsed.Error.Reason),
+		RootCause: normalizeESErrorCauses(parsed.Error.RootCause),
+		CausedBy:  normalizeESErrorCause(parsed.Error.CausedBy),
 	}
-	return errorType, reason, true
+	if info.Type == "" && info.Reason == "" && len(info.RootCause) == 0 && info.CausedBy == nil {
+		return esErrorInfo{}, false
+	}
+	return info, true
+}
+
+// normalizeESErrorCause 递归清理原因节点中的空白并丢弃空节点，返回 nil 表示该节点没有可用信息。
+// 引入动机：ES 的 root_cause 可能为空数组或只含 {}，直接渲染会拼出 "': '" 之类的空片段，
+// 破坏错误信息可读性；这里统一在解析阶段归一化，后续渲染无需再做判空。
+func normalizeESErrorCause(node *esErrorCause) *esErrorCause {
+	if node == nil {
+		return nil
+	}
+	cleaned := &esErrorCause{
+		Type:     strings.TrimSpace(node.Type),
+		Reason:   strings.TrimSpace(node.Reason),
+		CausedBy: normalizeESErrorCause(node.CausedBy),
+	}
+	if cleaned.Type == "" && cleaned.Reason == "" && cleaned.CausedBy == nil {
+		return nil
+	}
+	return cleaned
+}
+
+// normalizeESErrorCauses 逐条归一化 root_cause 数组，全为空时返回 nil。
+func normalizeESErrorCauses(nodes []esErrorCause) []esErrorCause {
+	var cleaned []esErrorCause
+	for i := range nodes {
+		if node := normalizeESErrorCause(&nodes[i]); node != nil {
+			cleaned = append(cleaned, *node)
+		}
+	}
+	return cleaned
 }
 
 // esErrorDetail 把 ES 错误类型与原因拼成 "type: reason" 形式的单行摘要。
@@ -536,6 +596,81 @@ func esErrorDetail(errorType, reason string) string {
 		return reason
 	}
 }
+
+// esErrorCauseSummary 把单个原因节点及其 caused_by 嵌套链渲染成单行摘要。
+// 引入动机：嵌套链（A caused_by B caused_by C）是 ES 常见的错误表达方式，
+// 展平成 "A; caused_by: B; caused_by: C" 比不断嵌套括号更利于日志检索与错误信息断言。
+func esErrorCauseSummary(node *esErrorCause) string {
+	if node == nil {
+		return ""
+	}
+	summary := esErrorDetail(node.Type, node.Reason)
+	for nested := node.CausedBy; nested != nil; nested = nested.CausedBy {
+		detail := esErrorDetail(nested.Type, nested.Reason)
+		if detail == "" {
+			continue
+		}
+		if summary == "" {
+			summary = detail
+			continue
+		}
+		summary += "; caused_by: " + detail
+	}
+	return summary
+}
+
+// rootCauseSummaries 返回 root_cause 的逐条单行摘要，供日志结构化输出与错误信息拼接。
+func (i esErrorInfo) rootCauseSummaries() []string {
+	if len(i.RootCause) == 0 {
+		return nil
+	}
+	summaries := make([]string, 0, len(i.RootCause))
+	for idx := range i.RootCause {
+		if summary := esErrorCauseSummary(&i.RootCause[idx]); summary != "" {
+			summaries = append(summaries, summary)
+		}
+	}
+	return summaries
+}
+
+// esErrorCauseSuffix 汇总 root_cause 与 caused_by，生成追加在 "type: reason" 之后的诊断细节。
+//
+// 引入动机：外层错误（search_phase_execution_exception: all shards failed）本身不含根因，
+// 只有把层次化原因追加到错误信息里，线上日志才可定位（例如向量维度不匹配）。
+// 语义：返回空字符串表示错误体没有可补充的层次化原因，此时调用方产出的错误信息与改动前完全一致，
+// 保证 "search 返回状态码 <code>: <type>: <reason>" 这段连续子串不被破坏。
+func esErrorCauseSuffix(info esErrorInfo) string {
+	parts := make([]string, 0, 2)
+	if summaries := info.rootCauseSummaries(); len(summaries) > 0 {
+		parts = append(parts, "root_cause: "+strings.Join(summaries, "; "))
+	}
+	if summary := esErrorCauseSummary(info.CausedBy); summary != "" {
+		parts = append(parts, "caused_by: "+summary)
+	}
+	if len(parts) == 0 {
+		return ""
+	}
+	return "（" + strings.Join(parts, "; ") + "）"
+}
+
+// bulkBatchMaxBytes 是单个 bulk 请求体的字节数上限（5MB）。
+//
+// 引入动机（线上事故修复）：重建索引时曾把"一个文档的全部 chunk"拼成同一个 bulk 请求，
+// 每条 chunk 带 4096 维 embedding（JSON 中约 45KB），单请求达 54MB；而 ES 堆只有 512MB，
+// 协调节点的 max_coordinating_bytes = 堆的 10% = 51.2MB，于是被确定性拒绝：
+// es_rejected_execution_exception: rejected execution of coordinating operation。
+// 这种超限载荷重试多少次都不会成功，必须在客户端按大小分批。
+//
+// 取值依据：ES 官方推荐单次 bulk 请求体控制在 5–15MB，这里取区间下界 5MB 作为保守值，
+// 给协调节点的其它内存占用留出余量。
+const bulkBatchMaxBytes = 5 << 20
+
+// bulkBatchMaxDocs 是单个 bulk 请求的文档条数上限。
+//
+// 引入动机：字节上限管不住"文档很小但条数极多"的情形（例如大量短 chunk），
+// 条数过多同样会撑大协调节点的请求解析与队列占用；与 bulkBatchMaxBytes 构成双限，
+// 每批必须同时满足两者。
+const bulkBatchMaxDocs = 1000
 
 // bulkRetryMaxAttempts 是 bulk 写入遇到可重试状态码时的最大尝试次数（含首次尝试）。
 // 引入动机：ES 的 429（too_many_requests，写入限流/队列拒绝）与 503（分片或节点暂时不可用）
@@ -621,38 +756,153 @@ func (c *HTTPClient) doBulkAttempt(ctx context.Context, requestURL string, paylo
 //
 // 引入动机：rebuild 和 index_document job 需要高效批量写入，同时必须能定位 ES 的具体拒绝原因。
 //
+// 分批语义（线上事故修复）：原实现把全部 docs 拼成一个请求，线上出现过一个文档的全部 chunk
+// （每条带 4096 维 embedding，JSON 中约 45KB）组成 54MB 的单请求，被 ES 协调节点的
+// max_coordinating_bytes 确定性拒绝，重试同一份载荷永远不可能成功。
+// 因此这里先用 planBulkBatches 按"字节数 + 条数"双限拆批，再逐批发送。
+//
 // 重试语义：ES 返回 429（写入限流）或 503（分片/节点暂时不可用）属于瞬时过载，
 // 原实现直接失败会让 job 无谓失败甚至进入 dead。这里对这两种状态码做指数退避 + 抖动重试，
 // 最多 bulkRetryMaxAttempts 次尝试；ctx 取消或超时立即中止并把 ctx 错误原样返回；
 // 其余非 200（400 维度/mapping 错误、404 索引不存在等）仍保持立即失败，不做重试。
+// 重试按批独立进行，任一批失败立即返回带批次定位信息的错误，全部成功才返回 nil。
 func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []IndexDoc) error {
 	if len(docs) == 0 {
 		return nil
 	}
 
-	var buf bytes.Buffer
-	for _, doc := range docs {
-		action := map[string]interface{}{
-			"index": map[string]interface{}{"_index": indexName, "_id": doc.ID},
-		}
-		actionLine, err := json.Marshal(action)
-		if err != nil {
-			return fmt.Errorf("序列化 bulk action (index=%s, doc_id=%s): %w", indexName, doc.ID, err)
-		}
-		buf.Write(actionLine)
-		buf.WriteByte('\n')
-
-		sourceLine, err := json.Marshal(doc.Body)
-		if err != nil {
-			return fmt.Errorf("序列化 bulk source (index=%s, doc_id=%s): %w", indexName, doc.ID, err)
-		}
-		buf.Write(sourceLine)
-		buf.WriteByte('\n')
+	batches, err := planBulkBatches(indexName, docs)
+	if err != nil {
+		return err
 	}
 
 	requestURL := c.baseURL + "/_bulk"
-	requestBytes := buf.Len()
-	payload := buf.Bytes()
+	for i, batch := range batches {
+		if batch.OversizedID != "" {
+			// 单条文档自身就超过推荐 bulk 大小：既不能与其它文档混合（会连带撑爆整个请求），
+			// 也不能静默丢弃，因此单独成批并留下可观测的告警。
+			slog.Warn("ES bulk 单条文档超过推荐请求体大小，单独成批发送",
+				"index", indexName,
+				"doc_id", batch.OversizedID,
+				"doc_bytes", len(batch.Payload),
+				"max_batch_bytes", bulkBatchMaxBytes,
+				"batch", i+1,
+				"batch_count", len(batches),
+			)
+		}
+		if err := c.bulkIndexBatch(ctx, indexName, requestURL, batch, i+1, len(batches)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// bulkBatch 是 BulkIndex 拆分出的单个 bulk 请求批次。
+// 引入动机：ES 协调节点按 max_coordinating_bytes（默认堆的 10%）拒绝过大的 bulk 请求，
+// 必须把文档按字节数与条数上限切成多批；每批自带 Payload/DocCount，
+// 使每批的重试与失败诊断都能定位到具体批次。
+type bulkBatch struct {
+	// Payload 是该批的 ndjson 请求体（action 行与 source 行交替）。
+	Payload []byte
+	// DocCount 是该批包含的文档条数。
+	DocCount int
+	// OversizedID 非空表示这批只含一条自身就超过 bulkBatchMaxBytes 的文档，
+	// 值为该文档 ID；此时 Payload 就是该文档自身的 ndjson，len(Payload) 即该文档字节数。
+	OversizedID string
+}
+
+// planBulkBatches 把文档按 bulkBatchMaxBytes / bulkBatchMaxDocs 双限拆分成待发送的批次。
+//
+// 引入动机：线上重建索引时单个请求达 54MB，超过 ES max_coordinating_bytes 后被确定性拒绝，
+// 必须在客户端按大小分批，否则重试永远不可能成功。
+//
+// 语义：
+//   - 每批同时满足 累计字节数 ≤ bulkBatchMaxBytes 与 条数 ≤ bulkBatchMaxDocs；
+//   - 单条自身就超过 bulkBatchMaxBytes 的文档单独成批（不与别的文档混合、也不被静默丢弃），
+//     并在 OversizedID 中标记，由调用方记录告警日志；
+//   - 序列化失败原样返回（Fail Fast，不产出半截请求体）。
+func planBulkBatches(indexName string, docs []IndexDoc) ([]bulkBatch, error) {
+	batches := make([]bulkBatch, 0, (len(docs)+bulkBatchMaxDocs-1)/bulkBatchMaxDocs)
+
+	var (
+		buf      bytes.Buffer
+		docCount int
+	)
+	flush := func() {
+		if docCount == 0 {
+			return
+		}
+		// OversizedID 留空：只有下面单独成批的超限文档才会带上它。
+		batches = append(batches, bulkBatch{Payload: buf.Bytes(), DocCount: docCount})
+		// 换成全新缓冲区：上一批的 Payload 继续引用旧底层数组，不能被后续写入覆盖。
+		buf = bytes.Buffer{}
+		docCount = 0
+	}
+
+	for _, doc := range docs {
+		lines, err := marshalBulkDoc(indexName, doc)
+		if err != nil {
+			return nil, err
+		}
+		if len(lines) > bulkBatchMaxBytes {
+			flush()
+			batches = append(batches, bulkBatch{Payload: lines, DocCount: 1, OversizedID: doc.ID})
+			continue
+		}
+		if docCount > 0 && (buf.Len()+len(lines) > bulkBatchMaxBytes || docCount+1 > bulkBatchMaxDocs) {
+			flush()
+		}
+		buf.Write(lines)
+		docCount++
+	}
+	flush()
+
+	return batches, nil
+}
+
+// marshalBulkDoc 把单条文档序列化成 bulk 需要的两行 ndjson（action 行 + source 行）。
+// 引入动机：分批需要先知道每条文档自身的字节数，才能判断"加入当前批是否会超限"，
+// 因此把序列化从拼 payload 的循环中独立出来；序列化失败立即返回，不产生半截请求体。
+func marshalBulkDoc(indexName string, doc IndexDoc) ([]byte, error) {
+	action := map[string]interface{}{
+		"index": map[string]interface{}{"_index": indexName, "_id": doc.ID},
+	}
+	actionLine, err := json.Marshal(action)
+	if err != nil {
+		return nil, fmt.Errorf("序列化 bulk action (index=%s, doc_id=%s): %w", indexName, doc.ID, err)
+	}
+	sourceLine, err := json.Marshal(doc.Body)
+	if err != nil {
+		return nil, fmt.Errorf("序列化 bulk source (index=%s, doc_id=%s): %w", indexName, doc.ID, err)
+	}
+
+	lines := make([]byte, 0, len(actionLine)+len(sourceLine)+2)
+	lines = append(lines, actionLine...)
+	lines = append(lines, '\n')
+	lines = append(lines, sourceLine...)
+	lines = append(lines, '\n')
+	return lines, nil
+}
+
+// bulkBatchAttrs 返回日志用的批次定位属性（批次序号/总批数）。
+// 引入动机：拆成多批后，失败诊断必须能指明"是哪一批"；文档数与字节数已由
+// diagnosticContext 提供，这里不重复输出同名 key。
+func bulkBatchAttrs(batchIndex, batchCount int) []any {
+	return []any{"batch", batchIndex, "batch_count", batchCount}
+}
+
+// bulkIndexBatch 发送单批 bulk 请求，逐批复用既有的 429/503 退避重试与失败诊断。
+//
+// 引入动机：BulkIndex 拆多批后，每批都要独立重试、独立诊断，因此把"发一批并处理响应"
+// 抽成本方法；batchIndex/batchCount 让返回的错误能定位到具体批次。
+//
+// 重试语义与拆分前完全一致：仅对 429/503 做指数退避 + 抖动重试（最多 bulkRetryMaxAttempts
+// 次尝试）；ctx 取消或超时立即返回并原样带回 ctx 错误；其他非 200 立即失败。
+func (c *HTTPClient) bulkIndexBatch(ctx context.Context, indexName, requestURL string, batch bulkBatch, batchIndex, batchCount int) error {
+	docCount := batch.DocCount
+	requestBytes := len(batch.Payload)
+	// batchCtx 同时进入 slog 属性与返回的错误，保证多批场景下能定位失败批次。
+	batchCtx := fmt.Sprintf("batch=%d/%d, documents=%d, request_bytes=%d", batchIndex, batchCount, docCount, requestBytes)
 	started := time.Now()
 
 	var (
@@ -662,20 +912,20 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 	for i := 1; i <= bulkRetryMaxAttempts; i++ {
 		attempts = i
 
-		result, err := c.doBulkAttempt(ctx, requestURL, payload)
+		result, err := c.doBulkAttempt(ctx, requestURL, batch.Payload)
 		if err != nil {
-			attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+			attrs := append(c.diagnosticContext(ctx, requestURL, docCount, requestBytes, started), bulkBatchAttrs(batchIndex, batchCount)...)
 			slog.Error("执行 ES bulk 请求失败", append(attrs, "attempt", i, "error", err)...)
-			return fmt.Errorf("执行 bulk index (url=%s, documents=%d, request_bytes=%d, attempt=%d, client_timeout=%s): %w", diagnosticURL(requestURL), len(docs), requestBytes, i, c.httpClient.Timeout, err)
+			return fmt.Errorf("执行 bulk index (%s, url=%s, attempt=%d, client_timeout=%s): %w", batchCtx, diagnosticURL(requestURL), i, c.httpClient.Timeout, err)
 		}
 		attempt = result
 
 		if attempt.ReadErr != nil {
 			// 读取响应体失败属于传输层问题（也可能是 ctx 已结束），重试同一请求没有意义。
-			attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+			attrs := append(c.diagnosticContext(ctx, requestURL, docCount, requestBytes, started), bulkBatchAttrs(batchIndex, batchCount)...)
 			attrs = append(attrs, "attempt", i, "status", attempt.Status, "content_type", attempt.ContentType, "body_summary", diagnosticBodySummary(attempt.Body))
 			slog.Error("读取 ES bulk 响应失败", append(attrs, "error", attempt.ReadErr)...)
-			return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d, attempt=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), attempt.Status, i, attempt.ContentType, diagnosticBodySummary(attempt.Body), attempt.ReadErr)
+			return fmt.Errorf("读取 bulk 响应 (%s, url=%s, status=%d, attempt=%d, content_type=%q, body=%q): %w", batchCtx, diagnosticURL(requestURL), attempt.Status, i, attempt.ContentType, diagnosticBodySummary(attempt.Body), attempt.ReadErr)
 		}
 
 		if !isRetryableBulkStatus(attempt.Status) || i == bulkRetryMaxAttempts {
@@ -684,7 +934,7 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 		}
 
 		delay := bulkRetryDelay(i)
-		attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+		attrs := append(c.diagnosticContext(ctx, requestURL, docCount, requestBytes, started), bulkBatchAttrs(batchIndex, batchCount)...)
 		attrs = append(attrs, "attempt", i, "max_attempts", bulkRetryMaxAttempts, "status", attempt.Status, "retry_delay", delay, "body_summary", diagnosticBodySummary(attempt.Body))
 		slog.Warn("ES bulk 写入遇到可重试状态，退避后重试", attrs...)
 
@@ -693,12 +943,14 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 			// ctx 取消或超时必须立即返回，并把 ctx 的错误原样带给调用方，
 			// 不能伪装成"重试耗尽"，也不能继续等待退避。
 			slog.Error("ES bulk 重试等待被取消", append(attrs, "error", ctx.Err())...)
-			return fmt.Errorf("bulk index 重试等待被取消 (url=%s, status=%d, attempt=%d, retry_delay=%s): %w", diagnosticURL(requestURL), attempt.Status, i, delay, ctx.Err())
+			return fmt.Errorf("bulk index 重试等待被取消 (%s, url=%s, status=%d, attempt=%d, retry_delay=%s): %w", batchCtx, diagnosticURL(requestURL), attempt.Status, i, delay, ctx.Err())
 		case <-time.After(delay):
 		}
 		// 退避结束后的第二次日志：确认重试确实按预期节奏发起，便于观测线上行为。
 		slog.Info("ES bulk 开始重试",
 			"url", diagnosticURL(requestURL),
+			"batch", batchIndex,
+			"batch_count", batchCount,
 			"attempt", i+1,
 			"max_attempts", bulkRetryMaxAttempts,
 			"previous_status", attempt.Status,
@@ -707,12 +959,12 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 	}
 
 	responseBody := attempt.Body
-	attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+	attrs := append(c.diagnosticContext(ctx, requestURL, docCount, requestBytes, started), bulkBatchAttrs(batchIndex, batchCount)...)
 	attrs = append(attrs, "attempts", attempts, "status", attempt.Status, "content_type", attempt.ContentType, "body_summary", diagnosticBodySummary(responseBody))
 	if len(responseBody) > bulkResponseLimit {
 		err := fmt.Errorf("响应超过 %d 字节限制", bulkResponseLimit)
 		slog.Error("ES bulk 响应过大", append(attrs, "error", err)...)
-		return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d, attempts=%d): %w", diagnosticURL(requestURL), attempt.Status, attempts, err)
+		return fmt.Errorf("读取 bulk 响应 (%s, url=%s, status=%d, attempts=%d): %w", batchCtx, diagnosticURL(requestURL), attempt.Status, attempts, err)
 	}
 	if attempt.Status != http.StatusOK {
 		err := fmt.Errorf("bulk index 返回状态码 %d", attempt.Status)
@@ -722,7 +974,7 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 			attrs = append(attrs, "retry_exhausted", true)
 		}
 		slog.Error("ES bulk 请求返回错误状态", append(attrs, "error", err)...)
-		return fmt.Errorf("%w (url=%s, attempts=%d, content_type=%q, body=%q)", err, diagnosticURL(requestURL), attempts, attempt.ContentType, diagnosticBodySummary(responseBody))
+		return fmt.Errorf("%w (%s, url=%s, attempts=%d, content_type=%q, body=%q)", err, batchCtx, diagnosticURL(requestURL), attempts, attempt.ContentType, diagnosticBodySummary(responseBody))
 	}
 
 	var bulkResp struct {
@@ -731,7 +983,7 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 	}
 	if err := json.Unmarshal(responseBody, &bulkResp); err != nil {
 		slog.Error("解析 ES bulk 响应失败", append(attrs, "error", err)...)
-		return fmt.Errorf("解析 bulk 响应 (url=%s, status=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), attempt.Status, attempt.ContentType, diagnosticBodySummary(responseBody), err)
+		return fmt.Errorf("解析 bulk 响应 (%s, url=%s, status=%d, content_type=%q, body=%q): %w", batchCtx, diagnosticURL(requestURL), attempt.Status, attempt.ContentType, diagnosticBodySummary(responseBody), err)
 	}
 
 	if bulkResp.Errors {
@@ -759,9 +1011,9 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 		}
 		slog.Error("ES bulk index 部分失败", append(attrs, "index", indexName, "errors", failed, "item_errors", details)...)
 		if len(details) == 0 {
-			return fmt.Errorf("bulk index 报告 errors=true，但未找到 item 错误详情 (index=%s, documents=%d)", indexName, len(docs))
+			return fmt.Errorf("bulk index 报告 errors=true，但未找到 item 错误详情 (index=%s, %s)", indexName, batchCtx)
 		}
-		return fmt.Errorf("bulk index 有 %d 个文档索引失败: %s", failed, strings.Join(details, "; "))
+		return fmt.Errorf("bulk index 有 %d 个文档索引失败: %s (%s)", failed, strings.Join(details, "; "), batchCtx)
 	}
 
 	slog.Info("ES bulk index 成功", append(attrs, "index", indexName, "attempts", attempts)...)
@@ -871,12 +1123,16 @@ func (c *HTTPClient) Search(ctx context.Context, indexName string, query map[str
 			return nil, fmt.Errorf("search 返回状态码 %d（读取错误响应体失败: %v）", resp.StatusCode, readErr)
 		}
 
-		errorType, reason, ok := parseESErrorBody(errBody)
+		info, ok := parseESErrorBody(errBody)
 		logAttrs := []any{
 			"index", indexName,
 			"status", resp.StatusCode,
-			"error_type", errorType,
-			"error_reason", reason,
+			"error_type", info.Type,
+			"error_reason", info.Reason,
+			// root_cause / caused_by 是 ES 层次化错误的真正原因（外层常只有 all shards failed），
+			// 不记录它们会让日志无法定位线上问题。
+			"root_cause", info.rootCauseSummaries(),
+			"caused_by", esErrorCauseSummary(info.CausedBy),
 		}
 		if !ok {
 			// 非 ES 标准错误体（如网关 HTML 错误页、error 为字符串）：退化为截断摘要。
@@ -887,7 +1143,8 @@ func (c *HTTPClient) Search(ctx context.Context, indexName string, query map[str
 		if !ok {
 			return nil, fmt.Errorf("search 返回状态码 %d: %s", resp.StatusCode, diagnosticBodySummary(errBody))
 		}
-		return nil, fmt.Errorf("search 返回状态码 %d: %s", resp.StatusCode, esErrorDetail(errorType, reason))
+		// 在既有的 "type: reason" 之后追加层次化原因，保持原有前缀连续、顺序不变（向后兼容）。
+		return nil, fmt.Errorf("search 返回状态码 %d: %s%s", resp.StatusCode, esErrorDetail(info.Type, info.Reason), esErrorCauseSuffix(info))
 	}
 
 	var result SearchResponse

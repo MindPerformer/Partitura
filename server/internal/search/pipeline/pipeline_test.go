@@ -23,9 +23,14 @@ type fakeESClient struct {
 	docs       map[string]map[string]map[string]interface{}
 	pingOK     bool
 	// indexDims 记录各索引的 embedding 维度，供 GetIndexDimensions 返回。
-	// 引入动机：搜索管线本身不消费维度信息，但 es.Client 接口要求实现该方法；
-	// 保留可配置的维度表使 fake 与真实 ES 语义一致（未配置 → 0 表示"无已知维度"）。
+	// 引入动机：vector 检索失败需要结合索引真实维度细分降级原因
+	// （维度不一致 / 无 embedding 字段 / 原因不明），fake 必须能表达这三种情形。
+	// 未配置 → 0，表示"无已知维度"（索引不存在或没有 embedding 字段）。
 	indexDims map[string]int
+	// indexDimsErr 非 nil 时 GetIndexDimensions 直接返回该错误。
+	// 引入动机：需要验证"维度读取自身失败"时管线仍保持 vector_search_failed，
+	// 且该错误不会被静默忽略。
+	indexDimsErr error
 	// searchedIndices 按调用顺序记录 Search 收到的目标索引名。
 	// 引入动机：design/01-SEARCH.md §Index Version 要求普通搜索打 alias
 	// knowledge_current；需要真实观察管线下发给 ES 的索引名来锁定该行为。
@@ -73,10 +78,14 @@ func (c *fakeESClient) IndexExists(ctx context.Context, indexName string) (bool,
 }
 
 // GetIndexDimensions 返回 fake 中为指定索引配置的 embedding 维度。
-// 引入动机：es.Client 接口新增该方法以支持 job 包的维度自愈；
-// 搜索管线不涉及维度判断，未配置维度的索引返回 (0, nil)，与真实客户端的
+// 引入动机：es.Client 接口要求实现该方法；搜索管线的 vector 失败分类需要依据
+// 索引真实维度，因此 fake 必须能表达"某索引 dims=N"与"无已知维度"两种状态。
+// 未配置维度的索引返回 (0, nil)，与真实客户端的
 // "索引不存在或没有 embedding 字段 → 无已知维度"语义一致。
 func (c *fakeESClient) GetIndexDimensions(ctx context.Context, indexName string) (int, error) {
+	if c.indexDimsErr != nil {
+		return 0, c.indexDimsErr
+	}
 	return c.indexDims[indexName], nil
 }
 
@@ -606,12 +615,198 @@ func TestSearch_SemanticVectorSearchError_Degraded(t *testing.T) {
 	if !output.Degraded {
 		t.Fatal("vector 检索失败时 semantic 应 degraded=true")
 	}
-	if output.DegradationReason != "vector_search_failed" {
-		t.Errorf("降级原因应为 vector_search_failed，得到 %s", output.DegradationReason)
+	// 细分降级原因后：本用例的 fake 未为 knowledge_v1 登记 embedding 维度，
+	// 对应真实客户端"索引不存在或没有 embedding 字段 → (0, nil)"的语义，
+	// 因此降级原因应为 vector_field_missing，而不是笼统的 vector_search_failed。
+	if output.DegradationReason != "vector_field_missing" {
+		t.Errorf("降级原因应为 vector_field_missing，得到 %s", output.DegradationReason)
 	}
 	if len(output.Results) != 0 {
 		t.Error("semantic 模式 vector 检索失败不应返回结果")
 	}
+}
+
+// newVectorFailureFixture 构造"vector 检索必然失败、lexical 检索仍可命中"的测试装置。
+//
+// 引入动机：细分降级原因需要真实驱动 Pipeline.Search 的 vector 失败分支，
+// 并可控地表达索引维度（indexDims）与维度读取失败（dimsErr）两种输入状态。
+// knnErr 只作用于携带 knn 子句的查询，因此 BM25 查询正常放行，
+// 可以同时验证 hybrid 模式失败后继续 lexical-only 融合的行为。
+func newVectorFailureFixture(t *testing.T, ctx context.Context, indexDims int, dimsErr error) *capturingESClient {
+	t.Helper()
+	base := newFakeESClient()
+	_ = base.CreateIndex(ctx, "knowledge_v1", nil)
+	_ = base.BulkIndex(ctx, "knowledge_v1", []es.IndexDoc{
+		{ID: "doc1_0", Body: map[string]interface{}{
+			"document_id":  "doc1",
+			"workspace_id": "ws-1",
+			"path":         "test.md",
+			"title":        "Test",
+			"content":      "test content",
+			"status":       "active",
+			"is_special":   false,
+		}},
+	})
+	if indexDims > 0 {
+		base.indexDims["knowledge_v1"] = indexDims
+	}
+	base.indexDimsErr = dimsErr
+	return &capturingESClient{fakeESClient: base, knnErr: errFakeUnavailable}
+}
+
+// TestSearch_VectorDimensionMismatch_ClassifiedAsMismatch 覆盖线上事故的真实成因分类：
+// 查询向量维度（4096）与索引 embedding 维度（1024）不一致，ES knn 请求返回 400。
+//
+// 引入动机：该情形此前的降级原因是笼统的 vector_search_failed，与"ES 抖动"无法区分，
+// 排查时看不出根因。本测试分别驱动 semantic 与 hybrid 两条路径，锁定：
+//   - 降级原因细分为 vector_dimension_mismatch；
+//   - semantic 模式仍然直接返回（不继续走 RRF），无结果；
+//   - hybrid 模式仍然丢弃 vectorResults 并继续 lexical-only 融合，返回 BM25 结果。
+func TestSearch_VectorDimensionMismatch_ClassifiedAsMismatch(t *testing.T) {
+	const (
+		indexDims = 1024
+		queryDims = 4096
+	)
+
+	t.Run("semantic 直接降级返回", func(t *testing.T) {
+		ctx := context.Background()
+		client := newVectorFailureFixture(t, ctx, indexDims, nil)
+		pipe := NewPipeline(client, &fakeEmbeddingProvider{available: true, dims: queryDims}, nil)
+
+		output, err := pipe.Search(ctx, SearchInput{
+			WorkspaceID: "ws-1",
+			Query:       "test",
+			Profile:     testProfile(),
+			Limit:       10,
+			Mode:        "semantic",
+		})
+		if err != nil {
+			t.Fatalf("vector 检索失败不应返回错误，应降级: %v", err)
+		}
+		if !output.Degraded {
+			t.Fatal("维度不一致时 semantic 应 degraded=true")
+		}
+		if output.DegradationReason != "vector_dimension_mismatch" {
+			t.Errorf("降级原因应为 vector_dimension_mismatch，得到 %s", output.DegradationReason)
+		}
+		if len(output.Results) != 0 {
+			t.Errorf("semantic 模式维度不一致不应返回结果，实际 %d 条", len(output.Results))
+		}
+	})
+
+	t.Run("hybrid 继续 lexical-only 融合", func(t *testing.T) {
+		ctx := context.Background()
+		client := newVectorFailureFixture(t, ctx, indexDims, nil)
+		pipe := NewPipeline(client, &fakeEmbeddingProvider{available: true, dims: queryDims}, nil)
+
+		output, err := pipe.Search(ctx, SearchInput{
+			WorkspaceID: "ws-1",
+			Query:       "test",
+			Profile:     testProfile(),
+			Limit:       10,
+			Mode:        "hybrid",
+		})
+		if err != nil {
+			t.Fatalf("Search 失败: %v", err)
+		}
+		if !output.Degraded {
+			t.Fatal("维度不一致时 hybrid 应 degraded=true")
+		}
+		if output.DegradationReason != "vector_dimension_mismatch" {
+			t.Errorf("降级原因应为 vector_dimension_mismatch，得到 %s", output.DegradationReason)
+		}
+		if len(output.Results) == 0 {
+			t.Fatal("hybrid 模式维度不一致时应继续返回 lexical BM25 结果")
+		}
+		if output.Results[0].DocumentID != "doc1" {
+			t.Errorf("hybrid 回退结果应来自 BM25 命中的 doc1，实际 %s", output.Results[0].DocumentID)
+		}
+	})
+}
+
+// TestSearch_VectorFieldMissing_ClassifiedAsFieldMissing 覆盖"索引没有 dense_vector 的
+// embedding 字段"这一分类：GetIndexDimensions 返回 (0, nil)。
+//
+// 引入动机：该情形与"索引维度不一致"的修复动作完全不同（前者需要重建 mapping/索引，
+// 后者需要检查 embedding provider 维度配置），必须能与 vector_dimension_mismatch 区分。
+func TestSearch_VectorFieldMissing_ClassifiedAsFieldMissing(t *testing.T) {
+	ctx := context.Background()
+	// indexDims=0：与真实客户端"索引不存在或没有 embedding 字段"语义一致
+	client := newVectorFailureFixture(t, ctx, 0, nil)
+	pipe := NewPipeline(client, &fakeEmbeddingProvider{available: true, dims: 4}, nil)
+
+	output, err := pipe.Search(ctx, SearchInput{
+		WorkspaceID: "ws-1",
+		Query:       "test",
+		Profile:     testProfile(),
+		Limit:       10,
+		Mode:        "hybrid",
+	})
+	if err != nil {
+		t.Fatalf("Search 失败: %v", err)
+	}
+	if !output.Degraded {
+		t.Fatal("embedding 字段缺失时 hybrid 应 degraded=true")
+	}
+	if output.DegradationReason != "vector_field_missing" {
+		t.Errorf("降级原因应为 vector_field_missing，得到 %s", output.DegradationReason)
+	}
+	if len(output.Results) == 0 {
+		t.Fatal("hybrid 模式 embedding 字段缺失时应继续返回 lexical BM25 结果")
+	}
+}
+
+// TestSearch_VectorSearchFailed_GenericReasonKept 覆盖保持笼统归因的两条分支：
+// 维度一致但检索仍失败（原因不明），以及维度读取自身报错。
+//
+// 引入动机：细分不能把"原因不明"误判成具体故障，否则会误导排查方向；
+// 同时维度读取失败不能静默忽略，必须回落到 vector_search_failed。
+func TestSearch_VectorSearchFailed_GenericReasonKept(t *testing.T) {
+	t.Run("维度一致但检索失败", func(t *testing.T) {
+		ctx := context.Background()
+		client := newVectorFailureFixture(t, ctx, 4, nil) // 索引维度 == 查询向量维度 4
+		pipe := NewPipeline(client, &fakeEmbeddingProvider{available: true, dims: 4}, nil)
+
+		output, err := pipe.Search(ctx, SearchInput{
+			WorkspaceID: "ws-1",
+			Query:       "test",
+			Profile:     testProfile(),
+			Limit:       10,
+			Mode:        "semantic",
+		})
+		if err != nil {
+			t.Fatalf("Search 失败: %v", err)
+		}
+		if output.DegradationReason != "vector_search_failed" {
+			t.Errorf("维度一致但检索失败时应保持 vector_search_failed，得到 %s", output.DegradationReason)
+		}
+	})
+
+	t.Run("维度读取失败", func(t *testing.T) {
+		ctx := context.Background()
+		client := newVectorFailureFixture(t, ctx, 0, errFakeUnavailable)
+		pipe := NewPipeline(client, &fakeEmbeddingProvider{available: true, dims: 4}, nil)
+
+		output, err := pipe.Search(ctx, SearchInput{
+			WorkspaceID: "ws-1",
+			Query:       "test",
+			Profile:     testProfile(),
+			Limit:       10,
+			Mode:        "hybrid",
+		})
+		if err != nil {
+			t.Fatalf("Search 失败: %v", err)
+		}
+		if !output.Degraded {
+			t.Fatal("维度读取失败时 hybrid 应 degraded=true")
+		}
+		if output.DegradationReason != "vector_search_failed" {
+			t.Errorf("维度读取失败时应保持 vector_search_failed，得到 %s", output.DegradationReason)
+		}
+		if len(output.Results) == 0 {
+			t.Fatal("维度读取失败时 hybrid 仍应返回 lexical BM25 结果")
+		}
+	})
 }
 
 func TestSearch_HybridVectorSearchError_LexicalFallback(t *testing.T) {

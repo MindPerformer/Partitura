@@ -17,7 +17,7 @@ describe('Markdown Safe Rendering — XSS Prevention', () => {
   describe('基本 Markdown 渲染', () => {
     it('渲染标题和格式化文本', () => {
       const html = renderMarkdown('# Hello\n\nThis is **bold** and *italic*.')
-      expect(html).toContain('<h1>Hello</h1>')
+      expect(html).toContain('<h1 id="heading-hello">Hello</h1>')
       expect(html).toContain('<strong>bold</strong>')
       expect(html).toContain('<em>italic</em>')
     })

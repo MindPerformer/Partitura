@@ -266,24 +266,28 @@ async function testReranker() {
                 v-if="embeddingStatus?.configured"
                 color="success"
                 variant="soft"
+                size="sm"
                 :label="t('admin.providerConfigured')"
               />
               <UBadge
                 v-else
                 color="neutral"
                 variant="soft"
+                size="sm"
                 :label="t('admin.providerNotConfigured')"
               />
               <UBadge
                 v-if="embeddingStatus?.api_key_set"
                 color="success"
                 variant="soft"
+                size="sm"
                 :label="t('admin.apiKeySet')"
               />
               <UBadge
                 v-else
                 color="warning"
                 variant="soft"
+                size="sm"
                 :label="t('admin.apiKeyNotSet')"
               />
             </div>
@@ -430,24 +434,28 @@ async function testReranker() {
                 v-if="rerankerStatus?.configured"
                 color="success"
                 variant="soft"
+                size="sm"
                 :label="t('admin.providerConfigured')"
               />
               <UBadge
                 v-else
                 color="neutral"
                 variant="soft"
+                size="sm"
                 :label="t('admin.providerNotConfigured')"
               />
               <UBadge
                 v-if="rerankerStatus?.api_key_set"
                 color="success"
                 variant="soft"
+                size="sm"
                 :label="t('admin.apiKeySet')"
               />
               <UBadge
                 v-else
                 color="warning"
                 variant="soft"
+                size="sm"
                 :label="t('admin.apiKeyNotSet')"
               />
             </div>

@@ -153,7 +153,7 @@ useHead({ title: () => t('search.title') + ' · ' + t('common.appName') })
               v-for="section in result.section_path"
               :key="section"
               variant="subtle"
-              size="xs"
+              size="sm"
             >{{ section }}</UBadge>
           </div>
         </div>
