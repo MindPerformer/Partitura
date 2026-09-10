@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -491,8 +492,139 @@ func diagnosticBodySummary(body []byte) string {
 	return text
 }
 
+// esErrorBody 是 ES 标准错误响应体的结构。
+// 引入动机：ES 在 4xx/5xx 时返回 {"error":{"type":"...","reason":"..."},"status":400}，
+// 只有解析出 type/reason 才能在不把整个响应体写进日志的前提下定位真实失败原因
+// （例如 dense_vector 维度不匹配、index_not_found_exception）。
+type esErrorBody struct {
+	Error struct {
+		Type   string `json:"type"`
+		Reason string `json:"reason"`
+	} `json:"error"`
+}
+
+// parseESErrorBody 解析 ES 标准错误响应体，返回 (error.type, error.reason)。
+//
+// 引入动机：Search 等操作需要把 ES 的真实失败原因带进返回的 error 与 slog 日志，
+// 只报告 HTTP 状态码无法诊断线上问题（如 400 的维度不匹配）。
+//
+// 语义：ok=false 表示响应体不是 ES 标准错误结构（非 JSON，或 type/reason 均为空），
+// 调用方应退化为 diagnosticBodySummary 的截断摘要，保证错误信息在任何情况下都可定位。
+func parseESErrorBody(body []byte) (errorType, reason string, ok bool) {
+	var parsed esErrorBody
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		return "", "", false
+	}
+	errorType = strings.TrimSpace(parsed.Error.Type)
+	reason = strings.TrimSpace(parsed.Error.Reason)
+	if errorType == "" && reason == "" {
+		return "", "", false
+	}
+	return errorType, reason, true
+}
+
+// esErrorDetail 把 ES 错误类型与原因拼成 "type: reason" 形式的单行摘要。
+// 引入动机：type 与 reason 可能只存在其中一个（ES 部分错误只给 reason），
+// 该函数保证不会拼出 "': '" 这类空字段结果，便于错误信息被稳定识别。
+func esErrorDetail(errorType, reason string) string {
+	switch {
+	case errorType != "" && reason != "":
+		return errorType + ": " + reason
+	case errorType != "":
+		return errorType
+	default:
+		return reason
+	}
+}
+
+// bulkRetryMaxAttempts 是 bulk 写入遇到可重试状态码时的最大尝试次数（含首次尝试）。
+// 引入动机：ES 的 429（too_many_requests，写入限流/队列拒绝）与 503（分片或节点暂时不可用）
+// 属于瞬时过载，退避重试几次通常即可恢复；设上限是为了不把 job 无限拖住，
+// 也避免重试流量把已经过载的 ES 压得更狠。
+const bulkRetryMaxAttempts = 5
+
+// bulkRetryBaseDelay 是首次重试前的退避时长，之后每次翻倍。
+// 引入动机：给过载的 ES 留出回收写入队列的时间；200ms 足够短，不会明显拖慢正常写入。
+const bulkRetryBaseDelay = 200 * time.Millisecond
+
+// bulkRetryMaxDelay 是单次退避时长的上限。
+// 引入动机：避免指数增长让 job 长时间无进展且难以观测；5s 与 ES 限流恢复的量级相当。
+const bulkRetryMaxDelay = 5 * time.Second
+
+// bulkRetryJitterRatio 是退避的随机抖动比例，实际等待落在 [d*(1-r), d*(1+r)] 区间。
+// 引入动机：多个写入方对同一个过载 ES 同步重试会形成尖峰并再次触发限流，
+// 抖动把重试时刻打散，提高重试的整体成功率。
+const bulkRetryJitterRatio = 0.2
+
+// isRetryableBulkStatus 判断 bulk 写入的 HTTP 状态码是否属于可重试的瞬时过载。
+// 引入动机：只对 429/503 重试；其他非 200（如 400 mapping/维度错误、404 索引不存在）
+// 是确定性失败，重试只会浪费 job 配额并掩盖真实原因。
+func isRetryableBulkStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status == http.StatusServiceUnavailable
+}
+
+// bulkRetryDelay 返回第 attempt 次尝试失败后到下一次尝试前的退避时长。
+// 引入动机：把"指数退避 + 抖动 + 上限"集中成一个可单测的纯函数，便于调参与验证边界。
+// attempt 从 1 开始计数（1 表示首次尝试刚刚失败），基础时长为 base * 2^(attempt-1)，封顶 maxDelay。
+func bulkRetryDelay(attempt int) time.Duration {
+	delay := bulkRetryBaseDelay
+	for i := 1; i < attempt && delay < bulkRetryMaxDelay; i++ {
+		delay *= 2
+	}
+	if delay > bulkRetryMaxDelay {
+		delay = bulkRetryMaxDelay
+	}
+	// 抖动：在 [1-ratio, 1+ratio] 区间随机缩放，避免多方重试同步触发限流。
+	return time.Duration(float64(delay) * (1 + bulkRetryJitterRatio*(2*rand.Float64()-1)))
+}
+
+// bulkAttempt 是一次 bulk HTTP 尝试的响应结果。
+// 引入动机：重试需要把"发出一次请求并读完响应体"独立成一步，由调用方根据状态码决定
+// 重试还是继续处理；同时在同一个地方关闭响应体，避免重试路径遗漏关闭或重复读取已消费的 body。
+type bulkAttempt struct {
+	Status      int    // HTTP 状态码
+	ContentType string // 响应 Content-Type，用于失败诊断
+	Body        []byte // 已读取的响应体（最多 bulkResponseLimit+1 字节，超出即视为响应过大）
+	ReadErr     error  // 读取响应体失败的原因；非 nil 时 Body 只含已读到的部分
+}
+
+// doBulkAttempt 发起一次 bulk 请求并读取响应体。
+//
+// 引入动机：BulkIndex 需要对 429/503 重试，而 http.Request 及其 body reader 都不可复用，
+// 每次尝试都必须用 bytes.NewReader(payload) 重建请求。本方法统一保证以下两点：
+// 每次尝试都使用全新的请求与全新的 body reader，且 resp.Body 在返回前一定被关闭。
+//
+// 只返回传输层错误（构造请求、发送请求失败）；HTTP 状态码与响应体由 bulkAttempt 承载，
+// 是否重试由调用方决定。
+func (c *HTTPClient) doBulkAttempt(ctx context.Context, requestURL string, payload []byte) (bulkAttempt, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(payload))
+	if err != nil {
+		return bulkAttempt{}, fmt.Errorf("创建 bulk 请求: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/x-ndjson")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return bulkAttempt{}, fmt.Errorf("执行 bulk 请求: %w", err)
+	}
+	defer resp.Body.Close()
+
+	attempt := bulkAttempt{
+		Status:      resp.StatusCode,
+		ContentType: resp.Header.Get("Content-Type"),
+	}
+	attempt.Body, attempt.ReadErr = io.ReadAll(io.LimitReader(resp.Body, bulkResponseLimit+1))
+	return attempt, nil
+}
+
 // BulkIndex 批量索引文档，并在失败时记录足够的请求、响应和 item 级诊断信息。
+//
 // 引入动机：rebuild 和 index_document job 需要高效批量写入，同时必须能定位 ES 的具体拒绝原因。
+//
+// 重试语义：ES 返回 429（写入限流）或 503（分片/节点暂时不可用）属于瞬时过载，
+// 原实现直接失败会让 job 无谓失败甚至进入 dead。这里对这两种状态码做指数退避 + 抖动重试，
+// 最多 bulkRetryMaxAttempts 次尝试；ctx 取消或超时立即中止并把 ctx 错误原样返回；
+// 其余非 200（400 维度/mapping 错误、404 索引不存在等）仍保持立即失败，不做重试。
 func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []IndexDoc) error {
 	if len(docs) == 0 {
 		return nil
@@ -520,39 +652,77 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 
 	requestURL := c.baseURL + "/_bulk"
 	requestBytes := buf.Len()
+	payload := buf.Bytes()
 	started := time.Now()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, requestURL, bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
-		slog.Error("创建 ES bulk 请求失败", append(attrs, "error", err)...)
-		return fmt.Errorf("创建 bulk 请求 (url=%s, documents=%d, request_bytes=%d): %w", diagnosticURL(requestURL), len(docs), requestBytes, err)
-	}
-	req.Header.Set("Content-Type", "application/x-ndjson")
 
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
-		slog.Error("执行 ES bulk 请求失败", append(attrs, "error", err)...)
-		return fmt.Errorf("执行 bulk index (url=%s, documents=%d, request_bytes=%d, client_timeout=%s): %w", diagnosticURL(requestURL), len(docs), requestBytes, c.httpClient.Timeout, err)
-	}
-	defer resp.Body.Close()
+	var (
+		attempt  bulkAttempt
+		attempts int
+	)
+	for i := 1; i <= bulkRetryMaxAttempts; i++ {
+		attempts = i
 
-	responseBody, readErr := io.ReadAll(io.LimitReader(resp.Body, bulkResponseLimit+1))
+		result, err := c.doBulkAttempt(ctx, requestURL, payload)
+		if err != nil {
+			attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+			slog.Error("执行 ES bulk 请求失败", append(attrs, "attempt", i, "error", err)...)
+			return fmt.Errorf("执行 bulk index (url=%s, documents=%d, request_bytes=%d, attempt=%d, client_timeout=%s): %w", diagnosticURL(requestURL), len(docs), requestBytes, i, c.httpClient.Timeout, err)
+		}
+		attempt = result
+
+		if attempt.ReadErr != nil {
+			// 读取响应体失败属于传输层问题（也可能是 ctx 已结束），重试同一请求没有意义。
+			attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+			attrs = append(attrs, "attempt", i, "status", attempt.Status, "content_type", attempt.ContentType, "body_summary", diagnosticBodySummary(attempt.Body))
+			slog.Error("读取 ES bulk 响应失败", append(attrs, "error", attempt.ReadErr)...)
+			return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d, attempt=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), attempt.Status, i, attempt.ContentType, diagnosticBodySummary(attempt.Body), attempt.ReadErr)
+		}
+
+		if !isRetryableBulkStatus(attempt.Status) || i == bulkRetryMaxAttempts {
+			// 不可重试的状态码，或可重试但尝试次数已用尽：交给下方统一的失败处理。
+			break
+		}
+
+		delay := bulkRetryDelay(i)
+		attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
+		attrs = append(attrs, "attempt", i, "max_attempts", bulkRetryMaxAttempts, "status", attempt.Status, "retry_delay", delay, "body_summary", diagnosticBodySummary(attempt.Body))
+		slog.Warn("ES bulk 写入遇到可重试状态，退避后重试", attrs...)
+
+		select {
+		case <-ctx.Done():
+			// ctx 取消或超时必须立即返回，并把 ctx 的错误原样带给调用方，
+			// 不能伪装成"重试耗尽"，也不能继续等待退避。
+			slog.Error("ES bulk 重试等待被取消", append(attrs, "error", ctx.Err())...)
+			return fmt.Errorf("bulk index 重试等待被取消 (url=%s, status=%d, attempt=%d, retry_delay=%s): %w", diagnosticURL(requestURL), attempt.Status, i, delay, ctx.Err())
+		case <-time.After(delay):
+		}
+		// 退避结束后的第二次日志：确认重试确实按预期节奏发起，便于观测线上行为。
+		slog.Info("ES bulk 开始重试",
+			"url", diagnosticURL(requestURL),
+			"attempt", i+1,
+			"max_attempts", bulkRetryMaxAttempts,
+			"previous_status", attempt.Status,
+			"retry_delay", delay,
+		)
+	}
+
+	responseBody := attempt.Body
 	attrs := c.diagnosticContext(ctx, requestURL, len(docs), requestBytes, started)
-	attrs = append(attrs, "status", resp.StatusCode, "content_type", resp.Header.Get("Content-Type"), "body_summary", diagnosticBodySummary(responseBody))
-	if readErr != nil {
-		slog.Error("读取 ES bulk 响应失败", append(attrs, "error", readErr)...)
-		return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), resp.StatusCode, resp.Header.Get("Content-Type"), diagnosticBodySummary(responseBody), readErr)
-	}
+	attrs = append(attrs, "attempts", attempts, "status", attempt.Status, "content_type", attempt.ContentType, "body_summary", diagnosticBodySummary(responseBody))
 	if len(responseBody) > bulkResponseLimit {
 		err := fmt.Errorf("响应超过 %d 字节限制", bulkResponseLimit)
 		slog.Error("ES bulk 响应过大", append(attrs, "error", err)...)
-		return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d): %w", diagnosticURL(requestURL), resp.StatusCode, err)
+		return fmt.Errorf("读取 bulk 响应 (url=%s, status=%d, attempts=%d): %w", diagnosticURL(requestURL), attempt.Status, attempts, err)
 	}
-	if resp.StatusCode != http.StatusOK {
-		err := fmt.Errorf("bulk index 返回状态码 %d", resp.StatusCode)
+	if attempt.Status != http.StatusOK {
+		err := fmt.Errorf("bulk index 返回状态码 %d", attempt.Status)
+		if isRetryableBulkStatus(attempt.Status) {
+			// 走到这里说明状态码可重试但尝试次数已用尽。
+			err = fmt.Errorf("bulk index 返回状态码 %d，重试 %d 次后仍失败", attempt.Status, attempts-1)
+			attrs = append(attrs, "retry_exhausted", true)
+		}
 		slog.Error("ES bulk 请求返回错误状态", append(attrs, "error", err)...)
-		return fmt.Errorf("%w (url=%s, content_type=%q, body=%q)", err, diagnosticURL(requestURL), resp.Header.Get("Content-Type"), diagnosticBodySummary(responseBody))
+		return fmt.Errorf("%w (url=%s, attempts=%d, content_type=%q, body=%q)", err, diagnosticURL(requestURL), attempts, attempt.ContentType, diagnosticBodySummary(responseBody))
 	}
 
 	var bulkResp struct {
@@ -561,7 +731,7 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 	}
 	if err := json.Unmarshal(responseBody, &bulkResp); err != nil {
 		slog.Error("解析 ES bulk 响应失败", append(attrs, "error", err)...)
-		return fmt.Errorf("解析 bulk 响应 (url=%s, status=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), resp.StatusCode, resp.Header.Get("Content-Type"), diagnosticBodySummary(responseBody), err)
+		return fmt.Errorf("解析 bulk 响应 (url=%s, status=%d, content_type=%q, body=%q): %w", diagnosticURL(requestURL), attempt.Status, attempt.ContentType, diagnosticBodySummary(responseBody), err)
 	}
 
 	if bulkResp.Errors {
@@ -594,7 +764,7 @@ func (c *HTTPClient) BulkIndex(ctx context.Context, indexName string, docs []Ind
 		return fmt.Errorf("bulk index 有 %d 个文档索引失败: %s", failed, strings.Join(details, "; "))
 	}
 
-	slog.Info("ES bulk index 成功", append(attrs, "index", indexName)...)
+	slog.Info("ES bulk index 成功", append(attrs, "index", indexName, "attempts", attempts)...)
 	return nil
 }
 
@@ -665,6 +835,10 @@ func (c *HTTPClient) DeleteByQuery(ctx context.Context, indexName string, query 
 }
 
 // Search 执行搜索查询。
+//
+// 失败诊断：ES 在非 200 时会在响应体给出 error.type/error.reason（例如 dense_vector
+// 维度不匹配返回 400 illegal_argument_exception）。只报告状态码无法定位线上问题，
+// 因此这里读取（有上限的）错误响应体，把 ES 的真实原因带进 error 与 slog 日志。
 func (c *HTTPClient) Search(ctx context.Context, indexName string, query map[string]interface{}) (*SearchResponse, error) {
 	body, err := json.Marshal(query)
 	if err != nil {
@@ -684,7 +858,36 @@ func (c *HTTPClient) Search(ctx context.Context, indexName string, query map[str
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("search 返回状态码 %d", resp.StatusCode)
+		// 有上限地读取错误体：ES 错误原因足以在 diagnosticBodyLimit 内表达，
+		// 避免异常巨大的响应体进入内存或日志。
+		errBody, readErr := io.ReadAll(io.LimitReader(resp.Body, diagnosticBodyLimit))
+		if readErr != nil {
+			slog.Error("ES search 返回错误状态且读取错误响应体失败",
+				"index", indexName,
+				"status", resp.StatusCode,
+				"error", readErr,
+				"body_summary", diagnosticBodySummary(errBody),
+			)
+			return nil, fmt.Errorf("search 返回状态码 %d（读取错误响应体失败: %v）", resp.StatusCode, readErr)
+		}
+
+		errorType, reason, ok := parseESErrorBody(errBody)
+		logAttrs := []any{
+			"index", indexName,
+			"status", resp.StatusCode,
+			"error_type", errorType,
+			"error_reason", reason,
+		}
+		if !ok {
+			// 非 ES 标准错误体（如网关 HTML 错误页、error 为字符串）：退化为截断摘要。
+			logAttrs = append(logAttrs, "body_summary", diagnosticBodySummary(errBody))
+		}
+		slog.Error("ES search 返回错误状态", logAttrs...)
+
+		if !ok {
+			return nil, fmt.Errorf("search 返回状态码 %d: %s", resp.StatusCode, diagnosticBodySummary(errBody))
+		}
+		return nil, fmt.Errorf("search 返回状态码 %d: %s", resp.StatusCode, esErrorDetail(errorType, reason))
 	}
 
 	var result SearchResponse

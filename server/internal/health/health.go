@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 
 	"partitura/server/internal/es"
@@ -113,8 +114,38 @@ type ActiveProfileInfo struct {
 	Name string `json:"name"`
 }
 
+// --- 健康检查超时策略 ---
+//
+// 引入动机：检查被分为两类，耗时特性完全不同，不能共用一个超时值。
+//
+//	1. 快检查（PG Ping / ES Ping / job 统计 / active profile）只是轻量查询或连通性探测，
+//	   5s 足够，且需要快速失败以免拖慢 /readyz 响应。
+//	2. Provider 检查（Embedding / Reranker）会发起真实推理请求：
+//	   EmbeddingChecker.Available 触发真实 embedding 调用，
+//	   RerankerChecker.Available 触发真实 rerank 推理（provider.go 内部调用 Rerank）。
+//	   推理在 provider 冷启动、模型加载或长文本场景下很容易超过 5s。
+//
+// 线上事故：两类检查曾共用写死的 5s，provider 只是"慢"就被判为
+// "context deadline exceeded"，日志持续输出
+// "reranker API 调用失败，将降级为 RRF 结果 ... context deadline exceeded"，
+// /readyz 长期把 Reranker 报成 degraded，加之 docker healthcheck 每 15s 打一次 /readyz 造成刷屏。
+// 因此 Provider 检查使用独立可配置的超时（默认 30s，由 HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS 配置）。
+//
+// 注意：该超时是健康检查自身的 context deadline，与 Web 管理界面配置的 provider timeout_seconds
+// 相互独立——两者同时存在时以更短者为准。
+const (
+	// defaultCheckTimeout 是快检查（PG/ES/job 统计/profile）的单次超时。
+	// 引入动机：这些检查只做连通性或单表查询，保持 5s 以便 /readyz 快速返回。
+	defaultCheckTimeout = 5 * time.Second
+
+	// DefaultProviderCheckTimeout 是 Provider 检查（embedding/reranker）的默认超时。
+	// 引入动机：这两个检查会发起真实推理请求，5s 会误报 degraded（见本节线上事故说明）。
+	// 生产可经 HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS 覆盖。
+	DefaultProviderCheckTimeout = 30 * time.Second
+)
+
 // SnapshotCollector 采集健康快照。
-// 引入动机：将各依赖检查器组合在一起，并行采集健康状态。
+// 引入动机：将各依赖检查器组合在一起，按依赖类型使用相应超时采集健康状态。
 // 不使用 XxxService/XxxManager 命名。
 type SnapshotCollector struct {
 	pg          PGChecker
@@ -123,113 +154,212 @@ type SnapshotCollector struct {
 	reranker    RerankerChecker
 	jobStats    JobStatsQuery
 	profileRepo ProfileQuery
-	// checkTimeout 是单次检查的超时时间。
+	// checkTimeout 是快检查（PG/ES/job 统计/profile）的超时时间。
 	// 引入动机：避免某个依赖检查阻塞整个 readyz 响应。
+	// 这些检查只做轻量查询，保持固定的 5s。
 	checkTimeout time.Duration
+	// providerCheckTimeout 是 Provider 检查（embedding/reranker）的超时时间。
+	// 引入动机：这两个检查会发起真实推理请求，必须与快检查解耦，
+	// 否则慢 provider 会被误判为 degraded（线上事故根因）。
+	providerCheckTimeout time.Duration
+}
+
+// SnapshotCollectorOption 是 NewSnapshotCollector 的构造选项。
+// 引入动机：依赖参数已达 6 个，超时又分快检查与 Provider 两类；
+// 用选项覆盖超时可保持既有调用点不变，也便于测试注入毫秒级超时。
+type SnapshotCollectorOption func(*SnapshotCollector)
+
+// WithProviderCheckTimeout 覆盖 Provider 检查（embedding/reranker）的超时。
+// 引入动机：生产由配置项 HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS 提供该值（默认 30s），
+// 测试需要注入较短的超时以缩短用例耗时。
+// 作用：仅影响 embedding/reranker 检查，快检查仍使用 defaultCheckTimeout。
+// 传入非正数时 panic（fail fast：超时配置错误必须立即暴露，不允许静默回退）。
+func WithProviderCheckTimeout(d time.Duration) SnapshotCollectorOption {
+	return func(c *SnapshotCollector) {
+		if d <= 0 {
+			panic(fmt.Sprintf("health: Provider 健康检查超时必须为正数，实际为 %v", d))
+		}
+		c.providerCheckTimeout = d
+	}
 }
 
 // NewSnapshotCollector 创建健康快照采集器。
 // 引入动机：main.go 需要注入所有依赖以构造 readyz handler。
-// 所有参数可为 nil，表示该依赖未配置（状态为 unavailable/degraded）。
-func NewSnapshotCollector(pg PGChecker, esClient ESChecker, emb EmbeddingChecker, rr RerankerChecker, jobStats JobStatsQuery, profileRepo ProfileQuery) *SnapshotCollector {
-	return &SnapshotCollector{
-		pg:          pg,
-		es:          esClient,
-		embedding:   emb,
-		reranker:    rr,
-		jobStats:    jobStats,
-		profileRepo: profileRepo,
-		checkTimeout: 5 * time.Second,
+// 所有依赖参数可为 nil，表示该依赖未配置（状态为 unavailable/degraded）。
+// opts 可覆盖默认超时（快检查 defaultCheckTimeout、Provider 检查 DefaultProviderCheckTimeout）；
+// 不传 opts 时全部使用默认值，main.go 传入 WithProviderCheckTimeout 接入配置。
+func NewSnapshotCollector(pg PGChecker, esClient ESChecker, emb EmbeddingChecker, rr RerankerChecker, jobStats JobStatsQuery, profileRepo ProfileQuery, opts ...SnapshotCollectorOption) *SnapshotCollector {
+	c := &SnapshotCollector{
+		pg:                   pg,
+		es:                   esClient,
+		embedding:            emb,
+		reranker:             rr,
+		jobStats:             jobStats,
+		profileRepo:          profileRepo,
+		checkTimeout:         defaultCheckTimeout,
+		providerCheckTimeout: DefaultProviderCheckTimeout,
 	}
+	for _, opt := range opts {
+		if opt == nil {
+			panic("health: NewSnapshotCollector 收到 nil 选项")
+		}
+		opt(c)
+	}
+	return c
 }
 
-// Collect 采集当前健康快照。
-// 引入动机：readyz handler 调用此方法获取各依赖状态。
-// 各依赖检查使用独立超时 context，避免互相阻塞。
+// Collect 并发采集当前健康快照。
+//
+// 引入动机（为什么并发）：各依赖检查原先顺序执行，最坏耗时是各项超时之和
+// （5s PG + 5s ES + 30s embedding + 30s reranker + 5s job + 5s profile = 80s）。
+// 而 docker-compose 中 server 的 healthcheck timeout 只有 10s：provider 慢或挂时，
+// healthcheck 命令会先被 docker 杀掉，容器被判为 unhealthy，
+// 即使 /readyz 本应返回 200 + degraded；这同时污染 depends_on: service_healthy 的启动判定。
+// 改为每项检查各自 goroutine 并发执行后，最坏耗时从"各项之和"降为"单项最长"（30s）。
+//
+// 对外语义不变：PG 失败 → 503（unavailable）；ES/embedding/reranker 失败 → 200 + degraded；
+// 各 ComponentStatus 的 Status/Error 取值与字段映射保持原样。
+//
+// 并发安全：每个 goroutine 只写自己独占的局部变量，全部完成后经 wg.Wait() 组装 Snapshot，
+// 不存在跨 goroutine 的共享写入；每个 goroutine 内部各自 defer cancel() 释放 context。
+//
+// 超时语义不变：PG/ES/job 统计/profile 使用 checkTimeout（5s），
+// embedding/reranker 使用 providerCheckTimeout（默认 30s，因为会发起真实推理请求）。
 func (c *SnapshotCollector) Collect(ctx context.Context) Snapshot {
-	snap := Snapshot{}
+	// 各检查结果先写入独占局部变量：goroutine 之间不共享任何可写内存，从根上避免 data race。
+	var (
+		pgStatus      ComponentStatus
+		esStatus      ComponentStatus
+		embStatus     ComponentStatus
+		rrStatus      ComponentStatus
+		pendingJobs   int
+		failedJobs    int
+		activeProfile ActiveProfileInfo
+	)
+
+	// wg 等待全部依赖检查结束；wg.Wait() 同时构成 happens-before，
+	// 保证下方组装 Snapshot 时能看到各 goroutine 的写入结果。
+	var wg sync.WaitGroup
 
 	// PostgreSQL 检查（PG 失败 = 服务不可用）
-	if c.pg == nil {
-		snap.PostgreSQL = ComponentStatus{Status: "unavailable", Error: "PG 连接未配置"}
-	} else {
-		pgCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
-		if err := c.pg.PingContext(pgCtx); err != nil {
-			snap.PostgreSQL = ComponentStatus{Status: "unavailable", Error: safeError(err)}
-		} else {
-			snap.PostgreSQL = ComponentStatus{Status: "healthy"}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if c.pg == nil {
+			pgStatus = ComponentStatus{Status: "unavailable", Error: "PG 连接未配置"}
+			return
 		}
-		cancel()
-	}
+		pgCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
+		defer cancel()
+		if err := c.pg.PingContext(pgCtx); err != nil {
+			pgStatus = ComponentStatus{Status: "unavailable", Error: safeError(err)}
+			return
+		}
+		pgStatus = ComponentStatus{Status: "healthy"}
+	}()
 
 	// Elasticsearch 检查（ES 失败 = degraded）
-	if c.es == nil {
-		snap.Elasticsearch = ComponentStatus{Status: "unavailable", Error: "ES 客户端未配置"}
-	} else {
-		esCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
-		if err := c.es.Ping(esCtx); err != nil {
-			snap.Elasticsearch = ComponentStatus{Status: "degraded", Error: safeError(err)}
-		} else {
-			snap.Elasticsearch = ComponentStatus{Status: "healthy"}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if c.es == nil {
+			esStatus = ComponentStatus{Status: "unavailable", Error: "ES 客户端未配置"}
+			return
 		}
-		cancel()
-	}
+		esCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
+		defer cancel()
+		if err := c.es.Ping(esCtx); err != nil {
+			esStatus = ComponentStatus{Status: "degraded", Error: safeError(err)}
+			return
+		}
+		esStatus = ComponentStatus{Status: "healthy"}
+	}()
 
 	// Embedding Provider 检查（不可用 = degraded）
-	if c.embedding == nil {
-		snap.Embedding = ComponentStatus{Status: "unavailable", Error: "Embedding Provider 未配置"}
-	} else {
-		embCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
-		if c.embedding.Available(embCtx) {
-			snap.Embedding = ComponentStatus{Status: "healthy"}
-		} else {
-			snap.Embedding = ComponentStatus{Status: "degraded", Error: "Embedding Provider 不可用"}
+	// 使用 providerCheckTimeout：Available 会发起真实 embedding 调用，5s 会误报 degraded。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if c.embedding == nil {
+			embStatus = ComponentStatus{Status: "unavailable", Error: "Embedding Provider 未配置"}
+			return
 		}
-		cancel()
-	}
+		embCtx, cancel := context.WithTimeout(ctx, c.providerCheckTimeout)
+		defer cancel()
+		if c.embedding.Available(embCtx) {
+			embStatus = ComponentStatus{Status: "healthy"}
+			return
+		}
+		embStatus = ComponentStatus{Status: "degraded", Error: "Embedding Provider 不可用"}
+	}()
 
 	// Reranker Provider 检查（不可用 = degraded）
-	if c.reranker == nil {
-		snap.Reranker = ComponentStatus{Status: "unavailable", Error: "Reranker Provider 未配置"}
-	} else {
-		rrCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
-		if c.reranker.Available(rrCtx) {
-			snap.Reranker = ComponentStatus{Status: "healthy"}
-		} else {
-			snap.Reranker = ComponentStatus{Status: "degraded", Error: "Reranker Provider 不可用"}
+	// 使用 providerCheckTimeout：Available 会发起真实 rerank 推理，5s 会误报 degraded。
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if c.reranker == nil {
+			rrStatus = ComponentStatus{Status: "unavailable", Error: "Reranker Provider 未配置"}
+			return
 		}
-		cancel()
-	}
+		rrCtx, cancel := context.WithTimeout(ctx, c.providerCheckTimeout)
+		defer cancel()
+		if c.reranker.Available(rrCtx) {
+			rrStatus = ComponentStatus{Status: "healthy"}
+			return
+		}
+		rrStatus = ComponentStatus{Status: "degraded", Error: "Reranker Provider 不可用"}
+	}()
 
-	// Job 统计
-	if c.jobStats != nil {
+	// Job 统计（同一个 goroutine 内串行执行两次轻量查询，只写 pendingJobs/failedJobs）
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if c.jobStats == nil {
+			return
+		}
 		jobCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
+		defer cancel()
 		if pending, err := c.jobStats.CountByStatus(jobCtx, "pending"); err != nil {
 			slog.Warn("readyz 查询 pending job 计数失败", "error", err)
 		} else {
-			snap.PendingJobs = pending
+			pendingJobs = pending
 		}
 		if failed, err := c.jobStats.CountByStatus(jobCtx, "dead"); err != nil {
 			slog.Warn("readyz 查询 dead job 计数失败", "error", err)
 		} else {
-			snap.FailedJobs = failed
+			failedJobs = failed
 		}
-		cancel()
-	}
+	}()
 
-	// Active profile
-	if c.profileRepo != nil {
+	// Active profile（只写 activeProfile）
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if c.profileRepo == nil {
+			return
+		}
 		profCtx, cancel := context.WithTimeout(ctx, c.checkTimeout)
+		defer cancel()
 		id, name, err := c.profileRepo.GetActiveProfileID(profCtx)
 		if err != nil {
 			slog.Warn("readyz 查询 active profile 失败", "error", err)
-		} else {
-			snap.ActiveProfile = ActiveProfileInfo{ID: id, Name: name}
+			return
 		}
-		cancel()
-	}
+		activeProfile = ActiveProfileInfo{ID: id, Name: name}
+	}()
 
-	return snap
+	wg.Wait()
+
+	return Snapshot{
+		PostgreSQL:    pgStatus,
+		Elasticsearch: esStatus,
+		Embedding:     embStatus,
+		Reranker:      rrStatus,
+		PendingJobs:   pendingJobs,
+		FailedJobs:    failedJobs,
+		ActiveProfile: activeProfile,
+	}
 }
 
 // IsReady 判断快照是否表示服务就绪。

@@ -87,6 +87,15 @@ type Config struct {
 	SchedulerEnabled     bool
 	SchedulerTickInterval int64 // 秒
 
+	// 健康检查配置
+	// 引入动机：readyz 中 embedding/reranker 两个检查会发起真实推理请求
+	// （embedding 真实调用 / rerank 真实推理），而 PG/ES/job 统计/profile 只是轻量查询。
+	// 线上事故：这两类检查共用写死的 5s 超时，provider 冷启动或模型推理稍慢就会被判为
+	// context deadline exceeded，/readyz 长期把 Reranker 标成 degraded，且 docker healthcheck
+	// 每 15s 打一次 /readyz 造成日志刷屏。
+	// 因此为 provider 健康检查提供独立可配置的超时，与快检查的 5s 解耦。
+	ProviderHealthCheckTimeout time.Duration
+
 	// 根加密密钥
 	// 引入动机：计划要求由部署方通过 MASTER_ENCRYPTION_KEY 环境变量提供
 	// base64 编码的 32 字节根密钥，用于 AES-256-GCM 加密 Provider API Key。
@@ -184,6 +193,14 @@ if len(errs) > 0 {
 	// 不写死 provider/base URL/API key/model/dimensions。
 	// 这些配置项缺失时不产生错误（搜索降级），但已设置的非法值产生错误。
 	loadSearchConfig(&cfg, &errs)
+
+	if len(errs) > 0 {
+		return nil, fmt.Errorf("配置加载失败，共 %d 项问题:\n  - %s", len(errs), strings.Join(errs, "\n  - "))
+	}
+
+	// --- 健康检查配置 ---
+	// 引入动机：readyz 中 embedding/reranker 检查会发起真实推理请求，需要独立于快检查的超时。
+	loadHealthCheckConfig(&cfg, &errs)
 
 	if len(errs) > 0 {
 		return nil, fmt.Errorf("配置加载失败，共 %d 项问题:\n  - %s", len(errs), strings.Join(errs, "\n  - "))
@@ -410,6 +427,25 @@ func loadAuthConfig(cfg *Config, errs *[]string) {
 		}
 	} else {
 		cfg.Argon2KeyLength = 32
+	}
+}
+
+// loadHealthCheckConfig 从环境变量加载健康检查配置。
+// 引入动机：/readyz 中 embedding/reranker 检查会发起真实推理请求，
+// 其耗时特性与 PG/ES/job/profile 等轻量检查完全不同，需要独立可配置的超时。
+func loadHealthCheckConfig(cfg *Config, errs *[]string) {
+	// Provider 健康检查超时（秒）
+	// 引入动机：embedding/reranker 检查会发起真实推理请求，冷启动或模型推理耗时远超
+	// 快检查所需的 5s；写死 5s 会把"只是慢"的 provider 误报为 degraded（线上事故）。
+	if v := os.Getenv("HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS"); v != "" {
+		d, err := strconv.Atoi(v)
+		if err != nil || d <= 0 {
+			*errs = append(*errs, fmt.Sprintf("HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS 非法值 %q：应为正整数（秒）", v))
+		} else {
+			cfg.ProviderHealthCheckTimeout = time.Duration(d) * time.Second
+		}
+	} else {
+		cfg.ProviderHealthCheckTimeout = 30 * time.Second
 	}
 }
 

@@ -291,6 +291,8 @@ func runServer(ctx context.Context, runner *migration.Runner, cfg *config.Config
 	// 构造 readyz 健康快照采集器
 	// 引入动机：readyz 需要注入 PG、ES、Embedding、Reranker、job stats 和 profile 查询依赖。
 	// Provider 从 Registry 函数引用动态获取，支持热更新——管理员保存新 Provider 后健康检查立即反映。
+	// Embedding/Reranker 检查会发起真实推理请求，使用独立的 provider 超时（默认 30s，
+	// 由 HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS 配置）；PG/ES/job/profile 仍用 5s 快检查超时。
 	healthCollector := health.NewSnapshotCollector(
 		&health.PGPingAdapter{DB: database},
 		&health.ESPingAdapter{Client: esClient},
@@ -298,6 +300,7 @@ func runServer(ctx context.Context, runner *migration.Runner, cfg *config.Config
 		&health.RerankerCheckAdapter{ProviderFn: providerRegistry.GetRerankerProvider},
 		jobRepo,
 		&health.ProfileQueryAdapter{Repo: profileRepo},
+		health.WithProviderCheckTimeout(cfg.ProviderHealthCheckTimeout),
 	)
 	mux.HandleFunc("/readyz", health.ReadyHandler(healthCollector))
 

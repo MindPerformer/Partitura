@@ -116,6 +116,11 @@ services:
       # Scheduler
       SCHEDULER_ENABLED: ${SCHEDULER_ENABLED}
       SCHEDULER_TICK_INTERVAL: ${SCHEDULER_TICK_INTERVAL}
+      # 健康检查：/readyz 中 Embedding/Reranker 检查会发起真实推理请求，使用独立超时（秒，默认 30）。
+      # 引入动机：provider 冷启动或模型推理慢于 5s 时，沿用快检查的 5s 会把"慢但可用"的 provider
+      # 误报为 degraded，并持续输出 context deadline exceeded（线上事故）。
+      # PG/ES 等快检查仍固定使用 5s。必须为正整数，非法值会导致服务启动 fail fast。
+      HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS: ${HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS:-30}
       # 迁移文件目录
       MIGRATIONS_DIR: /app/migrations
     networks:
@@ -123,7 +128,12 @@ services:
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/readyz | grep -q '\"status\"' || exit 1"]
       interval: 15s
-      timeout: 10s
+      # timeout 必须大于 HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS（默认 30s）：
+      # /readyz 的 embedding/reranker 检查会发起真实推理请求，最坏耗时即该 provider 超时。
+      # 若 timeout 过小（例如 10s），provider 慢/挂时 docker 会先杀掉 healthcheck 命令并把容器
+      # 标成 unhealthy——即使 /readyz 本应返回 200 + degraded，同时会误伤 depends_on: service_healthy。
+      # Collect 已并发采集，最坏总耗时 = 单项最长 = provider 超时，故取 40s 留出合理余量。
+      timeout: 40s
       retries: 5
       start_period: 60s
     # 不映射端口 — 仅内部网络可达，由 web 反代

@@ -21,6 +21,7 @@ import (
 	"net/http"
 
 	"partitura/server/internal/auth"
+	"partitura/server/internal/es"
 	httpmw "partitura/server/internal/http"
 	"partitura/server/internal/job"
 	"partitura/server/internal/profile"
@@ -147,10 +148,19 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 	profileConfig := profileRecord.ToConfig()
 
 	// 执行搜索管线
+	//
+	// 目标索引显式指定为 alias（knowledge_current）：
+	// 引入动机：design/01-SEARCH.md §Index Version 要求索引必须 versioned，
+	// 通过 alias 做原子切换、禁止原地破坏 active index。普通搜索若直接使用
+	// profile.ESIndexName 的具体索引名，一旦该字段与实际索引不一致（手动重建后换名、
+	// 换 alias、改 profile），ES 会返回 400/404 使搜索降级为 vector_search_failed。
+	// 打 alias 后，切索引只需切换 alias 指向，搜索无需感知具体版本索引。
+	// 注意：评测/调优路径（job/eval_handler.go）打候选 profile 的具体索引，不传 IndexName。
 	input := pipeline.SearchInput{
 		WorkspaceID: wsc.WorkspaceID,
 		Query:       req.Query,
 		Profile:     profileConfig,
+		IndexName:   es.AliasName,
 		Limit:       req.Limit,
 		Offset:      req.Offset,
 		Mode:        req.Mode,

@@ -32,7 +32,8 @@ func setEnv(t *testing.T, key, value string) {
 func clearEnv(t *testing.T) {
 	t.Helper()
 	keys := []string{"DB_HOST", "DB_PORT", "DB_USER", "DB_PASSWORD", "DB_NAME",
-		"DB_SSLMODE", "HTTP_ADDR", "LOG_LEVEL", "SHUTDOWN_TIMEOUT"}
+		"DB_SSLMODE", "HTTP_ADDR", "LOG_LEVEL", "SHUTDOWN_TIMEOUT",
+		"HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS"}
 	for _, k := range keys {
 		old, ok := os.LookupEnv(k)
 		os.Unsetenv(k)
@@ -44,6 +45,17 @@ func clearEnv(t *testing.T) {
 			}
 		})
 	}
+}
+
+// setRequiredEnv 设置所有必填环境变量，便于聚焦单个配置项的测试。
+func setRequiredEnv(t *testing.T) {
+	t.Helper()
+	setEnv(t, "DB_HOST", "localhost")
+	setEnv(t, "DB_PORT", "5432")
+	setEnv(t, "DB_USER", "testuser")
+	setEnv(t, "DB_PASSWORD", "secret")
+	setEnv(t, "DB_NAME", "testdb")
+	setEnv(t, "DB_SSLMODE", "disable")
 }
 
 func TestLoad_MissingAllRequired(t *testing.T) {
@@ -166,6 +178,44 @@ func TestLoad_DefaultValues(t *testing.T) {
 	}
 	if cfg.ShutdownTimeout != 30*time.Second {
 		t.Errorf("ShutdownTimeout 默认值 = %v, 期望 30s", cfg.ShutdownTimeout)
+	}
+	if cfg.ProviderHealthCheckTimeout != 30*time.Second {
+		t.Errorf("ProviderHealthCheckTimeout 默认值 = %v, 期望 30s", cfg.ProviderHealthCheckTimeout)
+	}
+}
+
+// TestLoad_ProviderHealthCheckTimeoutFromEnv 验证构造器级替换：环境变量覆盖默认的超时。
+// 引入动机：/readyz 的 Provider 检查超时必须由部署方配置，而非写死。
+func TestLoad_ProviderHealthCheckTimeoutFromEnv(t *testing.T) {
+	clearEnv(t)
+	setRequiredEnv(t)
+	setEnv(t, "HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS", "45")
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if cfg.ProviderHealthCheckTimeout != 45*time.Second {
+		t.Errorf("ProviderHealthCheckTimeout = %v, 期望 45s", cfg.ProviderHealthCheckTimeout)
+	}
+}
+
+// TestLoad_InvalidProviderHealthCheckTimeout 验证非法超时值 fail fast，不静默回退默认值。
+func TestLoad_InvalidProviderHealthCheckTimeout(t *testing.T) {
+	for _, raw := range []string{"abc", "0", "-3", "1.5"} {
+		t.Run(raw, func(t *testing.T) {
+			clearEnv(t)
+			setRequiredEnv(t)
+			setEnv(t, "HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS", raw)
+
+			cfg, err := Load()
+			if err == nil {
+				t.Fatalf("非法值 %q 期望返回错误，但 Load 成功（ProviderHealthCheckTimeout=%v）", raw, cfg.ProviderHealthCheckTimeout)
+			}
+			if !strings.Contains(err.Error(), "HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS") {
+				t.Errorf("错误信息应包含 HEALTH_PROVIDER_CHECK_TIMEOUT_SECONDS，实际: %s", err.Error())
+			}
+		})
 	}
 }
 

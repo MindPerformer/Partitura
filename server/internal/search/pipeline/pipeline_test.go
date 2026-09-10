@@ -26,6 +26,10 @@ type fakeESClient struct {
 	// 引入动机：搜索管线本身不消费维度信息，但 es.Client 接口要求实现该方法；
 	// 保留可配置的维度表使 fake 与真实 ES 语义一致（未配置 → 0 表示"无已知维度"）。
 	indexDims map[string]int
+	// searchedIndices 按调用顺序记录 Search 收到的目标索引名。
+	// 引入动机：design/01-SEARCH.md §Index Version 要求普通搜索打 alias
+	// knowledge_current；需要真实观察管线下发给 ES 的索引名来锁定该行为。
+	searchedIndices []string
 }
 
 func newFakeESClient() *fakeESClient {
@@ -110,6 +114,7 @@ func (c *fakeESClient) DeleteByQuery(ctx context.Context, indexName string, quer
 }
 
 func (c *fakeESClient) Search(ctx context.Context, indexName string, query map[string]interface{}) (*es.SearchResponse, error) {
+	c.searchedIndices = append(c.searchedIndices, indexName)
 	resp := &es.SearchResponse{}
 	if c.docs[indexName] == nil {
 		return resp, nil
@@ -661,4 +666,134 @@ func TestSearch_HybridVectorSearchError_LexicalFallback(t *testing.T) {
 	if len(output.Results) == 0 {
 		t.Fatal("hybrid vector 失败时应回退到 lexical BM25 结果")
 	}
+}
+
+// assertSearchedIndices 断言 fake ES 依次收到的目标索引名与期望完全一致。
+// 引入动机：目标索引断言必须校验真实下发给 ES 的参数序列，不能退化为字符串包含判断。
+func assertSearchedIndices(t *testing.T, client *fakeESClient, want []string) {
+	t.Helper()
+	if len(client.searchedIndices) != len(want) {
+		t.Fatalf("ES 检索调用次数应为 %d，实际 %d（索引序列: %v）",
+			len(want), len(client.searchedIndices), client.searchedIndices)
+	}
+	for i, idx := range want {
+		if client.searchedIndices[i] != idx {
+			t.Errorf("第 %d 次 ES 检索目标索引应为 %q，实际 %q", i+1, idx, client.searchedIndices[i])
+		}
+	}
+}
+
+// TestSearch_ExplicitIndexName_OverridesProfileIndex 验证显式 IndexName（alias）优先于 Profile.ESIndexName。
+//
+// 引入动机：design/01-SEARCH.md §Index Version 要求普通搜索通过 alias knowledge_current 检索，
+// 以保证索引切换（alias 原子切换）后搜索自动指向新索引。本测试构造 profile 的
+// ESIndexName="knowledge_v1"（与分析索引不一致的典型场景），文档只写入 alias 指向的索引，
+// 断言管线真实下发给 ES 的索引是 alias 且能取回结果。
+func TestSearch_ExplicitIndexName_OverridesProfileIndex(t *testing.T) {
+	client := newFakeESClient()
+	ctx := context.Background()
+	_ = client.CreateIndex(ctx, es.AliasName, nil)
+	_ = client.BulkIndex(ctx, es.AliasName, []es.IndexDoc{
+		{ID: "doc1_0", Body: map[string]interface{}{
+			"document_id":  "doc1",
+			"workspace_id": "ws-1",
+			"path":         "alias.md",
+			"title":        "Alias",
+			"content":      "alias content",
+			"status":       "active",
+			"is_special":   false,
+		}},
+	})
+
+	pipe := NewPipeline(client, nil, nil)
+	output, err := pipe.Search(ctx, SearchInput{
+		WorkspaceID: "ws-1",
+		Query:       "test",
+		Profile:     testProfile(), // ESIndexName = knowledge_v1
+		IndexName:   es.AliasName,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("Search 失败: %v", err)
+	}
+
+	assertSearchedIndices(t, client, []string{es.AliasName})
+	if len(output.Results) == 0 {
+		t.Fatal("应以 alias 索引为数据源取回结果")
+	}
+	if output.Results[0].DocumentID != "doc1" {
+		t.Errorf("结果应来自 alias 索引中的文档 doc1，实际 %s", output.Results[0].DocumentID)
+	}
+	if client.searchedIndices[0] == "knowledge_v1" {
+		t.Error("显式 IndexName 生效时不应再打 profile 的具体索引 knowledge_v1")
+	}
+}
+
+// TestSearch_EvalPath_EmptyIndexName_UsesProfileIndex 锁定评测路径不受 alias 改造影响。
+//
+// 引入动机：evaluate_profile / optimize_profile（job/eval_handler.go）用 SearchInput 搜索
+// 候选 profile 自己的索引，且不设置 IndexName。该索引通常不是 alias 当前指向的索引，
+// 因此本测试以与评测完全相同的输入组装方式（IndexName 留空 + Profile.ESIndexName 具体索引）
+// 断言管线仍然真实打具体索引，防止后续有人把 alias 强制写进管线内部。
+func TestSearch_EvalPath_EmptyIndexName_UsesProfileIndex(t *testing.T) {
+	client := newFakeESClient()
+	ctx := context.Background()
+	_ = client.CreateIndex(ctx, "knowledge_v1", nil)
+	_ = client.BulkIndex(ctx, "knowledge_v1", []es.IndexDoc{
+		{ID: "doc1_0", Body: map[string]interface{}{
+			"document_id":  "doc1",
+			"workspace_id": "ws-1",
+			"path":         "candidate.md",
+			"title":        "Candidate",
+			"content":      "candidate content",
+			"status":       "active",
+			"is_special":   false,
+		}},
+	})
+
+	pipe := NewPipeline(client, nil, nil)
+	output, err := pipe.Search(ctx, SearchInput{
+		WorkspaceID: "", // 评测不限定 workspace，与 eval_handler.go 一致
+		Query:       "test",
+		Profile:     testProfile(), // 候选 profile 的具体索引 knowledge_v1
+		Limit:       10,
+		Mode:        "hybrid",
+		// IndexName 留空：评测路径必须落到 Profile.ESIndexName
+	})
+	if err != nil {
+		t.Fatalf("Search 失败: %v", err)
+	}
+
+	assertSearchedIndices(t, client, []string{"knowledge_v1"})
+	if len(output.Results) == 0 {
+		t.Fatal("评测路径应从候选 profile 的具体索引取回结果")
+	}
+	if output.Results[0].DocumentID != "doc1" {
+		t.Errorf("结果应来自候选索引中的文档 doc1，实际 %s", output.Results[0].DocumentID)
+	}
+}
+
+// TestSearch_EmptyIndexNameAndProfileIndex_FallsBackToAlias 验证保留既有回退语义。
+//
+// 引入动机：管线原有语义为 indexName 为空时回退 es.AliasName，本次改造必须保留该行为，
+// 避免 profile 未设置索引名时目标索引为空导致 ES 请求非法。
+func TestSearch_EmptyIndexNameAndProfileIndex_FallsBackToAlias(t *testing.T) {
+	client := newFakeESClient()
+	ctx := context.Background()
+
+	pipe := NewPipeline(client, nil, nil)
+	profileConfig := testProfile()
+	profileConfig.ESIndexName = ""
+
+	_, err := pipe.Search(ctx, SearchInput{
+		WorkspaceID: "ws-1",
+		Query:       "test",
+		Profile:     profileConfig,
+		Limit:       10,
+	})
+	if err != nil {
+		t.Fatalf("Search 失败: %v", err)
+	}
+
+	assertSearchedIndices(t, client, []string{es.AliasName})
 }

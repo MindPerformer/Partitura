@@ -99,6 +99,17 @@ type SearchInput struct {
 	// Mode 控制搜索管线行为："hybrid"（默认）、"lexical"、"semantic"。
 	// 引入动机：M3 要求 search request 支持 mode 参数，允许客户端指定检索模式。
 	Mode string
+	// IndexName 是本次检索的目标索引名，留空表示由 Profile.ESIndexName 决定。
+	//
+	// 引入动机：design/01-SEARCH.md §Index Version 要求索引必须 versioned，
+	// 并通过 alias knowledge_current 做原子切换，禁止原地破坏 active index。
+	// 两类调用方对目标索引的需求不同：
+	//   - 普通搜索（handler）必须打 alias，否则 Profile.ESIndexName 与实际索引一旦不一致
+	//     （手动重建换索引名、换 alias、改 profile），ES 会返回 400/404，搜索直接降级；
+	//   - 评测/调优（evaluate_profile、optimize_profile）针对的是候选 profile 自己的
+	//     具体索引，该索引通常不是 alias 当前指向的索引，因此必须打具体索引名。
+	// 由调用方显式指定目标索引，避免在管线内部无条件使用 alias 而破坏评测。
+	IndexName string
 }
 
 // SearchOutput 是搜索管线的输出结果。
@@ -151,7 +162,14 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 		return output, nil
 	}
 
-	indexName := input.Profile.ESIndexName
+	// 目标索引解析顺序：显式 IndexName → Profile.ESIndexName → es.AliasName。
+	// 引入动机：design/01-SEARCH.md §Index Version 要求索引 versioned 且通过 alias
+	// knowledge_current 原子切换。普通搜索由 handler 显式传入 alias；评测路径不传
+	// IndexName，保持打候选 profile 的具体索引名，管线本身不强制使用 alias。
+	indexName := input.IndexName
+	if indexName == "" {
+		indexName = input.Profile.ESIndexName
+	}
 	if indexName == "" {
 		indexName = es.AliasName
 	}
