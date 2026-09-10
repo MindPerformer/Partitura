@@ -100,6 +100,72 @@ docker compose down
 
 Server 收到 SIGTERM 后会先停止接受新 HTTP 请求，再取消 Job Worker 和 Scheduler，等待进行中的任务安全完成或超时后退出。
 
+## MCP 客户端（knowledge-mcp）
+
+`knowledge-mcp` 是本地 stdio MCP 客户端二进制：Agent（Claude / Codex / Cursor 等）以子进程方式启动它，通过 stdin/stdout 走 MCP 协议；它再通过 HTTPS REST 与 Knowledge Server 通信。MCP 本身不开放网络端口。
+
+源码位于 `mcp/`（独立 Go module），配置与加密凭据都放在**运行目录**下，多实例靠不同运行目录隔离。
+
+### 本地构建
+
+前置条件：Go 1.26.4（与 `mcp/go.mod` 一致）。跨平台打包另需 `tar`、`sha256sum`；打 Windows 包还需要 `zip`，或可用的 `python3` / `python`。
+
+| 目标 | 命令 | 产物 |
+|------|------|------|
+| 当前平台快速构建 | `make mcp-build` | `dist/knowledge-mcp`（Windows 为 `dist/knowledge-mcp.exe`） |
+| 全部 6 平台打包 | `make mcp-cross` | `dist/` 下 6 个平台包 + `checksums.txt` |
+| 等价脚本调用 | `bash scripts/build-mcp.sh` | 同上，默认输出到 `dist/` |
+| 指定版本与平台 | `bash scripts/build-mcp.sh v1.2.3 dist linux/amd64` | `dist/knowledge-mcp_v1.2.3_linux_amd64.tar.gz` |
+
+平台为 windows/linux/darwin × amd64/arm64 共 6 个。`platforms` 参数接受 `os/arch` 或逗号分隔的多个 `os/arch`，不传则构建全部 6 个平台。
+
+产物命名：
+
+- `knowledge-mcp_<version>_<os>_<arch>.zip`（Windows，内含 `knowledge-mcp.exe`）
+- `knowledge-mcp_<version>_<os>_<arch>.tar.gz`（其余平台，内含 `knowledge-mcp`）
+- 每个包附带同名 `.sha256`
+- `checksums.txt` 汇总本次构建的全部包，脚本生成后会自动 `sha256sum -c` 复验
+
+其他 Makefile 目标：`make mcp-test`（`go test ./...`）、`make mcp-vet`（`go vet ./...`）。
+
+版本号经 `-ldflags` 注入 `mcp/internal/buildinfo`；不指定时脚本用 `git describe --tags --always --dirty` 推断，本地可覆盖，例如 `make mcp-build MCP_VERSION=v1.2.3`。构建后 `knowledge-mcp version` 会打印 Version / Commit / Date。
+
+### CI 发布
+
+`.github/workflows/mcp-release.yml` 的行为：
+
+- 触发：push 到 `master`、push 版本标签 `v*.*.*`、PR 到 `master`、手动 dispatch
+- `test` job：在 ubuntu / windows / macOS 三个 runner 上各自执行 `go vet` + `go test`
+- `build` job：在 ubuntu 交叉编译 6 个平台，各自上传 Actions artifact（`knowledge-mcp-<goos>-<goarch>`）
+- `release` job：**仅 tag `v*.*.*` 触发**，汇总所有平台包与 `checksums.txt` 上传为 GitHub Release assets；非 tag 事件只产出 artifact
+- 版本号：tag 事件使用 tag 名（如 `v1.2.3`），其余使用 `dev-<short sha>`
+
+### 凭据与配置位置
+
+| 内容 | 路径 |
+|------|------|
+| 配置（TOML） | `<cwd>/.knowledge-mcp/config.toml` |
+| 加密凭据 | `<cwd>/.knowledge-mcp/.credentials` |
+
+`<cwd>` 是运行目录（当前工作目录）。凭据使用 AES-256-GCM 加密，密钥是**源码中硬编码的 32 字节固定常量**，因此只提供**混淆级**保护：拿到二进制即可逆向提取密钥，它不是强加密，也无法抵御本地有权用户读取运行目录，只是提高了文件被误分享或目录被随意翻看时的门槛。目录权限 `0700`、文件权限 `0600`（Windows 不体现 POSIX 权限位，实际由 ACL 决定）。
+
+请把 `.knowledge-mcp/`（或至少 `.credentials`）加入项目 `.gitignore`。
+
+### 多实例与登录
+
+MCP 是纯 stdio 协议，**没有网络端口**；多个实例的隔离靠**不同的运行目录**——每个项目目录各自拥有 `.knowledge-mcp/`，配置与凭据互不干扰。
+
+因此 `login` 必须在**目标项目目录**中执行，凭据才会写到该目录：
+
+```bash
+cd /path/to/your-project
+knowledge-mcp login https://knowledge.company.com
+```
+
+否则 Agent 从别的目录启动 `serve` 时找不到凭据。
+
+其他命令：`logout`、`serve`（无参数时的默认命令）、`server-list`、`server-current`、`version`。
+
 ## 配置说明
 
 所有配置通过环境变量读取，参见 `.env.example`。

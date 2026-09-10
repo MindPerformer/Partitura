@@ -2,7 +2,10 @@
 //
 // 引入动机：design/02-MCP.md §MCP 配置 要求使用 TOML 配置文件保存 server URL、
 // cache TTL 等非敏感配置。认证凭证（access token / refresh token）禁止出现在配置文件中，
-// 必须存储在操作系统 credential store。
+// 必须存储在加密凭据文件中（见 internal/credential.FileStore）。
+//
+// 路径约定：三平台统一，配置与凭据都放在**运行目录**（当前工作目录）下的
+// .knowledge-mcp/ 中，即 <cwd>/.knowledge-mcp/config.toml。
 //
 // 安全原则：
 //   - 配置文件不得包含任何 token 或敏感凭据
@@ -57,11 +60,11 @@ type Config struct {
 // 引入动机：当配置文件缺失或某些字段未设置时，使用安全默认值。
 func DefaultConfig() Config {
 	return Config{
-		CacheTTL:           "30m",
-		CacheMaxEntries:    200,
-		DefaultSearchMode:  "hybrid",
-		SearchResultLimit:  10,
-		AllowInsecureTLS:   false,
+		CacheTTL:          "30m",
+		CacheMaxEntries:   200,
+		DefaultSearchMode: "hybrid",
+		SearchResultLimit: 10,
+		AllowInsecureTLS:  false,
 	}
 }
 
@@ -82,14 +85,16 @@ func (c *Config) ParseCacheTTL() (time.Duration, error) {
 }
 
 // configPath 返回配置文件的标准路径。
-// 引入动机：design/02-MCP.md 要求配置文件路径受控。
-// 使用用户主目录下的 .knowledge-mcp/config.toml。
+// 引入动机：design/02-MCP.md 要求配置文件路径受控；
+// 三平台统一改用运行目录（当前工作目录），与加密凭据文件同放在 .knowledge-mcp 下。
+// 路径为 <cwd>/.knowledge-mcp/config.toml。
+// os.Getwd 失败必须 fail-fast 返回错误，不得退化到其他目录。
 func configPath() (string, error) {
-	home, err := os.UserHomeDir()
+	cwd, err := os.Getwd()
 	if err != nil {
-		return "", fmt.Errorf("获取用户主目录: %w", err)
+		return "", fmt.Errorf("获取当前工作目录: %w", err)
 	}
-	return filepath.Join(home, ".knowledge-mcp", "config.toml"), nil
+	return filepath.Join(cwd, ".knowledge-mcp", "config.toml"), nil
 }
 
 // Load 从默认路径加载配置文件。

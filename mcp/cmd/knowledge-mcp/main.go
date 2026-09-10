@@ -9,6 +9,10 @@
 //   - knowledge-mcp serve              — 启动 stdio MCP server（默认命令）
 //   - knowledge-mcp server-list        — 列出已配置的 server
 //   - knowledge-mcp server-current     — 显示当前 server
+//   - knowledge-mcp version            — 显示构建版本信息
+//
+// 配置与凭据路径：三平台统一使用**运行目录**（当前工作目录），
+// 位于 <cwd>/.knowledge-mcp/ 下（config.toml 与加密凭据文件 .credentials）。
 package main
 
 import (
@@ -22,6 +26,7 @@ import (
 	"runtime"
 	"time"
 
+	"partitura/mcp/internal/buildinfo"
 	"partitura/mcp/internal/cache"
 	"partitura/mcp/internal/client"
 	"partitura/mcp/internal/config"
@@ -54,6 +59,8 @@ func main() {
 		runServerList()
 	case "server-current":
 		runServerCurrent()
+	case "version":
+		runVersion()
 	case "-h", "--help", "help":
 		printHelp()
 	default:
@@ -76,6 +83,7 @@ func printHelp() {
   serve                启动 stdio MCP server（默认）
   server-list          列出已配置的 server
   server-current       显示当前 server
+  version              显示构建版本信息
   help                 显示帮助信息`)
 }
 
@@ -92,8 +100,15 @@ func runLogin(serverURL string) {
 	cfg.Server = serverURL
 	cfg.AllowInsecureTLS = false
 
+	// 创建凭据存储（运行目录下的加密文件存储）
+	store, err := newCredentialStore()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "初始化凭据存储失败: %v\n", err)
+		os.Exit(1)
+	}
+
 	// 创建 REST client（login 前不需要 token）
-	cli := client.NewClient(serverURL, &credAdapter{store: credential.NewWindowsStore()}, cfg.AllowInsecureTLS)
+	cli := client.NewClient(serverURL, &credAdapter{store: store}, cfg.AllowInsecureTLS)
 
 	// 启动 device authorization 流程
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
@@ -147,16 +162,16 @@ func runLogin(serverURL string) {
 				fmt.Fprintf(os.Stderr, "\n授权被拒绝。\n")
 				os.Exit(1)
 			}
-		if err == client.ErrDeviceCodeExpired {
-			fmt.Fprintf(os.Stderr, "\n授权码已过期，请重新登录。\n")
-			os.Exit(1)
-		}
-		if err == client.ErrAuthorizationCompleted {
-			// 授权已被一次性交换完成，另一进程/轮询已领取 token。
-			// 本进程无法再从 server 获取 token，必须重新登录。
-			fmt.Fprintf(os.Stderr, "\n授权已完成（token 已由先前轮询领取），请重新登录。\n")
-			os.Exit(1)
-		}
+			if err == client.ErrDeviceCodeExpired {
+				fmt.Fprintf(os.Stderr, "\n授权码已过期，请重新登录。\n")
+				os.Exit(1)
+			}
+			if err == client.ErrAuthorizationCompleted {
+				// 授权已被一次性交换完成，另一进程/轮询已领取 token。
+				// 本进程无法再从 server 获取 token，必须重新登录。
+				fmt.Fprintf(os.Stderr, "\n授权已完成（token 已由先前轮询领取），请重新登录。\n")
+				os.Exit(1)
+			}
 			fmt.Fprintf(os.Stderr, "\n轮询失败: %v\n", err)
 			os.Exit(1)
 		}
@@ -164,7 +179,7 @@ func runLogin(serverURL string) {
 		if pollResp.Status == "authorized" {
 			fmt.Fprintf(os.Stderr, "\n授权成功！\n")
 
-			// 保存 token 到 OS credential store
+			// 保存 token 到本地加密凭据文件
 			tokens := &client.CredentialTokens{
 				AccessToken:  pollResp.AccessToken,
 				RefreshToken: pollResp.RefreshToken,
@@ -182,7 +197,7 @@ func runLogin(serverURL string) {
 				os.Exit(1)
 			}
 
-			fmt.Fprintf(os.Stderr, "登录成功。token 已保存到操作系统凭据存储。\n")
+			fmt.Fprintf(os.Stderr, "登录成功。token 已保存到本地加密凭据文件。\n")
 			return
 		}
 	}
@@ -194,11 +209,11 @@ func runLogin(serverURL string) {
 // runLogout 清除已保存的凭据。
 // 引入动机：design/02-MCP.md §登录 要求 logout 命令清除凭据并撤销 session。
 // 安全流程：
-//   1. 先尝试调用 server 撤销当前 MCP/device session
-//   2. 无论远端 revoke 是否成功，都删除本地凭据
-//   3. 清除 active workspace 配置
-//   4. 远端 revoke 失败时记录 stderr，但不阻止本地清理
-//   5. 不得输出 token
+//  1. 先尝试调用 server 撤销当前 MCP/device session
+//  2. 无论远端 revoke 是否成功，都删除本地凭据
+//  3. 清除 active workspace 配置
+//  4. 远端 revoke 失败时记录 stderr，但不阻止本地清理
+//  5. 不得输出 token
 func runLogout() {
 	cfg, err := config.Load()
 	if err != nil {
@@ -211,7 +226,11 @@ func runLogout() {
 		os.Exit(1)
 	}
 
-	store := credential.NewWindowsStore()
+	store, err := newCredentialStore()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "初始化凭据存储失败: %v\n", err)
+		os.Exit(1)
+	}
 	credAdapter := &credAdapter{store: store}
 
 	// 创建 REST client 以调用 server revoke
@@ -263,8 +282,12 @@ func runServe() {
 		os.Exit(1)
 	}
 
-	// 创建凭据存储
-	credStore := credential.NewWindowsStore()
+	// 创建凭据存储（运行目录下的加密文件存储）
+	credStore, err := newCredentialStore()
+	if err != nil {
+		slog.Error("初始化凭据存储失败", "error", err)
+		os.Exit(1)
+	}
 
 	// 创建 REST client
 	cli := client.NewClient(cfg.Server, &credAdapter{store: credStore}, cfg.AllowInsecureTLS)
@@ -349,6 +372,30 @@ func runServerCurrent() {
 	fmt.Println(cfg.Server)
 }
 
+// runVersion 打印构建版本信息。
+// 引入动机：便于确认部署的 knowledge-mcp 二进制版本、提交号和构建时间。
+// 版本由构建时的 -ldflags 注入（见 internal/buildinfo）。
+func runVersion() {
+	fmt.Printf("knowledge-mcp %s\n", buildinfo.Version)
+	fmt.Printf("commit: %s\n", buildinfo.Commit)
+	fmt.Printf("date: %s\n", buildinfo.Date)
+}
+
+// newCredentialStore 以运行目录（当前工作目录）为根创建加密文件凭据存储。
+// 引入动机：三平台统一使用加密文件存储，凭据目录与配置同为运行目录。
+// os.Getwd 或 credential.NewStore 失败必须 fail-fast，不得忽略错误或退化到其他目录。
+func newCredentialStore() (*credential.FileStore, error) {
+	dir, err := os.Getwd()
+	if err != nil {
+		return nil, fmt.Errorf("获取当前工作目录: %w", err)
+	}
+	store, err := credential.NewStore(dir)
+	if err != nil {
+		return nil, fmt.Errorf("创建凭据存储: %w", err)
+	}
+	return store, nil
+}
+
 // generateDeviceName 生成稳定且非敏感的 device name。
 // 引入动机：MCP login 不要求用户输入设备名。
 // 格式：mcp-{os}-{sha256(hostname)前8位}。
@@ -388,8 +435,9 @@ func openBrowser(url string) error {
 // credAdapter 将 credential.Store 适配为 client.CredentialStore。
 // 引入动机：client 包定义了独立的 CredentialStore 接口，
 // 需要适配器桥接 credential.Store 到 client.CredentialStore。
+// store 使用 credential.Store 接口，使适配器不依赖具体实现（加密文件存储或测试替身）。
 type credAdapter struct {
-	store *credential.WindowsStore
+	store credential.Store
 }
 
 func (a *credAdapter) Load(serverURL string) (*client.CredentialTokens, error) {

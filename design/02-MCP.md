@@ -18,19 +18,64 @@ Knowledge Server
 
 服务器不直接暴露给 Agent 作为远程 MCP。
 
+## 分发
+
+6 个目标平台：windows / linux / darwin × amd64 / arm64。
+
+`scripts/build-mcp.sh` 是唯一构建逻辑，本地与 CI 共用。
+
+产物：`knowledge-mcp_<version>_<os>_<arch>.zip`（windows）/ `.tar.gz`（其余），附 `checksums.txt` 汇总校验和。
+
+CI `.github/workflows/mcp-release.yml`：tag `v*.*.*` 时将全部平台产物发布为 GitHub Release assets；其余触发只产出 Actions artifact。
+
+版本经 `-ldflags` 注入 `mcp/internal/buildinfo`。
+
 ## 登录
 
 提供：
 
-`knowledge-mcp login <server>`
+`knowledge-mcp login <server-url>`
 
 推荐使用浏览器登录 / device authorization 风格。
 
 登录后：
 - access token + refresh token
-- 保存到 OS Credential Store
+- 保存到本地加密凭据文件
 
-禁止把 token 明文写进 MCP 配置文件。
+凭据与配置位置（三平台统一）：
+
+- 凭据文件：`<cwd>/.knowledge-mcp/.credentials`
+- 配置 TOML：`<cwd>/.knowledge-mcp/config.toml`
+- `<cwd>` 是运行目录，即进程的当前工作目录
+
+凭据文件格式：
+
+- JSON 信封 `{"v":1,"nonce":"<base64>","data":"<base64>"}`
+- 明文是 `map[serverURL]Tokens` 的 JSON
+- 加密算法 AES-256-GCM（Go 标准库）
+
+权限：
+
+- 目录 `0700`，文件 `0600`
+- Windows 不体现 POSIX 权限位，实际由 ACL 决定
+
+写入采用「临时文件 + rename」原子覆盖。
+
+安全性质（不得淡化）：
+
+- 加密密钥是**源码中硬编码**的 32 字节固定常量
+- 固定密钥只提供**混淆级**保护：任何拿到二进制的人都能逆向提取该密钥
+- 因此它**不等同于强加密**，也无法抵御本地有权用户读取运行目录
+- 它提升的是「文件被误分享 / 目录被随意翻看」的门槛，不是强安全边界
+
+token 明文不写入配置文件。
+
+多实例：
+
+- MCP 是纯 stdio 协议，没有网络端口
+- 隔离靠不同的运行目录：每个项目目录各自有 `.knowledge-mcp/`，配置与凭据互不干扰
+- 所以 `login` 必须在目标项目目录中执行，凭据才会写到该目录；否则 Agent 从别的目录启动 `serve` 时找不到凭据
+- 建议把 `.knowledge-mcp/`（或 `.credentials`）加入项目 `.gitignore`
 
 支持：
 - logout
@@ -209,6 +254,14 @@ MCP 可尝试一次安全 rebase：
 
 ## MCP 配置
 
+路径：
+
+`<cwd>/.knowledge-mcp/config.toml`
+
+`<cwd>` 是运行目录，即进程的当前工作目录。
+
+配置与凭据同放在该目录下，因此不同运行目录天然形成互不干扰的实例。
+
 示例：
 
 ```toml
@@ -220,3 +273,5 @@ search_result_limit = 10
 ```
 
 认证凭证不放在这里。
+
+凭证保存在同目录的 `.credentials` 加密文件中（见 §登录）。

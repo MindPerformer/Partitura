@@ -82,6 +82,75 @@ func TestLoadFromPathNonexistent(t *testing.T) {
 	}
 }
 
+// TestConfigPathBasedOnCWD 验证 configPath 基于当前工作目录，而非用户主目录。
+// 引入动机：三平台统一改为「配置与凭据都放在运行目录」，必须防止退回 UserHomeDir。
+func TestConfigPathBasedOnCWD(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("获取当前工作目录失败: %v", err)
+	}
+
+	path, err := configPath()
+	if err != nil {
+		t.Fatalf("configPath 失败: %v", err)
+	}
+
+	want := filepath.Join(cwd, ".knowledge-mcp", "config.toml")
+	if path != want {
+		t.Errorf("configPath() = %s, 期望 %s", path, want)
+	}
+
+	// 额外断言路径确实位于切换后的运行目录之下（不依赖路径字符串形式）。
+	rel, err := filepath.Rel(dir, path)
+	if err != nil {
+		t.Fatalf("计算相对路径失败: %v", err)
+	}
+	if rel != filepath.Join(".knowledge-mcp", "config.toml") {
+		t.Errorf("configPath 未落在运行目录下: rel = %s", rel)
+	}
+
+	// 明确排除旧的用户主目录方案。
+	home, err := os.UserHomeDir()
+	if err == nil && home != "" {
+		old := filepath.Join(home, ".knowledge-mcp", "config.toml")
+		if path == old {
+			t.Errorf("configPath 仍使用用户主目录路径: %s", old)
+		}
+	}
+}
+
+// TestSaveLoadDefaultPathUsesCWD 在运行目录下真实保存并加载配置。
+// 引入动机：验证 Save/Load 的默认路径确实指向 cwd/.knowledge-mcp/config.toml。
+func TestSaveLoadDefaultPathUsesCWD(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	cfg := DefaultConfig()
+	cfg.Server = "https://knowledge.example.com"
+
+	if err := Save(&cfg); err != nil {
+		t.Fatalf("Save 失败: %v", err)
+	}
+
+	path, err := configPath()
+	if err != nil {
+		t.Fatalf("configPath 失败: %v", err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("默认路径下未生成配置文件 %s: %v", path, err)
+	}
+
+	loaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load 失败: %v", err)
+	}
+	if loaded.Server != "https://knowledge.example.com" {
+		t.Errorf("Server = %s, 期望 https://knowledge.example.com", loaded.Server)
+	}
+}
+
 func TestLoadFromPathValid(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

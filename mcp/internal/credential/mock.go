@@ -10,7 +10,7 @@
 package credential
 
 // MockStore 是测试用的内存凭据存储替身。
-// 引入动机：测试需要安全替身而非真实 OS credential store。
+// 引入动机：测试需要内存替身而非真实加密文件存储。
 type MockStore struct {
 	data map[string]*Tokens
 	err  error

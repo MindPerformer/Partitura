@@ -1,8 +1,17 @@
-.PHONY: build test test-integration migrate-up migrate-down migrate-status clean e2e e2e-setup e2e-down
+.PHONY: build test test-integration migrate-up migrate-down migrate-status clean e2e e2e-setup e2e-down mcp-build mcp-cross mcp-test mcp-vet
 
 # Go 相关变量
 GO        := go
 SERVER_DIR := server
+MCP_DIR   := mcp
+MCP_DIST  := dist
+
+# MCP 构建元信息（经 ldflags 注入 partitura/mcp/internal/buildinfo）
+MCP_VERSION ?= dev
+MCP_COMMIT  := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
+MCP_DATE    := $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+MCP_LDFLAGS := -s -w -X partitura/mcp/internal/buildinfo.Version=$(MCP_VERSION) -X partitura/mcp/internal/buildinfo.Commit=$(MCP_COMMIT) -X partitura/mcp/internal/buildinfo.Date=$(MCP_DATE)
+MCP_EXE     := $(if $(findstring windows,$(shell $(GO) env GOOS)),.exe,)
 
 # 构建
 build:
@@ -49,3 +58,24 @@ e2e-setup:
 # 停止 E2E 容器（默认保留，仅显式停止）
 e2e-down:
 	bash scripts/e2e/run-e2e.sh --down
+
+# ==== MCP（mcp/ 独立 Go module：knowledge-mcp）====
+# 跨平台打包的构建逻辑统一收敛在 scripts/build-mcp.sh，本地与 CI 共用同一真相源；
+# 如需 MCP_VERSION 之外的注入值，可覆盖变量：make mcp-build MCP_VERSION=v1.2.3
+
+# 构建当前平台二进制到 dist/（含 ldflags 版本注入）
+mcp-build:
+	mkdir -p $(MCP_DIST)
+	cd $(MCP_DIR) && CGO_ENABLED=0 $(GO) build -trimpath -ldflags "$(MCP_LDFLAGS)" -o ../$(MCP_DIST)/knowledge-mcp$(MCP_EXE) ./cmd/knowledge-mcp
+
+# 构建全部 6 个平台（windows/linux/darwin × amd64/arm64）并打包 + 生成校验和
+mcp-cross:
+	bash scripts/build-mcp.sh "$(MCP_VERSION)" $(MCP_DIST)
+
+# MCP 单元测试
+mcp-test:
+	cd $(MCP_DIR) && $(GO) test ./...
+
+# MCP 静态检查
+mcp-vet:
+	cd $(MCP_DIR) && $(GO) vet ./...

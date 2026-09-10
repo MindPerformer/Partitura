@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"partitura/mcp/internal/buildinfo"
 )
 
 // runServerWithInput 使用给定输入运行 server 并捕获 stdout 输出。
@@ -87,6 +89,11 @@ func TestInitialize(t *testing.T) {
 	}
 	if serverInfo["name"] != "knowledge-mcp" {
 		t.Errorf("serverInfo.name = %v", serverInfo["name"])
+	}
+	// serverInfo.version 必须来自 buildinfo，而非硬编码版本字符串。
+	// 引入动机：构建时通过 ldflags 注入版本，握手必须如实上报。
+	if serverInfo["version"] != buildinfo.Version {
+		t.Errorf("serverInfo.version = %v, 期望 buildinfo.Version = %v", serverInfo["version"], buildinfo.Version)
 	}
 }
 

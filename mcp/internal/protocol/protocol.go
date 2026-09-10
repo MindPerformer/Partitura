@@ -23,6 +23,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"partitura/mcp/internal/buildinfo"
 )
 
 // JSONRPC 请求和响应类型
@@ -274,7 +276,7 @@ func (s *Server) handleInitialize(req *Request) *Response {
 		ProtocolVersion: "2024-11-05",
 		ServerInfo: ServerInfo{
 			Name:    "knowledge-mcp",
-			Version: "1.0.0",
+			Version: buildinfo.Version,
 		},
 		Capabilities: map[string]interface{}{
 			"tools": map[string]interface{}{

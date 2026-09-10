@@ -26,6 +26,14 @@ mcp/knowledge-mcp.exe
 coverage.*
 *.coverprofile
 
+# --- MCP 跨平台构建产物（scripts/build-mcp.sh / make mcp-build 的输出目录） ---
+dist/
+
+# --- MCP 运行目录数据（绝不可进入版本控制） ---
+# knowledge-mcp 在运行目录（cwd）下生成 .knowledge-mcp/，内含加密凭据 .credentials 与 config.toml。
+# 若在仓库根执行 login/serve，凭据文件会落在仓库内，必须忽略。
+.knowledge-mcp/
+
 # --- Node.js / Nuxt 依赖和构建输出 ---
 node_modules/
 .nuxt/

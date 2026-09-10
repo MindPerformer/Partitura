@@ -83,7 +83,7 @@
 - Go MCP binary
 - stdio MCP
 - device/browser login
-- OS credential storage
+- encrypted credential file storage
 - in-memory 30m cache
 - switch_workspace
 - bootstrap

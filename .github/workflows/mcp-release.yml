@@ -1,0 +1,155 @@
+name: Build and release MCP binaries
+
+on:
+  push:
+    branches:
+      - master
+    tags:
+      - 'v*.*.*'
+  pull_request:
+    branches:
+      - master
+  workflow_dispatch:
+
+# Release 上传资产需要 contents: write
+permissions:
+  contents: write
+
+jobs:
+  # 三个平台各自跑一遍 vet/test，保证 mcp 模块在真实目标平台上通过
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: true
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: mcp/go.mod
+          cache-dependency-path: mcp/go.sum
+
+      # GOTMPDIR 指向 runner 临时目录下的独立子目录：
+      # Windows runner 上 Defender 会实时扫描 %TEMP%，导致 go test 生成的
+      # protocol.test.exe 出现 "Access is denied"（本机曾复现）。
+      # 只改变 go 工作目录位置，不跳过、不削弱任何测试。
+      # 注意：go 不会自动创建 GOTMPDIR（本机 go1.26.4 实测：目录缺失直接
+      # 报 "creating work dir: ... cannot find the file specified"），必须显式创建。
+      - name: Prepare Go temp dir
+        shell: bash
+        run: mkdir -p "${RUNNER_TEMP}/gotmp"
+
+      - name: go vet
+        working-directory: mcp
+        env:
+          GOTMPDIR: ${{ runner.temp }}/gotmp
+        run: go vet ./...
+
+      - name: go test
+        working-directory: mcp
+        env:
+          GOTMPDIR: ${{ runner.temp }}/gotmp
+        run: go test ./...
+
+  # 6 个平台各自打一个包，各自上传独立 artifact（upload-artifact v4 不允许同名覆盖）
+  build:
+    name: Build ${{ matrix.goos }}/${{ matrix.goarch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: mcp/go.mod
+          cache-dependency-path: mcp/go.sum
+
+      # tag 事件用 tag 名（如 v1.2.3），其余用 dev-<short sha>
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "value=${GITHUB_REF_NAME}" >>"${GITHUB_OUTPUT}"
+          else
+            echo "value=dev-${GITHUB_SHA:0:7}" >>"${GITHUB_OUTPUT}"
+          fi
+
+      - name: Build ${{ matrix.goos }}/${{ matrix.goarch }} package
+        shell: bash
+        run: bash scripts/build-mcp.sh "${{ steps.version.outputs.value }}" dist "${{ matrix.goos }}/${{ matrix.goarch }}"
+
+      - name: Upload ${{ matrix.goos }}/${{ matrix.goarch }} artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: knowledge-mcp-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # 仅 tag 触发：汇总所有平台的包与校验和，创建 Release 并上传资产
+  release:
+    name: Publish release assets
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # 先按各平台自带的 .sha256 校验，再生成并复验汇总 checksums.txt
+      - name: Verify and aggregate checksums
+        working-directory: dist
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -l
+          for f in *.sha256; do
+            echo "== verify ${f}"
+            sha256sum -c "${f}"
+          done
+          cat *.sha256 | sort -k2 >checksums.txt
+          echo "== verify checksums.txt"
+          sha256sum -c checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.zip
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/checksums.txt
+          fail_on_unmatched_files: true
