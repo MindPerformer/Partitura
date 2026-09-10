@@ -26,7 +26,7 @@ import type {
 } from '~/types/api'
 
 definePageMeta({
-  middleware: ['auth']
+  middleware: ['auth', 'admin']
 })
 
 const { t } = useI18n()

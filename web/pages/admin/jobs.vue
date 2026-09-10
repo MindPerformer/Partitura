@@ -7,11 +7,12 @@
 import type { ApiError } from '~/types/api'
 
 definePageMeta({
-  middleware: ['auth']
+  middleware: ['auth', 'admin']
 })
 
 const { t } = useI18n()
 const { isSystemAdmin } = useAuth()
+const { jobStatusLabel, jobTypeLabel } = useEnumLabels()
 const { formatDate: formatDateUtil } = useFormatDate()
 
 // 修复说明：列表状态（jobs/total/loading/error）改由 useIndexJobs 提供，
@@ -125,8 +126,8 @@ useHead({ title: () => t('admin.indexJobs') + ' · ' + t('common.appName') })
             >
               <div class="flex-1">
                 <div class="flex items-center gap-2 mb-1">
-                  <UBadge :color="statusColors[job.status] ?? 'neutral'" variant="subtle" size="sm">{{ job.status }}</UBadge>
-                  <span class="text-sm font-medium">{{ job.type }}</span>
+                  <UBadge :color="statusColors[job.status] ?? 'neutral'" variant="subtle" size="sm">{{ jobStatusLabel(job.status) }}</UBadge>
+                  <span class="text-sm font-medium">{{ jobTypeLabel(job.type) }}</span>
                 </div>
                 <p class="text-xs text-muted">ID: {{ shortId(job.id) }}... · {{ t('admin.attempts') }}: {{ job.attempts }}/{{ job.max_attempts }}</p>
                 <p class="text-xs text-dimmed">{{ formatDate(job.updated_at) }}</p>

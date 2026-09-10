@@ -8,11 +8,12 @@ import type { SystemSetting, ApiError, RuntimeStatusResponse } from '~/types/api
 
 
 definePageMeta({
-  middleware: ['auth']
+  middleware: ['auth', 'admin']
 })
 
 const { t } = useI18n()
 const { isSystemAdmin } = useAuth()
+const { settingTypeLabel } = useEnumLabels()
 
 const settings = ref<SystemSetting[]>([])
 const loading = ref(false)
@@ -139,7 +140,7 @@ useHead({ title: () => t('admin.systemConfig') + ' · ' + t('common.appName') })
                   <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2 mb-1">
                       <span class="font-medium text-sm text-highlighted">{{ setting.key }}</span>
-                      <UBadge size="sm" variant="subtle">{{ setting.type }}</UBadge>
+                      <UBadge size="sm" variant="subtle">{{ settingTypeLabel(setting.type) }}</UBadge>
                       <UBadge v-if="setting.restart_required" color="warning" size="sm" variant="subtle">
                         {{ t('admin.restartRequired') }}
                       </UBadge>

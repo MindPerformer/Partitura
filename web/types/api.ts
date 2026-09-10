@@ -24,6 +24,27 @@ export interface LoginResponse {
   expires_at: string
 }
 
+/** GET /api/auth/me 响应 — 当前用户非敏感资料。 */
+export interface CurrentUserResponse {
+  id: string
+  username: string
+  email: string
+  system_role: string
+  workspace_create_perm: boolean
+}
+
+/** PUT /api/auth/me/email 请求。 */
+export interface UpdateEmailRequest {
+  current_password: string
+  email: string
+}
+
+/** PUT /api/auth/me/password 请求。 */
+export interface UpdatePasswordRequest {
+  current_password: string
+  new_password: string
+}
+
 /** Device authorize 响应 — POST /api/auth/device/authorize */
 export interface DeviceAuthorizeResponse {
   access_token: string
@@ -139,8 +160,13 @@ export interface ListMembersResponse {
 }
 
 export interface AddMemberRequest {
-  user_id: string
+  username: string
   role: string
+}
+
+/** GET /api/workspaces/{id}/members/candidates 响应。 */
+export interface MemberCandidatesResponse {
+  users: Member[]
 }
 
 export interface UpdateMemberRoleRequest {

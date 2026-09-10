@@ -75,6 +75,32 @@ func (m *LocalAuthMockRepository) GetUserByID(ctx context.Context, id string) (*
 	return nil, sql.ErrNoRows
 }
 
+// UpdateUserEmail 实现 auth.Repository 接口。
+func (m *LocalAuthMockRepository) UpdateUserEmail(ctx context.Context, userID, email string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.Email = email
+			return nil
+		}
+	}
+	return sql.ErrNoRows
+}
+
+// UpdateUserPasswordHash 实现 auth.Repository 接口。
+func (m *LocalAuthMockRepository) UpdateUserPasswordHash(ctx context.Context, userID, passwordHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, u := range m.users {
+		if u.ID == userID {
+			u.PasswordHash = passwordHash
+			return nil
+		}
+	}
+	return sql.ErrNoRows
+}
+
 // CreateSession 实现 auth.Repository 接口。
 func (m *LocalAuthMockRepository) CreateSession(ctx context.Context, userID, tokenHash, csrfTokenHash string, expiresAt time.Time) (string, error) {
 	m.mu.Lock()

@@ -111,7 +111,7 @@ func TestAddMemberThenAccess(t *testing.T) {
 	}
 
 	// 添加 viewer 为成员
-	addBody := `{"user_id":"viewer-001","role":"viewer"}`
+	addBody := `{"username":"vieweruser","role":"viewer"}`
 	addReq := authedRequest(http.MethodPost, "/api/workspaces/ws-1/members", creatorSession, creatorCSRF, addBody)
 	addRR := httptest.NewRecorder()
 	mux.ServeHTTP(addRR, addReq)

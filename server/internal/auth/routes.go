@@ -19,6 +19,9 @@ import (
 //   - POST /api/auth/refresh          — 公开（需 refresh token）
 //   - POST /api/auth/revoke           — 需认证 + CSRF
 //   - GET  /api/auth/device/sessions  — 需认证，列出当前用户设备会话
+//   - GET  /api/auth/me               — 需认证，读取当前用户资料
+//   - PUT  /api/auth/me/email         — 需认证 + CSRF，修改邮箱
+//   - PUT  /api/auth/me/password      — 需认证 + CSRF，修改密码
 //
 // middleware 链（请求进入顺序）：
 //   - AuthMiddleware：解析 cookie session 或 bearer token，设置 Identity
@@ -52,6 +55,10 @@ func RegisterRoutes(mux *http.ServeMux, handler *Handler, repo Repository, cfg A
 			handler.DeviceAuthorize(w, r)
 		case "/api/auth/revoke":
 			handler.Revoke(w, r)
+		case "/api/auth/me/email":
+			handler.UpdateEmail(w, r)
+		case "/api/auth/me/password":
+			handler.UpdatePassword(w, r)
 		default:
 			writeError(w, http.StatusNotFound, "未找到路由")
 		}
@@ -60,6 +67,13 @@ func RegisterRoutes(mux *http.ServeMux, handler *Handler, repo Repository, cfg A
 	mux.Handle("POST /api/auth/logout", protected)
 	mux.Handle("POST /api/auth/device/authorize", protected)
 	mux.Handle("POST /api/auth/revoke", protected)
+	mux.Handle("PUT /api/auth/me/email", protected)
+	mux.Handle("PUT /api/auth/me/password", protected)
+
+	// 当前用户资料只需要认证，不涉及状态变更，因此不需要 CSRF。
+	mux.Handle("GET /api/auth/me",
+		AuthMiddleware(repo, cfg)(RequireAuth(http.HandlerFunc(handler.Me))),
+	)
 
 	// 设备会话列表只需要认证，不涉及状态变更，因此不需要 CSRF。
 	mux.Handle("GET /api/auth/device/sessions",

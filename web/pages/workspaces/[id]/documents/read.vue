@@ -17,6 +17,7 @@ const workspaceId = computed(() => route.params.id as string)
 const docPath = computed(() => route.query.path as string)
 
 const { canEdit, canArchive } = useWorkspaceContext(workspaceId)
+const { documentTypeLabel } = useEnumLabels()
 const { formatDate: formatDateUtil } = useFormatDate()
 
 // 文档内容
@@ -110,16 +111,16 @@ useHead({ title: () => (doc.value?.title || t('document.documents')) + ' · ' + 
 
 <template>
   <WorkspaceLayout>
-    <div class="flex h-full overflow-hidden">
+    <div class="flex min-h-0 min-w-0 h-full overflow-hidden">
       <!-- Main content -->
-      <div class="flex-1 overflow-y-auto">
+      <div class="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
         <div v-if="loading" class="flex justify-center py-12">
           <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
         </div>
 
         <ErrorDisplay v-else-if="error" :message="error" />
 
-        <div v-else-if="doc" class="max-w-4xl mx-auto px-6 py-8">
+        <div v-else-if="doc" class="mx-auto min-w-0 max-w-4xl px-6 py-8">
           <!-- Document header -->
           <div class="mb-6 pb-4 border-b border-default">
             <div class="flex items-start justify-between">
@@ -164,7 +165,7 @@ useHead({ title: () => (doc.value?.title || t('document.documents')) + ' · ' + 
               <span>·</span>
               <span>{{ t('document.updated') }} {{ formatDate(doc.updated_at) }}</span>
               <UBadge v-if="doc.is_special" variant="subtle" size="sm" color="info">{{ t('document.special') }}</UBadge>
-              <UBadge v-if="doc.type" variant="subtle" size="sm">{{ doc.type }}</UBadge>
+              <UBadge v-if="doc.type" variant="subtle" size="sm">{{ documentTypeLabel(doc.type) }}</UBadge>
             </div>
           </div>
 
@@ -174,7 +175,7 @@ useHead({ title: () => (doc.value?.title || t('document.documents')) + ' · ' + 
       </div>
 
       <!-- Desktop right panel -->
-      <aside v-if="doc" class="hidden w-64 flex-shrink-0 overflow-hidden border-l border-default bg-default lg:block">
+      <aside v-if="doc" class="hidden h-full w-64 min-h-0 flex-shrink-0 overflow-hidden border-l border-default bg-default lg:block">
         <DocumentSidePanel
           :doc="doc"
           :headings="headings"

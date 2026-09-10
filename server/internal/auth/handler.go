@@ -10,6 +10,9 @@
 //   - POST /api/auth/device/authorize — 需认证 + CSRF，创建 device session
 //   - POST /api/auth/refresh        — 公开（需 refresh token），刷新 access token
 //   - POST /api/auth/revoke         — 需认证 + CSRF，撤销指定 device session
+//   - GET  /api/auth/me              — 需认证，读取当前用户资料
+//   - PUT  /api/auth/me/email        — 需认证 + CSRF，修改当前用户邮箱
+//   - PUT  /api/auth/me/password     — 需认证 + CSRF，修改当前用户密码
 package auth
 
 import (
@@ -228,6 +231,129 @@ func (h *Handler) DeviceAuthorize(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// currentUserResponse 是当前用户资料响应，不包含密码哈希、session 或 token。
+type currentUserResponse struct {
+	ID                  string `json:"id"`
+	Username            string `json:"username"`
+	Email               string `json:"email"`
+	SystemRole          string `json:"system_role"`
+	WorkspaceCreatePerm bool   `json:"workspace_create_perm"`
+}
+
+func toCurrentUserResponse(user *User) currentUserResponse {
+	return currentUserResponse{
+		ID: user.ID, Username: user.Username, Email: user.Email,
+		SystemRole: user.SystemRole, WorkspaceCreatePerm: user.WorkspaceCreatePerm,
+	}
+}
+
+// accountEmailRequest 是修改邮箱请求体。
+type accountEmailRequest struct {
+	CurrentPassword string `json:"current_password"`
+	Email           string `json:"email"`
+}
+
+// accountPasswordRequest 是修改密码请求体。
+type accountPasswordRequest struct {
+	CurrentPassword string `json:"current_password"`
+	NewPassword     string `json:"new_password"`
+}
+
+// Me 处理 GET /api/auth/me，返回当前用户的非敏感资料。
+func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
+	id := IdentityFromContext(r.Context())
+	if id == nil {
+		writeError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+	user, err := GetCurrentUser(r.Context(), h.repo, id.UserID)
+	if err != nil {
+		slog.Error("读取当前用户资料失败", "error", err, "user_id", id.UserID)
+		writeError(w, http.StatusInternalServerError, "内部错误")
+		return
+	}
+	writeJSON(w, http.StatusOK, toCurrentUserResponse(user))
+}
+
+// UpdateEmail 处理 PUT /api/auth/me/email。
+func (h *Handler) UpdateEmail(w http.ResponseWriter, r *http.Request) {
+	id := IdentityFromContext(r.Context())
+	if id == nil {
+		writeError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+	var req accountEmailRequest
+	if err := decodeJSONStrict(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体格式错误")
+		return
+	}
+	if req.CurrentPassword == "" {
+		writeError(w, http.StatusBadRequest, "current_password 不能为空")
+		return
+	}
+	user, err := UpdateEmail(r.Context(), h.repo, h.cfg, id.UserID, req.CurrentPassword, req.Email)
+	if err != nil {
+		switch {
+		case errors.Is(err, ErrCurrentPasswordInvalid):
+			writeError(w, http.StatusUnauthorized, "当前密码错误")
+		case errors.Is(err, ErrEmailInvalid):
+			writeError(w, http.StatusBadRequest, "邮箱格式不正确")
+		case errors.Is(err, ErrEmailAlreadyExists):
+			writeError(w, http.StatusConflict, "邮箱已存在")
+		default:
+			slog.Error("修改用户邮箱失败", "error", err, "user_id", id.UserID)
+			writeError(w, http.StatusInternalServerError, "内部错误")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, toCurrentUserResponse(user))
+}
+
+// UpdatePassword 处理 PUT /api/auth/me/password。
+func (h *Handler) UpdatePassword(w http.ResponseWriter, r *http.Request) {
+	id := IdentityFromContext(r.Context())
+	if id == nil {
+		writeError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+	var req accountPasswordRequest
+	if err := decodeJSONStrict(r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "请求体格式错误")
+		return
+	}
+	if req.CurrentPassword == "" {
+		writeError(w, http.StatusBadRequest, "current_password 不能为空")
+		return
+	}
+	if err := UpdatePassword(r.Context(), h.repo, h.cfg, id.UserID, req.CurrentPassword, req.NewPassword); err != nil {
+		switch {
+		case errors.Is(err, ErrCurrentPasswordInvalid):
+			writeError(w, http.StatusUnauthorized, "当前密码错误")
+		case errors.Is(err, ErrNewPasswordTooShort):
+			writeError(w, http.StatusBadRequest, "新密码长度至少为 12 个字符")
+		default:
+			slog.Error("修改用户密码失败", "error", err, "user_id", id.UserID)
+			writeError(w, http.StatusInternalServerError, "内部错误")
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// decodeJSONStrict 严格解析账户设置请求体，拒绝未知字段和多余 JSON 值。
+func decodeJSONStrict(r *http.Request, dst interface{}) error {
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(dst); err != nil {
+		return err
+	}
+	var extra json.RawMessage
+	if err := decoder.Decode(&extra); err != io.EOF {
+		return errors.New("请求体包含多个 JSON 值")
+	}
+	return nil
 }
 
 // refreshRequest 是 token 刷新端点的请求体。

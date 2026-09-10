@@ -55,6 +55,7 @@ web/.yarn/install-state.gz
 *.swp
 *.swo
 *~
+.VSCodeCounter
 
 # --- 操作系统生成文件 ---
 .DS_Store

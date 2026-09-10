@@ -14,6 +14,7 @@ const route = useRoute()
 const workspaceId = computed(() => route.params.id as string)
 
 const { workspace, loading, error, canEdit, currentMemberRole } = useWorkspaceContext(workspaceId)
+const { workspaceRoleLabel, workspaceStatusLabel } = useEnumLabels()
 const { formatDate: formatDateUtil } = useFormatDate()
 const {
   projectDoc,
@@ -45,8 +46,8 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
               <p v-if="workspace.description" class="mt-2 max-w-2xl text-sm leading-6 text-muted">{{ workspace.description }}</p>
             </div>
             <div class="flex shrink-0 flex-wrap items-center gap-2">
-              <UBadge variant="subtle" size="sm">{{ workspace.status }}</UBadge>
-              <UBadge variant="subtle" size="sm" color="neutral">{{ t('workspace.role') }}: {{ currentMemberRole || 'N/A' }}</UBadge>
+              <UBadge variant="subtle" size="sm">{{ workspaceStatusLabel(workspace.status) }}</UBadge>
+              <UBadge variant="subtle" size="sm" color="neutral">{{ t('workspace.role') }}: {{ workspaceRoleLabel(currentMemberRole) }}</UBadge>
             </div>
           </div>
         </section>
@@ -133,7 +134,7 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
         </section>
 
         <!-- Recent revisions and PROJECT.md -->
-        <div class="grid gap-6 lg:grid-cols-3">
+        <div class="grid min-w-0 gap-6 lg:grid-cols-3">
           <UCard class="lg:col-span-1">
             <template #header>
               <div class="flex items-center gap-2">
@@ -158,11 +159,11 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
             <p v-else class="py-6 text-center text-sm text-muted">{{ t('workspace.noRecentRevisions') }}</p>
           </UCard>
 
-          <div class="lg:col-span-2">
+          <div class="min-w-0 lg:col-span-2">
             <div v-if="projectLoading" class="flex min-h-48 items-center justify-center rounded-xl border border-default bg-default">
               <UIcon name="i-lucide-loader-circle" class="h-6 w-6 animate-spin text-muted" />
             </div>
-            <UCard v-else-if="projectDoc">
+            <UCard v-else-if="projectDoc" class="min-w-0 overflow-hidden">
               <template #header>
                 <div class="flex items-center justify-between gap-3">
                   <div class="flex min-w-0 items-center gap-2">

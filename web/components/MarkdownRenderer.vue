@@ -31,7 +31,8 @@ watch(rendered, (value) => {
 @reference "~/assets/css/main.css";
 
 .markdown-body {
-  @apply text-default leading-7;
+  @apply min-w-0 text-default leading-7;
+  overflow-wrap: anywhere;
 }
 
 .markdown-body :where(h1, h2, h3, h4, h5, h6) {
@@ -98,13 +99,24 @@ watch(rendered, (value) => {
   @apply text-primary underline hover:text-primary/80;
 }
 
+.markdown-table-scroll {
+  @apply my-4 max-w-full overflow-x-auto;
+}
+
 .markdown-body table {
-  @apply w-full my-4 border-collapse;
+  @apply w-full border-collapse;
+  min-width: 100%;
+  width: max-content;
+  table-layout: auto;
 }
 
 .markdown-body th,
 .markdown-body td {
   @apply border border-default px-3 py-2 text-left;
+  min-width: 0;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
 }
 
 .markdown-body th {

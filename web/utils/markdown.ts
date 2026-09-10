@@ -279,8 +279,11 @@ export function renderMarkdownWithOutline(markdown: string): { html: string; hea
   })
 
   const rawHtml = parser.parse(markdown, { async: false }) as string
+  const htmlWithScrollableTables = rawHtml
+    .replaceAll('<table>', '<div class="markdown-table-scroll"><table>')
+    .replaceAll('</table>', '</table></div>')
   return {
-    html: sanitizeMarkdownHtml(rawHtml),
+    html: sanitizeMarkdownHtml(htmlWithScrollableTables),
     headings
   }
 }

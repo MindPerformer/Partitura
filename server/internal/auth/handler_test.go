@@ -787,3 +787,53 @@ func TestValidateAccessToken_Expired(t *testing.T) {
 		t.Errorf("过期 access token 应返回 ErrDeviceSessionExpired，实际: %v", err)
 	}
 }
+
+// TestAccountHandlers 验证当前用户资料读取、邮箱更新和密码更新均绑定当前身份。
+func TestAccountHandlers(t *testing.T) {
+	handler, repo, _ := setupHandler(t)
+	ctx := WithIdentity(httptest.NewRequest(http.MethodGet, "/api/auth/me", nil).Context(), &Identity{UserID: "user-001"})
+
+	meReq := httptest.NewRequest(http.MethodGet, "/api/auth/me", nil).WithContext(ctx)
+	meRR := httptest.NewRecorder()
+	handler.Me(meRR, meReq)
+	if meRR.Code != http.StatusOK {
+		t.Fatalf("读取当前用户应返回 200，实际 %d，body: %s", meRR.Code, meRR.Body.String())
+	}
+	var me currentUserResponse
+	if err := json.Unmarshal(meRR.Body.Bytes(), &me); err != nil {
+		t.Fatalf("解析当前用户响应失败: %v", err)
+	}
+	if me.Email != "test@example.com" || me.Username != "testuser" {
+		t.Fatalf("当前用户资料不匹配: %+v", me)
+	}
+
+	emailReq := httptest.NewRequest(http.MethodPut, "/api/auth/me/email", strings.NewReader(`{"current_password":"testpass123","email":"updated@example.com"}`)).WithContext(ctx)
+	emailReq.Header.Set("Content-Type", "application/json")
+	emailRR := httptest.NewRecorder()
+	handler.UpdateEmail(emailRR, emailReq)
+	if emailRR.Code != http.StatusOK {
+		t.Fatalf("修改邮箱应返回 200，实际 %d，body: %s", emailRR.Code, emailRR.Body.String())
+	}
+
+	passwordReq := httptest.NewRequest(http.MethodPut, "/api/auth/me/password", strings.NewReader(`{"current_password":"testpass123","new_password":"new-password-123"}`)).WithContext(ctx)
+	passwordReq.Header.Set("Content-Type", "application/json")
+	passwordRR := httptest.NewRecorder()
+	handler.UpdatePassword(passwordRR, passwordReq)
+	if passwordRR.Code != http.StatusOK {
+		t.Fatalf("修改密码应返回 200，实际 %d，body: %s", passwordRR.Code, passwordRR.Body.String())
+	}
+
+	updated, err := repo.GetUserByID(nil, "user-001")
+	if err != nil {
+		t.Fatalf("读取更新后用户失败: %v", err)
+	}
+	if updated.Email != "updated@example.com" {
+		t.Errorf("邮箱未更新，实际 %q", updated.Email)
+	}
+	if err := VerifyPassword(updated.PasswordHash, "new-password-123"); err != nil {
+		t.Errorf("新密码校验失败: %v", err)
+	}
+	if err := VerifyPassword(updated.PasswordHash, "testpass123"); err == nil {
+		t.Error("旧密码不应继续有效")
+	}
+}

@@ -93,6 +93,14 @@ type Repository interface {
 	// GetUserByID 根据 ID 查询用户。用户不存在返回 sql.ErrNoRows。
 	GetUserByID(ctx context.Context, id string) (*User, error)
 
+	// UpdateUserEmail 更新指定用户邮箱，并刷新 updated_at。
+	// 引入动机：账户设置需要允许用户在验证当前密码后修改自己的邮箱。
+	UpdateUserEmail(ctx context.Context, userID, email string) error
+
+	// UpdateUserPasswordHash 更新指定用户的 Argon2id 密码哈希，并刷新 updated_at。
+	// 引入动机：账户设置需要在服务端完成改密，Repository 只接收哈希，绝不接收或存储明文密码。
+	UpdateUserPasswordHash(ctx context.Context, userID, passwordHash string) error
+
 	// CreateSession 插入一条新的 session 记录。
 	CreateSession(ctx context.Context, userID, tokenHash, csrfTokenHash string, expiresAt time.Time) (sessionID string, err error)
 
@@ -183,6 +191,44 @@ func (r *PGRepository) GetUserByID(ctx context.Context, id string) (*User, error
 		return nil, mapDBError(err, "根据 ID 查询用户")
 	}
 	return &u, nil
+}
+
+// UpdateUserEmail 更新指定用户的邮箱。
+func (r *PGRepository) UpdateUserEmail(ctx context.Context, userID, email string) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE users SET email = $1, updated_at = now() WHERE id = $2`,
+		email, userID,
+	)
+	if err != nil {
+		return mapDBError(err, "更新用户邮箱")
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("获取更新用户邮箱影响行数: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// UpdateUserPasswordHash 更新指定用户的密码哈希。
+func (r *PGRepository) UpdateUserPasswordHash(ctx context.Context, userID, passwordHash string) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE users SET password_hash = $1, updated_at = now() WHERE id = $2`,
+		passwordHash, userID,
+	)
+	if err != nil {
+		return mapDBError(err, "更新用户密码哈希")
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("获取更新用户密码哈希影响行数: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // CreateSession 插入一条新的 session 记录。
@@ -432,6 +478,13 @@ func (r *PGRepository) CreateUserIfNoneExist(ctx context.Context, username, emai
 
 // mapDBError 将 database/sql 错误映射为带上下文的错误信息。
 // 引入动机：统一处理 sql.ErrNoRows 和 pgconn.PgError，避免在每处调用重复判断。
+// IsUniqueViolation 判断错误链中是否包含 PostgreSQL 唯一约束冲突。
+// 引入动机：账户邮箱修改需要将 users.email 唯一约束映射为稳定的 409 语义。
+func IsUniqueViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505"
+}
+
 func mapDBError(err error, context string) error {
 	if err == sql.ErrNoRows {
 		return err

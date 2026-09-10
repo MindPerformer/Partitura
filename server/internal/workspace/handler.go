@@ -59,24 +59,24 @@ func NewHandlerWithInitializer(repo Repository, auditRepo audit.Repository, init
 // workspaceResponse 是返回给客户端的 workspace JSON 结构。
 // 引入动机：统一 workspace API 响应格式，不暴露内部实现细节。
 type workspaceResponse struct {
-	ID                     string `json:"id"`
-	Name                   string `json:"name"`
-	DisplayName            string `json:"display_name"`
-	Description            string `json:"description"`
-	Status                 string `json:"status"`
-	RevisionRetentionDays  int    `json:"revision_retention_days"`
-	RevisionMaxCount       int    `json:"revision_max_count"`
-	MaxDocumentSizeBytes   int    `json:"max_document_size_bytes"`
-	CreatedBy              string `json:"created_by"`
+	ID                    string `json:"id"`
+	Name                  string `json:"name"`
+	DisplayName           string `json:"display_name"`
+	Description           string `json:"description"`
+	Status                string `json:"status"`
+	RevisionRetentionDays int    `json:"revision_retention_days"`
+	RevisionMaxCount      int    `json:"revision_max_count"`
+	MaxDocumentSizeBytes  int    `json:"max_document_size_bytes"`
+	CreatedBy             string `json:"created_by"`
 }
 
 // memberResponse 是返回给客户端的成员 JSON 结构。
 type memberResponse struct {
-	ID        string `json:"id"`
-	UserID    string `json:"user_id"`
-	Username  string `json:"username"`
-	Email     string `json:"email"`
-	Role      string `json:"role"`
+	ID       string `json:"id"`
+	UserID   string `json:"user_id"`
+	Username string `json:"username"`
+	Email    string `json:"email"`
+	Role     string `json:"role"`
 }
 
 // listWorkspacesResponse 是 workspace 列表响应。
@@ -93,6 +93,11 @@ type listMembersResponse struct {
 	Total   int              `json:"total"`
 	Limit   int              `json:"limit"`
 	Offset  int              `json:"offset"`
+}
+
+// memberCandidatesResponse 是成员搜索候选响应。
+type memberCandidatesResponse struct {
+	Users []memberResponse `json:"users"`
 }
 
 // createWorkspaceRequest 是创建 workspace 的请求体。
@@ -114,9 +119,10 @@ type updateWorkspaceRequest struct {
 }
 
 // addMemberRequest 是添加成员的请求体。
+// 引入动机：前端不应要求用户处理内部 UUID，服务端根据用户名解析目标用户。
 type addMemberRequest struct {
-	UserID string `json:"user_id"`
-	Role   string `json:"role"`
+	Username string `json:"username"`
+	Role     string `json:"role"`
 }
 
 // updateMemberRoleRequest 是修改成员角色的请求体。
@@ -475,6 +481,37 @@ func (h *Handler) ListMembers(w http.ResponseWriter, r *http.Request) {
 	writeWorkspaceJSON(w, http.StatusOK, resp)
 }
 
+// ListMemberCandidates 处理 GET /api/workspaces/{id}/members/candidates。
+// 只返回尚未加入当前 workspace 的非敏感用户候选。
+func (h *Handler) ListMemberCandidates(w http.ResponseWriter, r *http.Request) {
+	wsc := WorkspaceContextFromContext(r.Context())
+	if wsc == nil {
+		writeWorkspaceError(w, http.StatusInternalServerError, "workspace 上下文缺失")
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	if query == "" {
+		writeWorkspaceError(w, http.StatusBadRequest, "q 不能为空")
+		return
+	}
+	limit, _, err := parsePagination(r)
+	if err != nil {
+		writeWorkspaceError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	candidates, err := h.repo.ListMemberCandidates(r.Context(), wsc.WorkspaceID, query, limit)
+	if err != nil {
+		slog.Error("查询成员候选失败", "error", err, "workspace_id", wsc.WorkspaceID)
+		writeWorkspaceError(w, http.StatusInternalServerError, "内部错误")
+		return
+	}
+	resp := memberCandidatesResponse{Users: make([]memberResponse, 0, len(candidates))}
+	for i := range candidates {
+		resp.Users = append(resp.Users, toMemberResponse(&candidates[i]))
+	}
+	writeWorkspaceJSON(w, http.StatusOK, resp)
+}
+
 // AddMember 处理 POST /api/workspaces/{id}/members。
 // 引入动机：design/04-WEB-API.md §Workspace 要求 members endpoint。
 // 需要 workspace admin+ 权限（PermMemberManage）——RequireWorkspacePermission 已处理。
@@ -494,8 +531,9 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.UserID == "" {
-		writeWorkspaceError(w, http.StatusBadRequest, "user_id 不能为空")
+	req.Username = strings.TrimSpace(req.Username)
+	if req.Username == "" {
+		writeWorkspaceError(w, http.StatusBadRequest, "username 不能为空")
 		return
 	}
 	if !IsValidRole(req.Role) {
@@ -508,31 +546,31 @@ func (h *Handler) AddMember(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 验证目标用户存在
-	targetUser, err := h.repo.GetUserByID(r.Context(), req.UserID)
+	// 按用户名解析目标用户，内部只使用服务端查询得到的用户 ID。
+	targetUser, err := h.repo.GetUserByUsername(r.Context(), req.Username)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			writeWorkspaceError(w, http.StatusNotFound, "目标用户不存在")
 			return
 		}
-		slog.Error("查询目标用户失败", "error", err, "target_user_id", req.UserID)
+		slog.Error("查询目标用户失败", "error", err, "target_username", req.Username)
 		writeWorkspaceError(w, http.StatusInternalServerError, "内部错误")
 		return
 	}
 
-	member, err := h.repo.AddMember(r.Context(), wsc.WorkspaceID, req.UserID, req.Role)
+	member, err := h.repo.AddMember(r.Context(), wsc.WorkspaceID, targetUser.UserID, req.Role)
 	if err != nil {
 		if isDuplicateKeyError(err) {
 			writeWorkspaceError(w, http.StatusConflict, "用户已是该 workspace 成员")
 			return
 		}
-		slog.Error("添加成员失败", "error", err, "workspace_id", wsc.WorkspaceID, "target_user_id", req.UserID)
+		slog.Error("添加成员失败", "error", err, "workspace_id", wsc.WorkspaceID, "target_user_id", targetUser.UserID)
 		writeWorkspaceError(w, http.StatusInternalServerError, "内部错误")
 		return
 	}
 
 	h.recordAudit(r, id.UserID, wsc.WorkspaceID, "workspace.member.add", "workspace_member", member.ID, map[string]string{
-		"target_user_id": req.UserID,
+		"target_user_id":  targetUser.UserID,
 		"target_username": targetUser.Username,
 		"role":            req.Role,
 	})

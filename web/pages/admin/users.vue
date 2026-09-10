@@ -8,11 +8,12 @@ import type { AdminUser, ApiError, CreateUserRequest } from '~/types/api'
 import type { SelectItem } from '@nuxt/ui'
 
 definePageMeta({
-  middleware: ['auth']
+  middleware: ['auth', 'admin']
 })
 
 const { t } = useI18n()
 const { isSystemAdmin } = useAuth()
+const { systemRoleLabel } = useEnumLabels()
 
 const users = ref<AdminUser[]>([])
 const total = ref(0)
@@ -190,8 +191,8 @@ useHead({ title: () => t('admin.adminUsers') + ' · ' + t('common.appName') })
                 </div>
               </div>
               <div class="flex items-center gap-2">
-                <UBadge :color="user.system_role === 'system_admin' ? 'error' : 'neutral'" variant="subtle" size="sm">{{ user.system_role }}</UBadge>
-                <UBadge v-if="user.workspace_create_perm" color="success" variant="subtle" size="sm">can create ws</UBadge>
+                <UBadge :color="user.system_role === 'system_admin' ? 'error' : 'neutral'" variant="subtle" size="sm">{{ systemRoleLabel(user.system_role) }}</UBadge>
+                <UBadge v-if="user.workspace_create_perm" color="success" variant="subtle" size="sm">{{ t('admin.workspaceCreateEnabled') }}</UBadge>
                 <UButton size="xs" variant="ghost" icon="i-lucide-pencil" @click="openEdit(user)" />
               </div>
             </div>

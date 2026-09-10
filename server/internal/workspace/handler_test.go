@@ -366,13 +366,49 @@ func TestAddMember_AdminSuccess(t *testing.T) {
 
 	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "owner1")
 
-	body := `{"user_id":"user-003","role":"viewer"}`
+	body := `{"username":"newmember2","role":"viewer"}`
 	req := authedRequest(http.MethodPost, "/api/workspaces/"+ws.ID+"/members", sessionToken, csrfToken, body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
 
 	if rr.Code != http.StatusCreated {
 		t.Fatalf("admin 添加成员应返回 201，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestAddMember_EditorDenied 验证 editor 不能添加成员。
+// TestListMemberCandidates_AdminGetsUnjoinedUsers 验证成员候选按用户名搜索且排除已加入成员。
+func TestListMemberCandidates_AdminGetsUnjoinedUsers(t *testing.T) {
+	mux, authRepo, wsRepo, _, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "owner-001", "owner1", "user", true)
+	createTestUserInAuth(t, authRepo, cfg, "user-002", "existingmember", "user", false)
+	createTestUserInAuth(t, authRepo, cfg, "user-003", "newmember", "user", false)
+
+	wsRepo.AddUser("owner-001", "owner1", "owner1@test.example", "user", true)
+	wsRepo.AddUser("user-002", "existingmember", "existing@test.example", "user", false)
+	wsRepo.AddUser("user-003", "newmember", "new@test.example", "user", false)
+	ws, _ := wsRepo.CreateWorkspace(context.Background(), "team-ws", "Team", "", "owner-001")
+	wsRepo.AddMember(context.Background(), ws.ID, "user-002", RoleViewer)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "owner1")
+	req := authedRequest(http.MethodGet, "/api/workspaces/"+ws.ID+"/members/candidates?q=newmember", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("查询成员候选应返回 200，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+
+	var resp struct {
+		Users []memberResponse `json:"users"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析成员候选响应失败: %v", err)
+	}
+	if len(resp.Users) != 1 {
+		t.Fatalf("应返回 1 个未加入候选，实际 %d: %+v", len(resp.Users), resp.Users)
+	}
+	if resp.Users[0].Username != "newmember" || resp.Users[0].UserID != "user-003" {
+		t.Errorf("候选用户不匹配: %+v", resp.Users[0])
 	}
 }
 
@@ -388,7 +424,7 @@ func TestAddMember_EditorDenied(t *testing.T) {
 
 	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "editor1")
 
-	body := `{"user_id":"user-003","role":"viewer"}`
+	body := `{"username":"newmember","role":"viewer"}`
 	req := authedRequest(http.MethodPost, "/api/workspaces/"+ws.ID+"/members", sessionToken, csrfToken, body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -410,7 +446,7 @@ func TestAddMember_ViewerDenied(t *testing.T) {
 
 	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "viewer1")
 
-	body := `{"user_id":"user-003","role":"viewer"}`
+	body := `{"username":"newmember","role":"viewer"}`
 	req := authedRequest(http.MethodPost, "/api/workspaces/"+ws.ID+"/members", sessionToken, csrfToken, body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -435,7 +471,7 @@ func TestAddMember_Duplicate(t *testing.T) {
 
 	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "owner1")
 
-	body := `{"user_id":"user-002","role":"editor"}`
+	body := `{"username":"existing","role":"editor"}`
 	req := authedRequest(http.MethodPost, "/api/workspaces/"+ws.ID+"/members", sessionToken, csrfToken, body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -455,7 +491,7 @@ func TestAddMember_InvalidRole(t *testing.T) {
 
 	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "owner1")
 
-	body := `{"user_id":"user-002","role":"superadmin"}`
+	body := `{"username":"newmember","role":"superadmin"}`
 	req := authedRequest(http.MethodPost, "/api/workspaces/"+ws.ID+"/members", sessionToken, csrfToken, body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -475,7 +511,7 @@ func TestAddMember_OwnerRoleRejected(t *testing.T) {
 
 	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "owner1")
 
-	body := `{"user_id":"user-002","role":"owner"}`
+	body := `{"username":"newmember","role":"owner"}`
 	req := authedRequest(http.MethodPost, "/api/workspaces/"+ws.ID+"/members", sessionToken, csrfToken, body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -605,7 +641,7 @@ func TestCrossWorkspace_Isolation(t *testing.T) {
 	}
 
 	// user1 尝试向 ws2 添加成员
-	addBody := `{"user_id":"user-002","role":"viewer"}`
+	addBody := `{"username":"member1","role":"viewer"}`
 	req4 := authedRequest(http.MethodPost, "/api/workspaces/"+ws2.ID+"/members", sessionToken, csrfToken, addBody)
 	rr4 := httptest.NewRecorder()
 	mux.ServeHTTP(rr4, req4)
@@ -1526,4 +1562,3 @@ func TestUpdateWorkspace_SettingsOutOfRange(t *testing.T) {
 		}
 	}
 }
-

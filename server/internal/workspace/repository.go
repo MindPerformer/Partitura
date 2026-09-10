@@ -45,12 +45,12 @@ type RecentRevision struct {
 // 引入动机：Phase6 WP2 需要 GET /api/workspaces/{id}/stats 返回文档/成员/近期 revision 统计。
 // 所有字段使用 snake_case JSON tag，与前端契约一致。
 type WorkspaceStats struct {
-	TotalDocuments      int              `json:"total_documents"`
-	ActiveDocuments     int              `json:"active_documents"`
-	DraftDocuments      int              `json:"draft_documents"`
-	ArchivedDocuments   int              `json:"archived_documents"`
-	MemberCount         int              `json:"member_count"`
-	RecentRevisions     []RecentRevision `json:"recent_revisions"`
+	TotalDocuments    int              `json:"total_documents"`
+	ActiveDocuments   int              `json:"active_documents"`
+	DraftDocuments    int              `json:"draft_documents"`
+	ArchivedDocuments int              `json:"archived_documents"`
+	MemberCount       int              `json:"member_count"`
+	RecentRevisions   []RecentRevision `json:"recent_revisions"`
 }
 
 // Repository 定义 workspace 模块所需的数据访问接口。
@@ -117,6 +117,14 @@ type Repository interface {
 
 	// GetUserByID 根据 ID 查询用户基本信息（不含密码哈希）。
 	GetUserByID(ctx context.Context, userID string) (*Member, error)
+
+	// GetUserByUsername 根据用户名查询用户基本信息（不含密码哈希）。
+	// 引入动机：成员添加 API 接受用户名，服务端负责解析为内部用户 ID。
+	GetUserByUsername(ctx context.Context, username string) (*Member, error)
+
+	// ListMemberCandidates 查询尚未加入指定 workspace 的用户候选。
+	// 引入动机：成员管理页面需要按用户名搜索，且不得返回当前 workspace 已有成员。
+	ListMemberCandidates(ctx context.Context, workspaceID, query string, limit int) ([]Member, error)
 
 	// ListAllWorkspaces 查询全部 workspace 列表（分页），供 system_admin 使用。
 	ListAllWorkspaces(ctx context.Context, limit, offset int) (*ListWorkspacesResult, error)
@@ -527,6 +535,51 @@ func (r *PGRepository) GetUserByID(ctx context.Context, userID string) (*Member,
 		return nil, mapDBError(err, "根据 ID 查询用户")
 	}
 	return &m, nil
+}
+
+// GetUserByUsername 根据用户名查询用户基本信息。
+func (r *PGRepository) GetUserByUsername(ctx context.Context, username string) (*Member, error) {
+	var member Member
+	err := r.db.QueryRowContext(ctx,
+		`SELECT id, username, email FROM users WHERE username = $1`, username,
+	).Scan(&member.UserID, &member.Username, &member.Email)
+	if err != nil {
+		return nil, mapDBError(err, "根据用户名查询用户")
+	}
+	return &member, nil
+}
+
+// ListMemberCandidates 查询尚未加入指定 workspace 的用户候选。
+func (r *PGRepository) ListMemberCandidates(ctx context.Context, workspaceID, query string, limit int) ([]Member, error) {
+	rows, err := r.db.QueryContext(ctx,
+		`SELECT u.id, u.username, u.email
+		 FROM users u
+		 WHERE (u.username ILIKE $1 OR u.email ILIKE $1)
+		   AND NOT EXISTS (
+				SELECT 1 FROM workspace_members wm
+				WHERE wm.workspace_id = $2 AND wm.user_id = u.id
+		   )
+		 ORDER BY CASE WHEN lower(u.username) = lower($3) THEN 0 ELSE 1 END, u.username ASC
+		 LIMIT $4`,
+		"%"+query+"%", workspaceID, query, limit,
+	)
+	if err != nil {
+		return nil, mapDBError(err, "查询成员候选")
+	}
+	defer rows.Close()
+
+	candidates := make([]Member, 0)
+	for rows.Next() {
+		var member Member
+		if err := rows.Scan(&member.UserID, &member.Username, &member.Email); err != nil {
+			return nil, fmt.Errorf("扫描成员候选: %w", err)
+		}
+		candidates = append(candidates, member)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历成员候选: %w", err)
+	}
+	return candidates, nil
 }
 
 // ListAllWorkspaces 查询全部 workspace 列表（分页），供 system_admin 使用。

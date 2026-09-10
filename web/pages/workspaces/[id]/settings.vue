@@ -15,6 +15,7 @@ const route = useRoute()
 const workspaceId = computed(() => route.params.id as string)
 
 const { workspace, canSettings, isOwner, reload } = useWorkspaceContext(workspaceId)
+const { workspaceStatusLabel } = useEnumLabels()
 
 const form = reactive({
   display_name: '',
@@ -120,7 +121,7 @@ useHead({ title: () => t('workspace.workspaceSettings') + ' · ' + t('common.app
 
             <div class="text-sm text-muted space-y-1 pt-2 border-t border-default">
               <p><span class="font-medium">{{ t('workspace.name') }}:</span> {{ workspace.name }}</p>
-              <p><span class="font-medium">{{ t('workspace.status') }}:</span> {{ workspace.status }}</p>
+              <p><span class="font-medium">{{ t('workspace.status') }}:</span> {{ workspaceStatusLabel(workspace.status) }}</p>
               <p><span class="font-medium">{{ t('workspace.retention') }}:</span> {{ t('workspace.retentionFormat', { days: workspace.revision_retention_days, count: workspace.revision_max_count }) }}</p>
               <p><span class="font-medium">{{ t('workspace.maxDocumentSize') }}:</span> {{ (workspace.max_document_size_bytes / 1024 / 1024).toFixed(1) }} MB</p>
             </div>

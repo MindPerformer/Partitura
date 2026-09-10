@@ -39,6 +39,36 @@ describe('Admin Guard', () => {
     expect(auth.isSystemAdmin.value).toBe(true)
   })
 
+  it('普通用户直接访问 admin URL 会被 admin middleware 重定向', async () => {
+    const { useAuth } = await import('~/composables/useAuth')
+    const auth = useAuth()
+    auth.setAuth({
+      user: { id: '3', username: 'normal', system_role: 'user' },
+      csrf_token: 'token',
+      expires_at: '2025-01-01'
+    } as never)
+
+    const middleware = (await import('~/middleware/admin')).default
+    const result = middleware({ path: '/admin/users', fullPath: '/admin/users' } as never, undefined as never)
+
+    expect(result).toBeDefined()
+  })
+
+  it('system_admin 通过 admin middleware 时不重定向', async () => {
+    const { useAuth } = await import('~/composables/useAuth')
+    const auth = useAuth()
+    auth.setAuth({
+      user: { id: '4', username: 'admin2', system_role: 'system_admin' },
+      csrf_token: 'token',
+      expires_at: '2025-01-01'
+    } as never)
+
+    const middleware = (await import('~/middleware/admin')).default
+    const result = middleware({ path: '/admin/users', fullPath: '/admin/users' } as never, undefined as never)
+
+    expect(result).toBeUndefined()
+  })
+
   it('admin API listUsers 调用正确端点', async () => {
     ctrl.setResponse({ users: [], total: 0, limit: 20, offset: 0 })
 

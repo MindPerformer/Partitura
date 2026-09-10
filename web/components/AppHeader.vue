@@ -16,6 +16,7 @@ const props = defineProps<{
 
 const { t, locale, locales, setLocale } = useI18n()
 const { currentUser, isAuthenticated, isSystemAdmin, clearAuth } = useAuth()
+const { systemRoleLabel } = useEnumLabels()
 const route = useRoute()
 const router = useRouter()
 
@@ -121,6 +122,7 @@ const userItems = computed<DropdownMenuItem[][]>(() => {
     { label: currentUser.value?.username ?? '', slot: 'info', type: 'label', disabled: true }
   ]
   const actions: DropdownMenuItem[] = [
+    { label: t('auth.accountSettings'), icon: 'i-lucide-user-cog', to: '/account' },
     { label: t('auth.deviceSessions'), icon: 'i-lucide-key', to: '/device-sessions' }
   ]
   if (isSystemAdmin.value) {
@@ -146,7 +148,7 @@ const userItems = computed<DropdownMenuItem[][]>(() => {
         <slot name="leading" />
         <NuxtLink to="/" class="flex shrink-0 items-center gap-2 font-semibold text-highlighted">
           <UIcon name="i-lucide-book-open" class="w-5 h-5 text-primary" />
-          <span class="hidden sm:inline">PKW</span>
+          <span class="hidden sm:inline">Partitura</span>
         </NuxtLink>
         <UDropdownMenu :items="workspaceItems">
           <UButton
@@ -212,7 +214,7 @@ const userItems = computed<DropdownMenuItem[][]>(() => {
           <template #info="{ item }">
             <div class="py-1">
               <p class="font-medium text-highlighted">{{ currentUser?.username }}</p>
-              <p class="text-xs text-muted">{{ currentUser?.system_role }}</p>
+              <p class="text-xs text-muted">{{ systemRoleLabel(currentUser?.system_role) }}</p>
             </div>
           </template>
         </UDropdownMenu>

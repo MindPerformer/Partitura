@@ -10,13 +10,15 @@
 // - 用户显示信息（id/username/system_role）非敏感数据，使用 Nuxt cookie 持久化供 SSR hydration
 // - 认证状态通过 API 请求结果验证，不依赖前端可篡改的状态
 
-import type { LoginResponse } from '~/types/api'
+import type { CurrentUserResponse, LoginResponse } from '~/types/api'
 
 /** 认证用户信息（非敏感显示数据） */
 export interface AuthUser {
   id: string
   username: string
+  email?: string
   system_role: string
+  workspace_create_perm?: boolean
 }
 
 const AUTH_COOKIE_NAME = 'pkw_user'
@@ -59,6 +61,19 @@ export function useAuth() {
     userCookie.value = user
   }
 
+  /** 用 /auth/me 的权威响应刷新当前用户显示状态。 */
+  function setCurrentUser(current: CurrentUserResponse) {
+    const user: AuthUser = {
+      id: current.id,
+      username: current.username,
+      email: current.email,
+      system_role: current.system_role,
+      workspace_create_perm: current.workspace_create_perm
+    }
+    userState.value = user
+    userCookie.value = user
+  }
+
   /** 清理认证状态（logout 或 401 时调用） */
   function clearAuth() {
     userState.value = null
@@ -71,6 +86,7 @@ export function useAuth() {
     isAuthenticated,
     isSystemAdmin,
     setAuth,
+    setCurrentUser,
     clearAuth
   }
 }

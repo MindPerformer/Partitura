@@ -21,6 +21,7 @@ const emit = defineEmits<{
 }>()
 
 const { t } = useI18n()
+const { documentStatusLabel, documentTypeLabel, sourceTypeLabel } = useEnumLabels()
 const { formatDate } = useFormatDate()
 const rightTab = ref<'toc' | 'meta' | 'sources'>('toc')
 </script>
@@ -61,11 +62,11 @@ const rightTab = ref<'toc' | 'meta' | 'sources'>('toc')
       </div>
       <div>
         <p class="text-xs uppercase text-muted">{{ t('document.type') }}</p>
-        <p class="text-default">{{ props.doc.type || 'N/A' }}</p>
+        <p class="text-default">{{ documentTypeLabel(props.doc.type) }}</p>
       </div>
       <div>
         <p class="text-xs uppercase text-muted">{{ t('workspace.status') }}</p>
-        <p class="text-default">{{ props.doc.status }}</p>
+        <p class="text-default">{{ documentStatusLabel(props.doc.status) }}</p>
       </div>
       <div>
         <p class="text-xs uppercase text-muted">{{ t('document.revision') }}</p>
@@ -93,7 +94,7 @@ const rightTab = ref<'toc' | 'meta' | 'sources'>('toc')
           class="rounded border border-default p-2 text-sm"
         >
           <div class="mb-1 flex items-center gap-1">
-            <UBadge variant="subtle" size="sm">{{ src.source_type }}</UBadge>
+            <UBadge variant="subtle" size="sm">{{ sourceTypeLabel(src.source_type) }}</UBadge>
           </div>
           <p class="break-all text-xs text-default">{{ src.value }}</p>
           <p v-if="src.title" class="mt-1 text-xs text-muted">{{ src.title }}</p>

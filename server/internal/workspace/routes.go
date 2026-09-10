@@ -143,6 +143,17 @@ func RegisterRoutes(
 		),
 	)
 
+	// GET /api/workspaces/{id}/members/candidates — workspace admin+（PermMemberManage）
+	mux.Handle("GET /api/workspaces/{id}/members/candidates",
+		auth.AuthMiddleware(authRepo, authCfg)(
+			auth.RequireAuth(
+				RequireWorkspacePermission(handler.repo, PermMemberManage, "id")(
+					http.HandlerFunc(handler.ListMemberCandidates),
+				),
+			),
+		),
+	)
+
 	// POST /api/workspaces/{id}/members — workspace admin+（PermMemberManage）
 	mux.Handle("POST /api/workspaces/{id}/members",
 		auth.AuthMiddleware(authRepo, authCfg)(

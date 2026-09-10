@@ -87,7 +87,7 @@ export default defineNuxtConfig({
   },
   app: {
     head: {
-      title: '项目知识工作区',
+      title: 'Partitura',
       meta: [
         { name: 'viewport', content: 'width=device-width, initial-scale=1' }
       ]

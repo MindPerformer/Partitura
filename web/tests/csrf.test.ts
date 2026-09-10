@@ -60,7 +60,6 @@ describe('CSRF Token Handling', () => {
 
   it('DELETE 请求携带 CSRF header', async () => {
     setDocumentCookie('csrf', 'csrf-token-delete')
-
     const { useWorkspaceApi } = await import('~/composables/useApi')
     const api = useWorkspaceApi()
     await api.removeMember('ws-1', 'user-1')
@@ -69,6 +68,26 @@ describe('CSRF Token Handling', () => {
     const headers = firstCall().opts.headers as Record<string, string>
     expect(headers['X-CSRF-Token']).toBe('csrf-token-delete')
   })
+
+  it('账户邮箱和密码更新请求携带 CSRF header 与正确 body', async () => {
+    setDocumentCookie('csrf', 'csrf-token-account')
+    const { useAuthApi } = await import('~/composables/useApi')
+    const api = useAuthApi()
+
+    ctrl.setResponse({ id: 'u1', username: 'user', email: 'new@example.com', system_role: 'user', workspace_create_perm: false })
+    await api.updateEmail({ current_password: 'old-password', email: 'new@example.com' })
+    const emailCall = ctrl.mockFn.mock.calls[0]!
+    expect((emailCall[1] as Record<string, unknown>).headers).toMatchObject({ 'X-CSRF-Token': 'csrf-token-account' })
+    expect(JSON.parse((emailCall[1] as { body: string }).body)).toEqual({ current_password: 'old-password', email: 'new@example.com' })
+
+    ctrl.reset()
+    ctrl.setResponse({ status: 'ok' })
+    await api.updatePassword({ current_password: 'old-password', new_password: 'new-password-123' })
+    const passwordCall = ctrl.mockFn.mock.calls[0]!
+    expect((passwordCall[1] as Record<string, unknown>).headers).toMatchObject({ 'X-CSRF-Token': 'csrf-token-account' })
+    expect(JSON.parse((passwordCall[1] as { body: string }).body)).toEqual({ current_password: 'old-password', new_password: 'new-password-123' })
+  })
+
 
   it('所有请求携带 credentials: include', async () => {
     const { useWorkspaceApi } = await import('~/composables/useApi')

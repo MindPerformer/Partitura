@@ -17,6 +17,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/mail"
+	"strings"
 	"time"
 )
 
@@ -38,6 +40,14 @@ var ErrDeviceSessionRevoked = errors.New("device session 已被撤销")
 
 // ErrRefreshTokenExpired 表示 refresh token 已过期。
 var ErrRefreshTokenExpired = errors.New("refresh token 已过期")
+
+// 账户设置错误用于在 handler 层映射为稳定的 HTTP 响应，避免泄露内部细节。
+var (
+	ErrCurrentPasswordInvalid = errors.New("当前密码错误")
+	ErrEmailInvalid           = errors.New("邮箱格式不正确")
+	ErrEmailAlreadyExists     = errors.New("邮箱已存在")
+	ErrNewPasswordTooShort    = errors.New("新密码长度不足")
+)
 
 // LoginResult 是 login 成功后返回的结果。
 // 引入动机：handler 需要设置 cookie 和响应体，这些数据由领域逻辑层生成。
@@ -327,6 +337,84 @@ func RevokeDeviceSession(ctx context.Context, repo Repository, deviceSessionID s
 	return nil
 }
 
+const minAccountPasswordLength = 12
+
+// GetCurrentUser 返回当前认证用户的非敏感资料。
+// 引入动机：账户页需要从服务端读取权威资料，不能依赖客户端可修改的缓存状态。
+func GetCurrentUser(ctx context.Context, repo Repository, userID string) (*User, error) {
+	user, err := repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("查询当前用户: %w", err)
+	}
+	return user, nil
+}
+
+// UpdateEmail 验证当前密码后更新当前用户邮箱。
+// 引入动机：邮箱属于账户资料，必须由后端绑定当前身份并要求当前密码确认。
+func UpdateEmail(ctx context.Context, repo Repository, cfg AuthConfig, userID, currentPassword, email string) (*User, error) {
+	user, err := repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return nil, fmt.Errorf("查询当前用户: %w", err)
+	}
+	if err := VerifyPassword(user.PasswordHash, currentPassword); err != nil {
+		if errors.Is(err, ErrPasswordVerificationFailed) {
+			return nil, ErrCurrentPasswordInvalid
+		}
+		return nil, fmt.Errorf("校验当前密码: %w", err)
+	}
+
+	email = strings.TrimSpace(email)
+	if err := validateEmail(email); err != nil {
+		return nil, err
+	}
+	if err := repo.UpdateUserEmail(ctx, userID, email); err != nil {
+		if IsUniqueViolation(err) {
+			return nil, ErrEmailAlreadyExists
+		}
+		return nil, fmt.Errorf("更新用户邮箱: %w", err)
+	}
+	user.Email = email
+	return user, nil
+}
+
+// UpdatePassword 验证当前密码并写入新的 Argon2id 密码哈希。
+// 引入动机：改密必须由服务端完成哈希和持久化，明文只在当前请求内存在。
+func UpdatePassword(ctx context.Context, repo Repository, cfg AuthConfig, userID, currentPassword, newPassword string) error {
+	user, err := repo.GetUserByID(ctx, userID)
+	if err != nil {
+		return fmt.Errorf("查询当前用户: %w", err)
+	}
+	if err := VerifyPassword(user.PasswordHash, currentPassword); err != nil {
+		if errors.Is(err, ErrPasswordVerificationFailed) {
+			return ErrCurrentPasswordInvalid
+		}
+		return fmt.Errorf("校验当前密码: %w", err)
+	}
+	if len([]rune(newPassword)) < minAccountPasswordLength {
+		return ErrNewPasswordTooShort
+	}
+
+	passwordHash, err := HashPassword(newPassword, cfg)
+	if err != nil {
+		return fmt.Errorf("生成新密码哈希: %w", err)
+	}
+	if err := repo.UpdateUserPasswordHash(ctx, userID, passwordHash); err != nil {
+		return fmt.Errorf("更新用户密码哈希: %w", err)
+	}
+	return nil
+}
+
+func validateEmail(email string) error {
+	if email == "" || len([]rune(email)) > 255 {
+		return ErrEmailInvalid
+	}
+	parsed, err := mail.ParseAddress(email)
+	if err != nil || parsed.Address != email || !strings.Contains(email, "@") {
+		return ErrEmailInvalid
+	}
+	return nil
+}
+
 // ValidateSession 验证 session token 并返回 Identity。
 // 引入动机：middleware 需要验证 cookie session 并构建 Identity 放入 request context。
 //
@@ -360,12 +448,12 @@ func ValidateSession(ctx context.Context, repo Repository, sessionToken string) 
 	}
 
 	return &Identity{
-		UserID:             user.ID,
-		Username:           user.Username,
-		SystemRole:         user.SystemRole,
+		UserID:              user.ID,
+		Username:            user.Username,
+		SystemRole:          user.SystemRole,
 		WorkspaceCreatePerm: user.WorkspaceCreatePerm,
-		SessionID:          session.ID,
-		AuthMethod:         AuthMethodCookie,
+		SessionID:           session.ID,
+		AuthMethod:          AuthMethodCookie,
 	}, nil
 }
 
@@ -402,12 +490,12 @@ func ValidateAccessToken(ctx context.Context, repo Repository, accessToken strin
 	}
 
 	return &Identity{
-		UserID:             user.ID,
-		Username:           user.Username,
-		SystemRole:         user.SystemRole,
+		UserID:              user.ID,
+		Username:            user.Username,
+		SystemRole:          user.SystemRole,
 		WorkspaceCreatePerm: user.WorkspaceCreatePerm,
-		DeviceSessionID:    deviceSession.ID,
-		AuthMethod:         AuthMethodBearer,
+		DeviceSessionID:     deviceSession.ID,
+		AuthMethod:          AuthMethodBearer,
 	}, nil
 }
 

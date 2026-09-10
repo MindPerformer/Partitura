@@ -75,6 +75,42 @@ func (m *LocalAuthMockRepository) GetUserByID(ctx context.Context, id string) (*
 	return nil, sql.ErrNoRows
 }
 
+// UpdateUserEmail 实现 auth.Repository 接口。
+func (m *LocalAuthMockRepository) UpdateUserEmail(ctx context.Context, userID, email string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var target *auth.User
+	for _, user := range m.users {
+		if user.ID == userID {
+			target = user
+			break
+		}
+	}
+	if target == nil {
+		return sql.ErrNoRows
+	}
+	for _, user := range m.users {
+		if user.ID != userID && user.Email == email {
+			return fmt.Errorf("duplicate key value violates unique constraint users_email_key")
+		}
+	}
+	target.Email = email
+	return nil
+}
+
+// UpdateUserPasswordHash 实现 auth.Repository 接口。
+func (m *LocalAuthMockRepository) UpdateUserPasswordHash(ctx context.Context, userID, passwordHash string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, user := range m.users {
+		if user.ID == userID {
+			user.PasswordHash = passwordHash
+			return nil
+		}
+	}
+	return sql.ErrNoRows
+}
+
 // CreateSession 实现 auth.Repository 接口。
 func (m *LocalAuthMockRepository) CreateSession(ctx context.Context, userID, tokenHash, csrfTokenHash string, expiresAt time.Time) (string, error) {
 	m.mu.Lock()

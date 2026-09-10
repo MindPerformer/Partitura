@@ -84,7 +84,7 @@ function handleSelectDoc(path: string) {
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col">
+  <div class="flex h-screen min-h-0 flex-col overflow-hidden">
     <AppHeader
       :workspace-id="workspaceId"
       :workspace-name="workspace?.display_name"
@@ -112,7 +112,7 @@ function handleSelectDoc(path: string) {
     </div>
 
     <!-- Workspace content -->
-    <div v-else-if="workspace" class="flex-1 flex overflow-hidden">
+    <div v-else-if="workspace" class="flex min-h-0 min-w-0 flex-1 overflow-hidden">
       <!-- Desktop sidebar toggle -->
       <button
         class="hidden w-6 flex-shrink-0 items-center justify-center border-r border-default bg-default transition-colors hover:bg-elevated md:flex"
@@ -125,7 +125,7 @@ function handleSelectDoc(path: string) {
       <!-- Desktop sidebar -->
       <aside
         v-if="sidebarOpen"
-        class="hidden w-64 min-h-0 flex-shrink-0 overflow-y-auto border-r border-default bg-default md:block"
+        class="hidden h-full w-64 min-h-0 flex-shrink-0 overflow-hidden border-r border-default bg-default md:block"
       >
         <WorkspaceSidebar
           :workspace-id="workspaceId"
@@ -143,8 +143,10 @@ function handleSelectDoc(path: string) {
       </aside>
 
       <!-- Main content -->
-      <main class="flex-1 overflow-y-auto">
-        <slot :workspace="workspace" :can-edit="canEdit" :can-read="canRead" :current-role="currentMemberRole" />
+      <main class="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+        <div class="min-w-0">
+          <slot :workspace="workspace" :can-edit="canEdit" :can-read="canRead" :current-role="currentMemberRole" />
+        </div>
       </main>
     </div>
 

@@ -11,11 +11,12 @@
 import type { SearchProfile, ApiError, CreateProfileRequest, CreateProfileVersionRequest } from '~/types/api'
 
 definePageMeta({
-  middleware: ['auth']
+  middleware: ['auth', 'admin']
 })
 
 const { t } = useI18n()
 const { isSystemAdmin } = useAuth()
+const { profileStatusLabel } = useEnumLabels()
 
 const {
   profiles,
@@ -299,7 +300,7 @@ useHead({ title: () => t('admin.searchProfiles') + ' · ' + t('common.appName') 
                 <h3 class="font-medium text-highlighted">{{ profile.name }}</h3>
                 <p class="text-xs text-muted">v{{ profile.version }} · {{ profile.embedding_model }} · {{ profile.embedding_dimensions }}d</p>
               </div>
-              <UBadge :color="profileStatusColor(profile.status)" variant="subtle" size="sm">{{ profile.status }}</UBadge>
+              <UBadge :color="profileStatusColor(profile.status)" variant="subtle" size="sm">{{ profileStatusLabel(profile.status) }}</UBadge>
             </div>
             <div class="grid grid-cols-3 sm:grid-cols-6 gap-2 text-xs text-muted mb-3">
               <span>Lex K: {{ profile.lexical_top_k }}</span>

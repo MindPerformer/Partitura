@@ -6,7 +6,6 @@
 <script setup lang="ts">
 import type { Member, ApiError } from '~/types/api'
 import type { SelectItem } from '@nuxt/ui'
-import { WORKSPACE_ROLES, hasMinRole } from '~/types/api'
 
 definePageMeta({
   middleware: ['auth']
@@ -17,6 +16,7 @@ const route = useRoute()
 const workspaceId = computed(() => route.params.id as string)
 
 const { workspace, canManageMembers, currentMemberRole } = useWorkspaceContext(workspaceId)
+const { workspaceRoleLabel } = useEnumLabels()
 
 const members = ref<Member[]>([])
 const total = ref(0)
@@ -26,9 +26,17 @@ const loading = ref(false)
 const error = ref<string | null>(null)
 
 const showAddModal = ref(false)
-const addForm = ref({ user_id: '', role: 'viewer' })
+const addForm = ref({ username: '', role: 'viewer' })
+const selectedCandidate = ref<Member | null>(null)
+const candidates = ref<Member[]>([])
+const candidateLoading = ref(false)
+const candidateSearched = ref(false)
+const candidateOpen = ref(false)
+const candidateError = ref<string | null>(null)
 const addLoading = ref(false)
 const addError = ref<string | null>(null)
+let candidateTimer: ReturnType<typeof setTimeout> | undefined
+let candidateSearchVersion = 0
 
 async function loadMembers() {
   if (!workspaceId.value) return
@@ -54,19 +62,74 @@ function handleOffsetChange(newOffset: number) {
   loadMembers()
 }
 
+watch(() => addForm.value.username, (value) => {
+  const version = ++candidateSearchVersion
+  selectedCandidate.value = null
+  candidateError.value = null
+  candidateSearched.value = false
+  candidates.value = []
+  candidateOpen.value = false
+  if (candidateTimer) clearTimeout(candidateTimer)
+
+  const query = value.trim()
+  if (!query || !workspaceId.value || !canManageMembers.value) return
+
+  candidateTimer = setTimeout(async () => {
+    candidateLoading.value = true
+    candidateOpen.value = true
+    try {
+      const res = await useWorkspaceApi().listMemberCandidates(workspaceId.value, query, 8)
+      if (version !== candidateSearchVersion) return
+      candidates.value = res.users
+      candidateSearched.value = true
+    } catch (err) {
+      if (version !== candidateSearchVersion) return
+      const apiErr = err as ApiError
+      candidateError.value = apiErr.error || t('workspace.candidateSearchFailed')
+      candidateSearched.value = true
+    } finally {
+      if (version === candidateSearchVersion) candidateLoading.value = false
+    }
+  }, 250)
+})
+
+function selectCandidate(candidate: Member) {
+  selectedCandidate.value = candidate
+  addForm.value.username = candidate.username
+  candidateOpen.value = false
+  candidateError.value = null
+}
+
+function resetAddForm() {
+  candidateSearchVersion++
+  if (candidateTimer) clearTimeout(candidateTimer)
+  addForm.value = { username: '', role: 'viewer' }
+  selectedCandidate.value = null
+  candidates.value = []
+  candidateSearched.value = false
+  candidateOpen.value = false
+  candidateError.value = null
+  addError.value = null
+}
+
+function openAddModal() {
+  resetAddForm()
+  showAddModal.value = true
+}
+
 async function handleAdd() {
-  if (!addForm.value.user_id) {
-    addError.value = t('workspace.userIdRequired')
+  if (!selectedCandidate.value || selectedCandidate.value.username !== addForm.value.username.trim()) {
+    addError.value = t('workspace.memberCandidateRequired')
     return
   }
   addLoading.value = true
   addError.value = null
   try {
     const api = useWorkspaceApi()
-    const member = await api.addMember(workspaceId.value, addForm.value)
-    members.value.push(member)
+    await api.addMember(workspaceId.value, { username: selectedCandidate.value.username, role: addForm.value.role })
     showAddModal.value = false
-    addForm.value = { user_id: '', role: 'viewer' }
+    resetAddForm()
+    await loadMembers()
   } catch (err) {
     const apiErr = err as ApiError
     if (apiErr.status === 409) {
@@ -80,6 +143,10 @@ async function handleAdd() {
     addLoading.value = false
   }
 }
+
+onBeforeUnmount(() => {
+  if (candidateTimer) clearTimeout(candidateTimer)
+})
 
 async function handleUpdateRole(member: Member, newRole: string) {
   try {
@@ -117,13 +184,13 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
 
 <template>
   <WorkspaceLayout>
-    <div class="max-w-4xl mx-auto px-4 py-8">
+    <div class="mx-auto min-w-0 max-w-4xl px-4 py-8">
       <div class="flex items-center justify-between mb-6">
         <h1 class="text-2xl font-bold text-highlighted">{{ t('workspace.members') }}</h1>
         <UButton
           v-if="canManageMembers"
           icon="i-lucide-plus"
-          @click="showAddModal = true"
+          @click="openAddModal"
         >{{ t('workspace.addMember') }}</UButton>
       </div>
 
@@ -152,7 +219,7 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
                 :color="member.role === 'owner' ? 'warning' : member.role === 'admin' ? 'info' : member.role === 'editor' ? 'success' : 'neutral'"
                 variant="subtle"
                 size="sm"
-              >{{ member.role }}</UBadge>
+              >{{ workspaceRoleLabel(member.role) }}</UBadge>
               <USelect
                 v-if="canManageMembers && member.role !== 'owner'"
                 :model-value="member.role"
@@ -193,15 +260,53 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
         <div class="p-6">
           <h3 class="text-lg font-semibold mb-4">{{ t('workspace.addMember') }}</h3>
           <form @submit.prevent="handleAdd" class="space-y-4">
-            <UFormField :label="t('workspace.userId')" name="user_id">
-              <UInput v-model="addForm.user_id" placeholder="UUID" class="w-full" />
+            <UFormField :label="t('workspace.username')" name="username">
+              <div class="relative">
+                <UInput
+                  v-model="addForm.username"
+                  :placeholder="t('workspace.usernamePlaceholder')"
+                  autocomplete="off"
+                  class="w-full"
+                  @focus="candidateOpen = addForm.username.trim().length > 0"
+                />
+                <div
+                  v-if="candidateOpen && addForm.username.trim()"
+                  class="absolute left-0 right-0 top-full z-10 mt-1 overflow-hidden rounded-lg border border-default bg-default shadow-lg"
+                >
+                  <div v-if="candidateLoading" class="flex items-center gap-2 px-3 py-3 text-sm text-muted">
+                    <UIcon name="i-lucide-loader-circle" class="h-4 w-4 animate-spin" />
+                    {{ t('workspace.searchingCandidates') }}
+                  </div>
+                  <ErrorDisplay v-else-if="candidateError" :message="candidateError" class="m-2" />
+                  <div v-else-if="candidateSearched && candidates.length === 0" class="px-3 py-3 text-sm text-muted">
+                    {{ t('workspace.noCandidateResults') }}
+                  </div>
+                  <button
+                    v-for="candidate in candidates"
+                    :key="candidate.user_id"
+                    type="button"
+                    class="flex w-full items-center gap-3 px-3 py-2 text-left transition-colors hover:bg-elevated"
+                    @mousedown.prevent
+                    @click="selectCandidate(candidate)"
+                  >
+                    <UAvatar :alt="candidate.username.charAt(0).toUpperCase()" size="xs" />
+                    <span class="min-w-0">
+                      <span class="block truncate text-sm font-medium text-highlighted">{{ candidate.username }}</span>
+                      <span class="block truncate text-xs text-muted">{{ candidate.email }}</span>
+                    </span>
+                  </button>
+                </div>
+              </div>
             </UFormField>
+            <p v-if="selectedCandidate" class="text-xs text-success">
+              {{ t('workspace.selectedCandidate', { username: selectedCandidate.username }) }}
+            </p>
             <UFormField :label="t('workspace.role')" name="role">
               <USelect v-model="addForm.role" :items="roleOptions" value-key="value" label-key="label" class="w-full" />
             </UFormField>
             <ErrorDisplay v-if="addError" :message="addError" />
             <div class="flex justify-end gap-2 pt-2">
-              <UButton color="neutral" variant="ghost" @click="showAddModal = false">{{ t('common.cancel') }}</UButton>
+              <UButton color="neutral" variant="ghost" @click="showAddModal = false; resetAddForm()">{{ t('common.cancel') }}</UButton>
               <UButton type="submit" :loading="addLoading">{{ t('common.add') }}</UButton>
             </div>
           </form>

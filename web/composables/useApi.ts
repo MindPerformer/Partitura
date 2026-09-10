@@ -14,6 +14,9 @@ import type {
   ApiError,
   PaginationParams,
   LoginResponse,
+  CurrentUserResponse,
+  UpdateEmailRequest,
+  UpdatePasswordRequest,
   ListWorkspacesResponse,
   Workspace,
   CreateWorkspaceRequest,
@@ -22,6 +25,7 @@ import type {
   Member,
   MyMembershipResponse,
   AddMemberRequest,
+  MemberCandidatesResponse,
   UpdateMemberRoleRequest,
   Document,
   DocumentListItem,
@@ -225,6 +229,14 @@ export function useAuthApi() {
         method: 'POST'
       }),
 
+    me: () => apiFetch<CurrentUserResponse>('/auth/me'),
+
+    updateEmail: (req: UpdateEmailRequest) =>
+      apiFetch<CurrentUserResponse>('/auth/me/email', { method: 'PUT', body: req }),
+
+    updatePassword: (req: UpdatePasswordRequest) =>
+      apiFetch<{ status: string }>('/auth/me/password', { method: 'PUT', body: req }),
+
     deviceAuthorize: (deviceName: string) =>
       apiFetch<DeviceAuthorizeResponse>('/auth/device/authorize', {
         method: 'POST',
@@ -298,6 +310,9 @@ export function useWorkspaceApi() {
 
     listMembers: (id: string, params?: PaginationParams) =>
       apiFetch<ListMembersResponse>(`/workspaces/${id}/members`, { query: params }),
+
+    listMemberCandidates: (id: string, query: string, limit = 10) =>
+      apiFetch<MemberCandidatesResponse>(`/workspaces/${id}/members/candidates`, { query: { q: query, limit } }),
 
     addMember: (id: string, req: AddMemberRequest) =>
       apiFetch<Member>(`/workspaces/${id}/members`, { method: 'POST', body: req }),

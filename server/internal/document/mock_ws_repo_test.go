@@ -22,9 +22,9 @@ import (
 type LocalWSMockRepository struct {
 	mu sync.Mutex
 
-	workspaces   map[string]*workspace.Workspace
-	members      map[string]map[string]string // key: workspaceID -> map[userID]role
-	memberIDCtr  int
+	workspaces  map[string]*workspace.Workspace
+	members     map[string]map[string]string // key: workspaceID -> map[userID]role
+	memberIDCtr int
 }
 
 // NewLocalWSMockRepository 创建空 mock workspace repository。
@@ -281,6 +281,16 @@ func (m *LocalWSMockRepository) CountOwners(ctx context.Context, workspaceID str
 // GetUserByID 查询用户基本信息。
 func (m *LocalWSMockRepository) GetUserByID(ctx context.Context, userID string) (*workspace.Member, error) {
 	return nil, sql.ErrNoRows
+}
+
+// GetUserByUsername 查询用户基本信息。
+func (m *LocalWSMockRepository) GetUserByUsername(ctx context.Context, username string) (*workspace.Member, error) {
+	return nil, sql.ErrNoRows
+}
+
+// ListMemberCandidates 查询成员候选。
+func (m *LocalWSMockRepository) ListMemberCandidates(ctx context.Context, workspaceID, query string, limit int) ([]workspace.Member, error) {
+	return []workspace.Member{}, nil
 }
 
 // ListAllWorkspaces 查询全部 workspace。

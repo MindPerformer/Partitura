@@ -32,6 +32,8 @@ describe('Markdown Safe Rendering — XSS Prevention', () => {
       const html = renderMarkdown('| A | B |\n|---|---|\n| 1 | 2 |')
       expect(html).toContain('<td>1</td>')
       expect(html).toContain('<td>2</td>')
+      expect(html).toContain('<div class="markdown-table-scroll"><table>')
+      expect(html).toContain('</table></div>')
     })
 
     it('允许安全 https 链接', () => {

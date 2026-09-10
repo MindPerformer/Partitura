@@ -9,6 +9,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,12 +21,12 @@ import (
 type MockRepository struct {
 	mu sync.Mutex
 
-	workspaces  map[string]*Workspace // key: workspace ID
-	wsByName    map[string]*Workspace // key: workspace name
-	members     map[string][]*Member  // key: workspace ID -> members list
+	workspaces    map[string]*Workspace        // key: workspace ID
+	wsByName      map[string]*Workspace        // key: workspace name
+	members       map[string][]*Member         // key: workspace ID -> members list
 	membersByUser map[string]map[string]string // key: userID -> map[workspaceID]role
-	users       map[string]*Member    // key: user ID -> user info
-	userSysInfo map[string]*userSysInfo // key: user ID
+	users         map[string]*Member           // key: user ID -> user info
+	userSysInfo   map[string]*userSysInfo      // key: user ID
 
 	// 用于模拟自增 ID
 	memberIDCounter int
@@ -47,13 +48,13 @@ type userSysInfo struct {
 // NewMockRepository 创建空 mock repository。
 func NewMockRepository() *MockRepository {
 	return &MockRepository{
-		workspaces:     make(map[string]*Workspace),
-		wsByName:       make(map[string]*Workspace),
-		members:        make(map[string][]*Member),
-		membersByUser:  make(map[string]map[string]string),
-		users:          make(map[string]*Member),
-		userSysInfo:    make(map[string]*userSysInfo),
-		stats:          make(map[string]*WorkspaceStats),
+		workspaces:    make(map[string]*Workspace),
+		wsByName:      make(map[string]*Workspace),
+		members:       make(map[string][]*Member),
+		membersByUser: make(map[string]map[string]string),
+		users:         make(map[string]*Member),
+		userSysInfo:   make(map[string]*userSysInfo),
+		stats:         make(map[string]*WorkspaceStats),
 	}
 }
 
@@ -368,6 +369,44 @@ func (m *MockRepository) GetUserByID(ctx context.Context, userID string) (*Membe
 	}
 	copied := *u
 	return &copied, nil
+}
+
+// GetUserByUsername 实现 Repository 接口。
+func (m *MockRepository) GetUserByUsername(ctx context.Context, username string) (*Member, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, user := range m.users {
+		if user.Username == username {
+			copied := *user
+			return &copied, nil
+		}
+	}
+	return nil, sql.ErrNoRows
+}
+
+// ListMemberCandidates 实现 Repository 接口。
+func (m *MockRepository) ListMemberCandidates(ctx context.Context, workspaceID, query string, limit int) ([]Member, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	query = strings.ToLower(query)
+	members := make(map[string]bool)
+	for _, member := range m.members[workspaceID] {
+		members[member.UserID] = true
+	}
+	candidates := make([]Member, 0)
+	for userID, user := range m.users {
+		if members[userID] {
+			continue
+		}
+		if !strings.Contains(strings.ToLower(user.Username), query) && !strings.Contains(strings.ToLower(user.Email), query) {
+			continue
+		}
+		candidates = append(candidates, *user)
+		if len(candidates) >= limit {
+			break
+		}
+	}
+	return candidates, nil
 }
 
 // ListAllWorkspaces 实现 Repository 接口。

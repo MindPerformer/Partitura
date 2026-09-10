@@ -7,11 +7,12 @@
 import type { Workspace, ApiError } from '~/types/api'
 
 definePageMeta({
-  middleware: ['auth']
+  middleware: ['auth', 'admin']
 })
 
 const { t } = useI18n()
 const { isSystemAdmin } = useAuth()
+const { workspaceStatusLabel } = useEnumLabels()
 
 const workspaces = ref<Workspace[]>([])
 const total = ref(0)
@@ -78,7 +79,7 @@ useHead({ title: () => t('admin.adminWorkspaces') + ' · ' + t('common.appName')
                 <p class="text-xs text-muted">{{ ws.name }} · {{ t('admin.createdBy') }} {{ ws.created_by.substring(0, 8) }}...</p>
               </div>
               <div class="flex items-center gap-2">
-                <UBadge :color="ws.status === 'active' ? 'success' : 'neutral'" variant="subtle" size="sm">{{ ws.status }}</UBadge>
+                <UBadge :color="ws.status === 'active' ? 'success' : 'neutral'" variant="subtle" size="sm">{{ workspaceStatusLabel(ws.status) }}</UBadge>
                 <UButton size="xs" variant="ghost" icon="i-lucide-eye" :to="`/workspaces/${ws.id}`" />
               </div>
             </div>

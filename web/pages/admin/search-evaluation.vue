@@ -8,7 +8,7 @@ import type { ApiError, EvaluationDataset } from '~/types/api'
 import type { SelectItem } from '@nuxt/ui'
 
 definePageMeta({
-  middleware: ['auth']
+  middleware: ['auth', 'admin']
 })
 
 const { t } = useI18n()

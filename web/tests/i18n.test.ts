@@ -54,6 +54,35 @@ describe('i18n 词典完整性', () => {
     }
   })
 
+  it('角色和状态枚举具有中英文用户可见文案', () => {
+    const translatedValues = [
+      ['admin.roleSystemAdmin', zh.admin.roleSystemAdmin, en.admin.roleSystemAdmin, 'system_admin'],
+      ['admin.roleUser', zh.admin.roleUser, en.admin.roleUser, 'user'],
+      ['workspace.roleOwner', zh.workspace.roleOwner, en.workspace.roleOwner, 'owner'],
+      ['workspace.roleAdmin', zh.workspace.roleAdmin, en.workspace.roleAdmin, 'admin'],
+      ['workspace.roleEditor', zh.workspace.roleEditor, en.workspace.roleEditor, 'editor'],
+      ['workspace.roleViewer', zh.workspace.roleViewer, en.workspace.roleViewer, 'viewer'],
+      ['workspace.statusActive', zh.workspace.statusActive, en.workspace.statusActive, 'active'],
+      ['workspace.statusArchived', zh.workspace.statusArchived, en.workspace.statusArchived, 'archived'],
+      ['document.statusActive', zh.document.statusActive, en.document.statusActive, 'active'],
+      ['document.statusArchived', zh.document.statusArchived, en.document.statusArchived, 'archived'],
+      ['admin.statusDraft', zh.admin.statusDraft, en.admin.statusDraft, 'draft'],
+      ['admin.statusPending', zh.admin.statusPending, en.admin.statusPending, 'pending'],
+      ['admin.statusRunning', zh.admin.statusRunning, en.admin.statusRunning, 'running'],
+      ['admin.statusCompleted', zh.admin.statusCompleted, en.admin.statusCompleted, 'completed'],
+      ['admin.statusFailed', zh.admin.statusFailed, en.admin.statusFailed, 'failed'],
+      ['admin.jobTypeIndexDocument', zh.admin.jobTypeIndexDocument, en.admin.jobTypeIndexDocument, 'index_document'],
+      ['admin.settingTypeString', zh.admin.settingTypeString, en.admin.settingTypeString, 'string']
+    ] as const
+
+    for (const [key, zhValue, enValue, enumValue] of translatedValues) {
+      expect(zhValue, `zh.json missing translation for ${key}`).toBeTruthy()
+      expect(enValue, `en.json missing translation for ${key}`).toBeTruthy()
+      expect(zhValue).not.toBe(enumValue)
+      expect(enValue).not.toBe(enumValue)
+    }
+  })
+
   it('关键用户可见 key 在两种语言中都存在', () => {
     const criticalKeys = [
       'common.appName',
@@ -101,14 +130,17 @@ describe('i18n 词典完整性', () => {
     }
   })
 
+  it('品牌名称统一为 Partitura', () => {
+    expect(zh.common.appName).toBe('Partitura')
+    expect(en.common.appName).toBe('Partitura')
+  })
+
   it('zh.json 默认语言包含中文文本', () => {
-    expect(zh.common.appName).toContain('工作区')
     expect(zh.auth.signIn).toContain('登录')
     expect(zh.search.noResults).toContain('未找到')
   })
 
   it('en.json 包含英文文本', () => {
-    expect(en.common.appName).toContain('Workspace')
     expect(en.auth.signIn).toContain('Sign')
     expect(en.search.noResults).toContain('No results')
   })

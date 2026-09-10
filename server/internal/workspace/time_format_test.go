@@ -69,8 +69,8 @@ func TestWorkspaceStatsTimeFormatIsRFC3339(t *testing.T) {
 	// 解析 JSON 响应，验证 recent_revisions 时间字段
 	var resp struct {
 		Stats struct {
-			TotalDocuments    int              `json:"total_documents"`
-			RecentRevisions   []RecentRevision `json:"recent_revisions"`
+			TotalDocuments  int              `json:"total_documents"`
+			RecentRevisions []RecentRevision `json:"recent_revisions"`
 		} `json:"stats"`
 	}
 	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
@@ -168,7 +168,7 @@ func TestAuditEntryTimeFormatIsRFC3339(t *testing.T) {
 
 	// 添加成员产生审计记录
 	wsRepo.AddUser("user-002", "member2", "member2@test.example", "user", false)
-	body := `{"user_id":"user-002","role":"viewer"}`
+	body := `{"username":"member2","role":"viewer"}`
 	req := authedRequest(http.MethodPost, "/api/workspaces/"+ws.ID+"/members", sessionToken, csrfToken, body)
 	rr := httptest.NewRecorder()
 	mux.ServeHTTP(rr, req)
@@ -228,5 +228,3 @@ func TestWorkspaceResponseNoTimeFields(t *testing.T) {
 		t.Error("workspace 响应不应包含 updated_at 字段")
 	}
 }
-
-
