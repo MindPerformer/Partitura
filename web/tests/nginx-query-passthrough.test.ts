@@ -104,6 +104,15 @@ describe('Nginx 查询参数透传', () => {
     expect(nginxConf).toContain('listen 8080')
   })
 
+  it('关闭绝对重定向，防止目录路由 301 泄漏容器端口', () => {
+    // 防的是"目录路由 301 泄漏容器端口"：
+    // Nuxt generate 为每个路由生成目录（login/、admin/ ...），访问 /login（无结尾斜杠）时
+    // try_files $uri $uri/ 命中目录，nginx 默认的 absolute_redirect on + port_in_redirect on
+    // 会返回 301 Location: http://host:8080/login/（容器内监听端口 8080），
+    // 浏览器地址栏因此被改写到 :8080。关闭后 Location 变为相对路径（/login/）。
+    expect(nginxConf).toContain('absolute_redirect off')
+  })
+
   it('健康检查端点 /healthz 配置正确', () => {
     expect(nginxConf).toContain('location = /healthz')
     expect(nginxConf).toContain('return 200')

@@ -183,6 +183,13 @@ knowledge-mcp login https://knowledge.company.com
 | `EMBEDDING_MODEL` | Embedding 模型名 | Qwen3-Embedding-8B |
 | `RERANKER_MODEL` | Reranker 模型名 | Qwen3-Reranker-8B |
 
+### Web 端口与目录路由重定向
+
+web 容器内 Nginx 固定监听 8080，宿主端口由 `WEB_PORT` 控制（默认 80）。
+Nuxt generate 会为每个路由生成目录（`login/`、`admin/` 等），访问无结尾斜杠的 `/login` 时 `try_files $uri $uri/` 命中目录，Nginx 默认的 `absolute_redirect on` + `port_in_redirect on` 会返回 `301 Location: http://<host>:8080/login/`，把浏览器地址栏改写到容器端口。本仓库已在 `web/nginx.conf.template` 中设置 `absolute_redirect off`，使 `Location` 变为相对路径。
+该修正通过 compose 运行时挂载 `web/nginx.conf.template` 到容器内 `/etc/nginx/nginx.conf.template` 生效，因此使用 GHCR 已发布镜像时无需自行重建镜像。
+如需更换宿主端口，只改 `WEB_PORT` 即可（容器内 8080 不变）。
+
 ## 安全注意事项
 
 - **PG/ES 不暴露宿主端口**：仅 web 对外暴露 80 端口，server/pg/es 仅内部网络可达

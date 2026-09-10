@@ -32,6 +32,13 @@ http {
     include /etc/nginx/mime.types;
     default_type application/octet-stream;
 
+    # 关闭 nginx 绝对重定向，避免把容器内监听端口泄漏进 Location 头。
+    # 根因：Nuxt generate 为每个路由生成目录（login/、admin/ ...），访问 /login 时
+    # try_files 命中目录，nginx 默认的 absolute_redirect on + port_in_redirect on
+    # 会返回 301 Location: http://host:8080/login/，导致浏览器地址栏被改写成 :8080。
+    # 关闭后 Location 变为相对路径（/login/），浏览器保持在当前 host:port。
+    absolute_redirect off;
+
     # 传输优化
     sendfile on;
     keepalive_timeout 65;

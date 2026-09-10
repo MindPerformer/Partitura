@@ -148,6 +148,12 @@ services:
     ports:
       # 仅 web 对外暴露，端口可配置以支持隔离测试
       - "${WEB_PORT:-80}:8080"
+    volumes:
+      # 运行时挂载修正后的 nginx 模板，覆盖镜像内同名文件。
+      # 引入动机：镜像的 entrypoint.sh 启动时会用 envsubst 渲染
+      # /etc/nginx/nginx.conf.template，因此挂载该文件即可让**已发布的 GHCR 镜像**
+      # 无需重新构建就获得修正（解决目录路由 301 泄漏容器端口 8080 的问题）。
+      - ./web/nginx.conf.template:/etc/nginx/nginx.conf.template:ro
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://localhost:8080/healthz || exit 1"]
       interval: 15s
