@@ -45,9 +45,26 @@ type Chunk struct {
 	IsSpecial bool
 }
 
+// LineRange 表示文档内一段命中区间的行号范围。
+// 引入动机：搜索改为"一个文档一条主结果"后，同文档其余命中 chunk
+// 需要以紧凑的行号区间形式暴露给调用方，便于调用方按需展开阅读，
+// 而不是重复返回完整 chunk 条目浪费响应体积。
+type LineRange struct {
+	// StartLine 是命中区间的起始行号（从 1 开始，含）。
+	StartLine int `json:"start_line"`
+	// EndLine 是命中区间的结束行号（含）。
+	EndLine int `json:"end_line"`
+	// Heading 是该命中区间所在 section 的 heading 文本，便于调用方定位上下文（可为空）。
+	Heading string `json:"heading"`
+}
+
 // SearchResult 表示一条搜索结果。
 // 引入动机：design/01-SEARCH.md §Search Result 要求返回 document_id, path, title,
 // section_path, start_line, end_line, snippet, score, revision, source freshness。
+//
+// 语义说明：经过文档级聚合（group_by=document）后，一条 SearchResult 代表
+// "一个文档的一条主结果"——主 chunk 是该文档内得分最高的命中段，
+// 同文档其余命中段通过 MatchedChunks/OtherRanges 折叠呈现。
 type SearchResult struct {
 	// DocumentID 是文档的 UUID。
 	DocumentID string `json:"document_id"`
@@ -69,6 +86,14 @@ type SearchResult struct {
 	Revision int `json:"revision"`
 	// Rank 是结果在最终列表中的排名（从 1 开始）。
 	Rank int `json:"rank"`
+	// MatchedChunks 是该文档在本次搜索中命中的 chunk 总数。
+	// 引入动机：文档级聚合后一条结果只展示主命中段，调用方需要知道
+	// 该文档实际命中了几段，以判断覆盖度并决定是否展开阅读更多区间。
+	MatchedChunks int `json:"matched_chunks"`
+	// OtherRanges 是同文档除主 chunk 外其余命中 chunk 的行号区间列表（上限 3 条）。
+	// 引入动机：避免同文档多 chunk 重复占用结果位、重复输出 path/title 浪费
+	// 响应体积；同时保留"还有哪些区间命中"的可导航信息，供调用方按需展开。
+	OtherRanges []LineRange `json:"other_ranges,omitempty"`
 }
 
 // SearchResponse 是搜索 API 的响应结构。
@@ -92,6 +117,11 @@ type SearchResponse struct {
 	SearchID string `json:"search_id"`
 	// RerankerUsed 标记是否使用了 reranker。
 	RerankerUsed bool `json:"reranker_used"`
+	// TruncatedByScore 是因归一化分数过低（< minNormalizedScore）而被裁剪掉的结果数。
+	// 引入动机：score 归一化裁剪会移除尾部噪声结果，调用方与运维需要
+	// 可观测的计数来区分"本来就没命中"与"命中了但被低分裁掉"两种情况，
+	// 避免裁剪行为变成不可见的隐式丢结果。
+	TruncatedByScore int `json:"truncated_by_score,omitempty"`
 }
 
 // CandidateResult 表示 RRF 融合后、reranker 之前的候选结果。
@@ -109,6 +139,12 @@ type CandidateResult struct {
 	BM25Rank int
 	// VectorRank 是在向量结果中的排名（从 1 开始，0 表示未出现在向量结果中）。
 	VectorRank int
+	// Highlights 是 ES 为该候选命中返回的高亮片段（key 为字段名，value 为
+	// 带 <em> 标记的 fragment 列表）。
+	// 引入动机：snippet 需要基于真实命中位置的高亮片段生成（命中点可见），
+	// 而不是永远截断 chunk 开头；highlight 只来自 BM25 检索，vector 检索无高亮，
+	// 因此挂在候选结果上供 snippet 构建阶段消费。
+	Highlights map[string][]string
 }
 
 // SearchProfileConfig 是 Search Profile 的完整配置，用于搜索管线运行时。

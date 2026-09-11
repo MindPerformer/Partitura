@@ -260,9 +260,10 @@ func (c *fakeESClient) Search(ctx context.Context, indexName string, query map[s
 	// 返回匹配的文档作为 hits
 	for _, e := range matching {
 		hit := struct {
-			ID     string                 `json:"_id"`
-			Score  float64                `json:"_score"`
-			Source map[string]interface{} `json:"_source"`
+			ID        string                 `json:"_id"`
+			Score     float64                `json:"_score"`
+			Source    map[string]interface{} `json:"_source"`
+			Highlight map[string][]string    `json:"highlight"`
 		}{ID: e.id, Score: 1.0, Source: e.body}
 		resp.Hits.Hits = append(resp.Hits.Hits, hit)
 	}

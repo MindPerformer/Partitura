@@ -183,6 +183,7 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		DegradationReason: output.DegradationReason,
 		SearchID:          output.SearchID,
 		RerankerUsed:      output.RerankerUsed,
+		TruncatedByScore:  output.TruncatedByScore,
 	}
 
 	// 记录搜索指标

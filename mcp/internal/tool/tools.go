@@ -1541,8 +1541,10 @@ func (r *Registry) applyPatchAndUpload(wsID, path, oldText, newText, baseContent
 
 func (r *Registry) knowledgeSearchTool() *protocol.Tool {
 	return &protocol.Tool{
-		Name:        "knowledge_search",
-		Description: "Search the knowledge base of the active workspace only. Cross-workspace search is not supported.",
+		Name: "knowledge_search",
+		Description: "Search the knowledge base of the active workspace only. Cross-workspace search is not supported. " +
+			"Results are aggregated per document: each hit is the best chunk of that document and other_ranges lists additional matched line ranges. " +
+			"For more context around a hit, call document_read with section_path or start_line+end_line.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -1564,7 +1566,11 @@ func (r *Registry) knowledgeSearchTool() *protocol.Tool {
 				},
 				"max_snippet_chars": map[string]interface{}{
 					"type":        "integer",
-					"description": "Maximum characters per result snippet; server generates ~200-char snippets, this truncates further client-side.",
+					"description": "Maximum runes per result snippet. Omit to truncate to 160; pass 0 to disable truncation.",
+				},
+				"verbose": map[string]interface{}{
+					"type":        "boolean",
+					"description": "Return the full unprojected result including document_id, search_id and other debug fields (default false).",
 				},
 			},
 			"required": []string{"query"},
@@ -1578,11 +1584,14 @@ func (r *Registry) handleKnowledgeSearch(args json.RawMessage) (*protocol.ToolRe
 	}
 
 	var params struct {
-		Query           string `json:"query"`
-		Mode            string `json:"mode"`
-		Limit           int    `json:"limit"`
-		Offset          int    `json:"offset"`
-		MaxSnippetChars int    `json:"max_snippet_chars"`
+		Query  string `json:"query"`
+		Mode   string `json:"mode"`
+		Limit  int    `json:"limit"`
+		Offset int    `json:"offset"`
+		// MaxSnippetChars 用指针区分"未传"与"显式传 0"：
+		// nil（未传）→ 默认截断到 defaultSearchSnippetRunes；显式 0 → 不截断；显式 >0 → 按该值截断。
+		MaxSnippetChars *int `json:"max_snippet_chars"`
+		Verbose         bool `json:"verbose"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -1620,14 +1629,27 @@ func (r *Registry) handleKnowledgeSearch(args json.RawMessage) (*protocol.ToolRe
 		return errorResult(fmt.Sprintf("search failed: %v", err)), nil
 	}
 
-	// max_snippet_chars>0 时对每个 result.snippet 按 rune 截断（客户端二次瘦身，属锦上添花）。
-	// 结果不是可解析对象或不含 results 数组时原样返回，不视为错误。
-	if params.MaxSnippetChars > 0 {
-		truncateSearchSnippets(result, params.MaxSnippetChars)
+	// max_snippet_chars 语义：未传 → 默认截到 defaultSearchSnippetRunes；显式 0 → 不截断；显式 >0 → 按该值。
+	// 截断在投影之前做（snippet 字段在两条路径上都存在）。
+	snippetCap := defaultSearchSnippetRunes
+	if params.MaxSnippetChars != nil {
+		snippetCap = *params.MaxSnippetChars
+	}
+	if snippetCap > 0 {
+		truncateSearchSnippets(result, snippetCap)
+	}
+
+	// verbose=true 时原样返回（调试/排障用）；否则投影瘦身，剔除对模型无用的字段。
+	if !params.Verbose {
+		result = projectSearchResult(result)
 	}
 
 	return jsonResult(result)
 }
+
+// defaultSearchSnippetRunes 是 knowledge_search 未传 max_snippet_chars 时的默认 snippet 截断长度（按 rune）。
+// 引入动机：server 生成 ~200 字符 snippet，默认压到 160 可进一步省 token；用户可传 0 关闭或传具体值覆盖。
+const defaultSearchSnippetRunes = 160
 
 // truncateSearchSnippets 对 search 结果的 results[].snippet 按 rune 截断到 max 并追加 "..."。
 // 引入动机：server 生成 ~200 字符 snippet，Agent 可进一步压缩以省上下文；snippet 可能含 UTF-8 中文，
@@ -1656,6 +1678,69 @@ func truncateSearchSnippets(result interface{}, max int) {
 			entry["snippet"] = string(runes[:max]) + "..."
 		}
 	}
+}
+
+// searchResultTopLevelFields 是 knowledge_search 非 verbose 路径下顶层保留的字段。
+// 剔除 search_id/reranker_used/limit/offset——对模型无用（limit/offset 是入参，模型已知）。
+var searchResultTopLevelFields = map[string]bool{
+	"results":            true,
+	"total":              true,
+	"degraded":           true,
+	"degradation_reason": true,
+	"truncated_by_score": true,
+}
+
+// searchResultItemFields 是每条 result 保留的字段。
+// 剔除 document_id/revision/rank——对模型意义小；matched_chunks/other_ranges 由 server 端文档级聚合透传。
+var searchResultItemFields = map[string]bool{
+	"path":           true,
+	"title":          true,
+	"section_path":   true,
+	"start_line":     true,
+	"end_line":       true,
+	"snippet":        true,
+	"score":          true,
+	"matched_chunks": true,
+	"other_ranges":   true,
+}
+
+// projectSearchResult 对 search 响应做投影瘦身：顶层和每条 result 都只保留对模型有用的字段。
+// 引入动机：SearchResponse 含 document_id/search_id/revision/rank 等字段，回传给模型会浪费 token；
+// 但投影只是瘦身不是校验——结构不符或解析失败时原样返回，不 fail。
+func projectSearchResult(result interface{}) interface{} {
+	obj, ok := result.(map[string]interface{})
+	if !ok {
+		return result
+	}
+
+	projected := make(map[string]interface{}, len(searchResultTopLevelFields))
+	for key := range searchResultTopLevelFields {
+		if val, exists := obj[key]; exists {
+			projected[key] = val
+		}
+	}
+
+	if results, ok := obj["results"].([]interface{}); ok {
+		projectedItems := make([]interface{}, 0, len(results))
+		for _, item := range results {
+			entry, ok := item.(map[string]interface{})
+			if !ok {
+				// 非对象条目原样透传，不丢弃
+				projectedItems = append(projectedItems, item)
+				continue
+			}
+			proj := make(map[string]interface{}, len(searchResultItemFields))
+			for key := range searchResultItemFields {
+				if val, exists := entry[key]; exists {
+					proj[key] = val
+				}
+			}
+			projectedItems = append(projectedItems, proj)
+		}
+		projected["results"] = projectedItems
+	}
+
+	return projected
 }
 
 // --- Source 工具 ---

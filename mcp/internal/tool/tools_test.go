@@ -635,6 +635,276 @@ func TestKnowledgeSearchNoWorkspaceInjection(t *testing.T) {
 	t.Fatal("期望请求路径包含 ws-1（active workspace）")
 }
 
+// --- knowledge_search 投影瘦身 ---
+
+// searchResponseFull 模拟 server 端文档级聚合后的完整 SearchResponse，
+// 含 verbose-only 字段（document_id/search_id/revision/rank）与新字段（matched_chunks/other_ranges/truncated_by_score）。
+const searchResponseFull = `{
+	"results": [
+		{
+			"document_id": "doc-1",
+			"path": "guide/intro.md",
+			"title": "Intro",
+			"section_path": ["Getting Started"],
+			"start_line": 10,
+			"end_line": 25,
+			"snippet": "hello world snippet",
+			"score": 0.95,
+			"rank": 1,
+			"revision": 3,
+			"matched_chunks": 2,
+			"other_ranges": [{"start_line": 40, "end_line": 55, "heading": "Advanced"}]
+		},
+		{
+			"document_id": "doc-2",
+			"path": "ref/api.md",
+			"title": "API",
+			"section_path": [],
+			"start_line": 1,
+			"end_line": 8,
+			"snippet": "second doc snippet",
+			"score": 0.70,
+			"rank": 2,
+			"revision": 1,
+			"matched_chunks": 1,
+			"other_ranges": []
+		}
+	],
+	"total": 5,
+	"degraded": false,
+	"degradation_reason": "",
+	"search_id": "s-abc",
+	"reranker_used": true,
+	"limit": 10,
+	"offset": 0,
+	"truncated_by_score": 3
+}`
+
+// setupSearchServer 返回一个 fake server + 已 switch 的 registry，
+// search 接口回包 body 由 searchBody 提供。
+func setupSearchServer(t *testing.T, searchBody string) (*fakeServer, *Registry) {
+	t.Helper()
+	fs := newFakeServer()
+	fs.mux.HandleFunc("POST /api/workspaces/ws-1/search", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(searchBody))
+	}))
+	r := newTestRegistry(newTestClient(t, fs))
+	r.wsState.Switch("ws-1", "Test Workspace")
+	return fs, r
+}
+
+// searchResultText 调用 knowledge_search 并把文本结果反序列化为 map。
+func searchResultText(t *testing.T, r *Registry, args json.RawMessage) map[string]interface{} {
+	t.Helper()
+	result, err := callToolByName(r, "knowledge_search", args)
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("search 失败: %s", result.Content[0].Text)
+	}
+	var m map[string]interface{}
+	if err := json.Unmarshal([]byte(result.Content[0].Text), &m); err != nil {
+		t.Fatalf("解析结果失败: %v\n原文: %s", err, result.Content[0].Text)
+	}
+	return m
+}
+
+// TestKnowledgeSearchProjectionFields 验证非 verbose 路径下：
+// 顶层剔除 search_id/reranker_used/limit/offset，透传 truncated_by_score；
+// 每条 result 剔除 document_id/revision/rank，透传 matched_chunks/other_ranges。
+func TestKnowledgeSearchProjectionFields(t *testing.T) {
+	_, r := setupSearchServer(t, searchResponseFull)
+
+	m := searchResultText(t, r, json.RawMessage(`{"query":"test"}`))
+
+	// 顶层：剔除字段不应存在
+	for _, removed := range []string{"search_id", "reranker_used", "limit", "offset"} {
+		if _, exists := m[removed]; exists {
+			t.Errorf("顶层字段 %s 应被剔除: %v", removed, m)
+		}
+	}
+	// 顶层：透传字段
+	if m["total"] != float64(5) {
+		t.Errorf("total = %v, 期望 5", m["total"])
+	}
+	if m["truncated_by_score"] != float64(3) {
+		t.Errorf("truncated_by_score = %v, 期望 3", m["truncated_by_score"])
+	}
+	if _, exists := m["degraded"]; !exists {
+		t.Error("degraded 应保留")
+	}
+
+	// 每条 result：剔除 document_id/revision/rank，透传 matched_chunks/other_ranges
+	results, ok := m["results"].([]interface{})
+	if !ok || len(results) != 2 {
+		t.Fatalf("results 应有 2 条: %v", m["results"])
+	}
+	first := results[0].(map[string]interface{})
+	for _, removed := range []string{"document_id", "revision", "rank"} {
+		if _, exists := first[removed]; exists {
+			t.Errorf("result 字段 %s 应被剔除: %v", removed, first)
+		}
+	}
+	if first["matched_chunks"] != float64(2) {
+		t.Errorf("matched_chunks = %v, 期望 2", first["matched_chunks"])
+	}
+	otherRanges, ok := first["other_ranges"].([]interface{})
+	if !ok || len(otherRanges) != 1 {
+		t.Fatalf("other_ranges 应有 1 条: %v", first["other_ranges"])
+	}
+	rng := otherRanges[0].(map[string]interface{})
+	if rng["start_line"] != float64(40) || rng["end_line"] != float64(55) || rng["heading"] != "Advanced" {
+		t.Errorf("other_ranges[0] = %v", rng)
+	}
+	if first["path"] != "guide/intro.md" || first["score"] != 0.95 {
+		t.Errorf("保留字段缺失: %v", first)
+	}
+}
+
+// TestKnowledgeSearchVerbosePassthrough 验证 verbose=true 时返回完整字段（含 document_id/search_id 等）。
+func TestKnowledgeSearchVerbosePassthrough(t *testing.T) {
+	_, r := setupSearchServer(t, searchResponseFull)
+
+	m := searchResultText(t, r, json.RawMessage(`{"query":"test","verbose":true}`))
+
+	// verbose：顶层 debug 字段应保留
+	for _, kept := range []string{"search_id", "reranker_used", "limit", "offset"} {
+		if _, exists := m[kept]; !exists {
+			t.Errorf("verbose 下顶层字段 %s 应保留: %v", kept, m)
+		}
+	}
+	if m["search_id"] != "s-abc" {
+		t.Errorf("search_id = %v, 期望 s-abc", m["search_id"])
+	}
+
+	// verbose：result 内 debug 字段应保留
+	results, _ := m["results"].([]interface{})
+	first := results[0].(map[string]interface{})
+	for _, kept := range []string{"document_id", "revision", "rank"} {
+		if _, exists := first[kept]; !exists {
+			t.Errorf("verbose 下 result 字段 %s 应保留: %v", kept, first)
+		}
+	}
+	if first["document_id"] != "doc-1" {
+		t.Errorf("document_id = %v, 期望 doc-1", first["document_id"])
+	}
+}
+
+// TestKnowledgeSearchMaxSnippetChars 验证 max_snippet_chars 三种取值的行为。
+func TestKnowledgeSearchMaxSnippetChars(t *testing.T) {
+	// 构造一个 snippet 长度 > 160 rune 的响应
+	longSnippet := strings.Repeat("a", 200)
+	body := `{"results":[{"path":"a.md","title":"A","start_line":1,"end_line":5,"snippet":"` + longSnippet + `","score":0.9,"matched_chunks":1}],"total":1,"degraded":false}`
+
+	tests := []struct {
+		name          string
+		args          string
+		wantMaxLen    int  // 期望 snippet 最大 rune 数
+		wantTruncated bool // 期望是否被截断（snippet 含 "..."）
+	}{
+		{
+			name:          "未传默认160",
+			args:          `{"query":"test"}`,
+			wantMaxLen:    163, // 160 rune + "..." (3 bytes)
+			wantTruncated: true,
+		},
+		{
+			name:          "显式0不截断",
+			args:          `{"query":"test","max_snippet_chars":0}`,
+			wantMaxLen:    200,
+			wantTruncated: false,
+		},
+		{
+			name:          "显式值50",
+			args:          `{"query":"test","max_snippet_chars":50}`,
+			wantMaxLen:    53, // 50 rune + "..." 
+			wantTruncated: true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, r := setupSearchServer(t, body)
+			m := searchResultText(t, r, json.RawMessage(tc.args))
+
+			results := m["results"].([]interface{})
+			snippet := results[0].(map[string]interface{})["snippet"].(string)
+			runeLen := len([]rune(snippet))
+
+			if tc.wantTruncated {
+				if runeLen > tc.wantMaxLen {
+					t.Errorf("snippet 长度 %d rune, 期望 <= %d", runeLen, tc.wantMaxLen)
+				}
+				if !strings.HasSuffix(snippet, "...") {
+					t.Errorf("截断后应以 ... 结尾: %q", snippet[len(snippet)-10:])
+				}
+			} else {
+				if runeLen != tc.wantMaxLen {
+					t.Errorf("snippet 长度 %d rune, 期望 %d（不截断）", runeLen, tc.wantMaxLen)
+				}
+			}
+		})
+	}
+}
+
+// TestKnowledgeSearchSnippetUTF8RuneTruncate 验证按 rune 截断不产生乱码。
+func TestKnowledgeSearchSnippetUTF8RuneTruncate(t *testing.T) {
+	// 中文字符串，每字 3 字节/1 rune；共 50 rune
+	chinese := strings.Repeat("中", 50)
+	body := `{"results":[{"path":"c.md","title":"C","start_line":1,"end_line":5,"snippet":"` + chinese + `","score":0.8,"matched_chunks":1}],"total":1,"degraded":false}`
+
+	_, r := setupSearchServer(t, body)
+	m := searchResultText(t, r, json.RawMessage(`{"query":"test","max_snippet_chars":20}`))
+
+	results := m["results"].([]interface{})
+	snippet := results[0].(map[string]interface{})["snippet"].(string)
+	runes := []rune(snippet)
+
+	// 截断到 20 rune + "..."
+	if len(runes) != 23 {
+		t.Fatalf("snippet rune 数 = %d, 期望 23 (20 + ...)", len(runes))
+	}
+	// 不应有 UTF-8 替换字符（乱码标志）
+	if strings.ContainsRune(snippet, '\uFFFD') {
+		t.Errorf("截断产生了乱码字符: %q", snippet)
+	}
+	// 前 20 个 rune 应都是 '中'
+	for i, r := range runes[:20] {
+		if r != '中' {
+			t.Errorf("rune[%d] = %c, 期望 '中'", i, r)
+		}
+	}
+}
+
+// TestProjectSearchResultPassthroughOnBadShape 验证非标准结构原样返回（不 panic、不 fail）。
+func TestProjectSearchResultPassthroughOnBadShape(t *testing.T) {
+	// 非 map 输入
+	input := "not a map"
+	if got := projectSearchResult(input); got != input {
+		t.Errorf("非 map 输入应原样返回, 得到 %v", got)
+	}
+
+	// map 但无 results
+	input2 := map[string]interface{}{"foo": "bar"}
+	got2 := projectSearchResult(input2).(map[string]interface{})
+	if _, exists := got2["foo"]; exists {
+		t.Error("顶层未知字段应被剔除")
+	}
+
+	// results 非数组
+	input3 := map[string]interface{}{"results": "not-array", "total": 1}
+	got3 := projectSearchResult(input3).(map[string]interface{})
+	if got3["total"] != 1 {
+		t.Errorf("total 应保留: %v", got3)
+	}
+	if got3["results"] != "not-array" {
+		t.Errorf("results 非数组时应原样透传: %v", got3["results"])
+	}
+}
+
 // --- switch_workspace 返回不含 PROJECT/AGENTS 全文 ---
 
 func TestSwitchWorkspaceNoFullText(t *testing.T) {

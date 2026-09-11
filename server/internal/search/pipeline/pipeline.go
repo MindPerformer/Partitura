@@ -18,6 +18,8 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"sort"
+	"strings"
 	"time"
 
 	"partitura/server/internal/es"
@@ -122,6 +124,11 @@ type SearchOutput struct {
 	RerankerCost      float64
 	SearchID          string
 	LatencyMs         int
+	// TruncatedByScore 是因归一化分数过低而被裁剪掉的结果数。
+	// 引入动机：归一化裁剪会把尾部低相关噪声从结果集中移除，
+	// 该计数让"裁剪行为"可观测，便于调用方与运维区分
+	// "无命中"与"命中但被低分过滤"。
+	TruncatedByScore int
 }
 
 // Search 执行完整的搜索管线。
@@ -332,7 +339,23 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 	// --- 阶段 5: Document Diversification ---
 	finalResults = diversity.Apply(finalResults, input.Profile.MaxChunksPerDocument, input.Profile.MergeAdjacentChunks)
 
+	// --- 阶段 6: 文档级聚合 ---
+	// 引入动机：搜索改为"一个文档一条主结果"，避免同文档多 chunk 重复挤占
+	// 结果位、重复输出 path/title；limit 自此作用于"文档数"而非"chunk 数"。
+	// 聚合在 diversity 之后进行：diversity 先做 chunk 级多样性/相邻合并，
+	// groupByDocument 再把每个文档折叠为单条主结果（MatchedChunks/OtherRanges）。
+	finalResults = groupByDocument(finalResults)
+
+	// --- 阶段 7: Score 归一化 + 低分裁剪 ---
+	// 引入动机：RRF 融合分数是 ~0.0X 的不可读小数，归一化到 0~1 后模型可读；
+	// 归一化后低于 minNormalizedScore 的尾部结果多为噪声，直接丢弃以控制输出质量。
+	// 裁剪数量写入 output.TruncatedByScore 供响应透传与可观测。
+	normalizedResults, truncatedByScore := normalizeAndTrimByScore(finalResults, output.RerankerUsed)
+	finalResults = normalizedResults
+	output.TruncatedByScore = truncatedByScore
+
 	// --- 分页 ---
+	// 注意：Total 采用裁剪后（文档级聚合后）的结果数，与"一个文档一条"语义一致。
 	output.Total = len(finalResults)
 	if input.Offset >= len(finalResults) {
 		finalResults = nil
@@ -414,6 +437,21 @@ func (p *Pipeline) searchBM25(ctx context.Context, indexName string, input Searc
 				},
 			},
 		},
+		// 请求 ES 高亮片段，用于 buildSnippet 生成"命中点可见"的 snippet。
+		// 引入动机：原实现 snippet 永远截断 chunk 开头，与命中位置无关，
+		// 模型只能看到开头套话。请求 content/heading/title 的 fragment 后，
+		// snippet 可定位到真实命中处，显著提升结果可读性。
+		// content 取 2 个 fragment 以覆盖可能的多个命中点，order=score 优先高分片段。
+		"highlight": map[string]interface{}{
+			"fields": map[string]interface{}{
+				"title":   map[string]interface{}{"number_of_fragments": 1, "fragment_size": 80},
+				"heading": map[string]interface{}{"number_of_fragments": 1, "fragment_size": 80},
+				"content": map[string]interface{}{"number_of_fragments": 2, "fragment_size": 160, "order": "score"},
+			},
+			"pre_tags":             []string{"<em>"},
+			"post_tags":            []string{"</em>"},
+			"require_field_match": false,
+		},
 	}
 
 	resp, err := p.esClient.Search(ctx, indexName, query)
@@ -426,8 +464,9 @@ func (p *Pipeline) searchBM25(ctx context.Context, indexName string, input Searc
 		chunk := hitToChunk(hit.Source)
 		chunk.WorkspaceID = input.WorkspaceID
 		results = append(results, types.CandidateResult{
-			Chunk:     chunk,
-			BM25Score: hit.Score,
+			Chunk:      chunk,
+			BM25Score:  hit.Score,
+			Highlights: hit.Highlight,
 		})
 	}
 
@@ -543,7 +582,7 @@ func candidatesToResults(candidates []types.CandidateResult) []types.SearchResul
 			SectionPath: c.Chunk.SectionPath,
 			StartLine:   c.Chunk.StartLine,
 			EndLine:     c.Chunk.EndLine,
-			Snippet:     truncate(c.Chunk.Content, 200),
+			Snippet:     buildSnippet(c.Chunk, c.Highlights),
 			Score:       c.RRFScore,
 			Revision:    c.Chunk.Revision,
 			Rank:        i + 1,
@@ -553,35 +592,230 @@ func candidatesToResults(candidates []types.CandidateResult) []types.SearchResul
 }
 
 // rerankedToResults 将 reranker 结果转换为搜索结果。
+//
+// 注意：reranked 中 Index 越界的条目会被跳过（不产生结果项）。
+// 原实现用预分配数组 + continue，越界时留下零值 SearchResult 占位，
+// 导致结果里混入全空条目；改为按 append 紧凑收集，保证每条都是有效结果。
 func rerankedToResults(candidates []types.CandidateResult, reranked []types.RerankerResult) []types.SearchResult {
-	results := make([]types.SearchResult, len(reranked))
-	for i, rr := range reranked {
+	results := make([]types.SearchResult, 0, len(reranked))
+	for _, rr := range reranked {
 		if rr.Index < 0 || rr.Index >= len(candidates) {
 			continue
 		}
 		c := candidates[rr.Index]
-		results[i] = types.SearchResult{
+		results = append(results, types.SearchResult{
 			DocumentID:  c.Chunk.DocumentID,
 			Path:        c.Chunk.Path,
 			Title:       c.Chunk.Title,
 			SectionPath: c.Chunk.SectionPath,
 			StartLine:   c.Chunk.StartLine,
 			EndLine:     c.Chunk.EndLine,
-			Snippet:     truncate(c.Chunk.Content, 200),
+			Snippet:     buildSnippet(c.Chunk, c.Highlights),
 			Score:       rr.Score,
 			Revision:    c.Chunk.Revision,
-			Rank:        i + 1,
-		}
+			Rank:        len(results) + 1,
+		})
 	}
 	return results
 }
 
-// truncate 截断文本到指定长度。
-func truncate(s string, maxLen int) string {
-	if len(s) <= maxLen {
+// snippetMaxRunes 是 snippet 的总长度上限（按 rune 计）。
+// 引入动机：snippet 需要在"命中点可见"与"响应体积可控"之间取一个上限，
+// 240 rune 足以容纳 1~2 个 content fragment（各 ~160 字符）加连接符，
+// 又不会把整篇 chunk 塞进结果里。
+const snippetMaxRunes = 240
+
+// contentFallbackRunes 是无高亮时 content 兜底截断的长度（按 rune 计）。
+// 与原实现的 200 一致，保持降级路径输出规模不变。
+const contentFallbackRunes = 200
+
+// buildSnippet 基于 ES 高亮片段生成"命中点可见"的 snippet。
+//
+// 引入动机：原实现 snippet 永远取 chunk 开头（truncate(content,200)），
+// 与命中位置无关，模型只能看到开头套话。本函数优先使用 ES 返回的高亮
+// fragment 定位真实命中处，提升结果可读性。
+//
+// 取值优先级：
+//  1. highlight["content"]：多 fragment 用 " … " 连接，保留 <em> 标记（模型可读）；
+//  2. content 无高亮时降级到 highlight["heading"] / highlight["title"]；
+//  3. 完全没有高亮时回退 truncate(chunk.Content, contentFallbackRunes)。
+//
+// 无论走哪条路径，最终结果都按 rune 截断到 snippetMaxRunes，
+// 保证中文等多字节字符不会被按字节切断。
+func buildSnippet(chunk types.Chunk, highlights map[string][]string) string {
+	// 优先 content 高亮：content 是正文命中，最能反映相关性。
+	if fragments := highlights["content"]; len(fragments) > 0 {
+		return truncateRunes(strings.Join(fragments, " … "), snippetMaxRunes)
+	}
+	// 其次 heading 高亮：命中的是小节标题。
+	if fragments := highlights["heading"]; len(fragments) > 0 {
+		return truncateRunes(strings.Join(fragments, " … "), snippetMaxRunes)
+	}
+	// 再次 title 高亮：命中的是文档标题。
+	if fragments := highlights["title"]; len(fragments) > 0 {
+		return truncateRunes(strings.Join(fragments, " … "), snippetMaxRunes)
+	}
+	// 无任何高亮（如 vector-only 命中）时回退到 chunk 开头截断。
+	return truncateRunes(chunk.Content, contentFallbackRunes)
+}
+
+// groupByDocument 把 chunk 级搜索结果折叠为"一个文档一条主结果"。
+//
+// 引入动机：原先一个文档的多个命中 chunk 各占一个结果位，重复输出
+// path/title 浪费响应体积且稀释了文档多样性；聚合后 limit 作用于文档数，
+// 每条结果代表一个文档的最相关命中段，同文档其余命中段折叠进 OtherRanges。
+//
+// 语义：
+//   - 按 DocumentID 分组，每组取 Score 最高的 chunk 作为主结果；
+//   - MatchedChunks = 组大小（该文档本次命中的 chunk 总数）；
+//   - 组内其余 chunk 按 Score 降序填入 OtherRanges（最多 3 条）；
+//   - 组间按主 chunk Score 降序排列，并重排 Rank。
+//
+// 输入应已按 Score 降序（diversity.Apply 输出保证），但函数内部仍显式
+// 排序以保证独立调用时的正确性。
+func groupByDocument(results []types.SearchResult) []types.SearchResult {
+	if len(results) == 0 {
+		return results
+	}
+
+	// 按文档分组，保持文档首次出现的顺序。
+	docChunks := make(map[string][]types.SearchResult, len(results))
+	docOrder := make([]string, 0, len(results))
+	for _, r := range results {
+		if _, exists := docChunks[r.DocumentID]; !exists {
+			docOrder = append(docOrder, r.DocumentID)
+		}
+		docChunks[r.DocumentID] = append(docChunks[r.DocumentID], r)
+	}
+
+	grouped := make([]types.SearchResult, 0, len(docChunks))
+	for _, docID := range docOrder {
+		chunks := docChunks[docID]
+		// 组内按 Score 降序，最高分 chunk 作为主结果。
+		sort.SliceStable(chunks, func(i, j int) bool {
+			return chunks[i].Score > chunks[j].Score
+		})
+
+		primary := chunks[0]
+		primary.MatchedChunks = len(chunks)
+
+		// 其余 chunk 折叠为行号区间（最多 3 条），保留可导航信息。
+		// chunks[1:] 已按 Score 降序，取前 3 个即可。
+		const maxOtherRanges = 3
+		others := chunks[1:]
+		if len(others) > maxOtherRanges {
+			others = others[:maxOtherRanges]
+		}
+		if len(others) > 0 {
+			primary.OtherRanges = make([]types.LineRange, 0, len(others))
+			for _, oc := range others {
+				primary.OtherRanges = append(primary.OtherRanges, types.LineRange{
+					StartLine: oc.StartLine,
+					EndLine:   oc.EndLine,
+					Heading:   headingOf(oc),
+				})
+			}
+		}
+		grouped = append(grouped, primary)
+	}
+
+	// 组间按主 chunk Score 降序并重排 Rank。
+	sort.SliceStable(grouped, func(i, j int) bool {
+		return grouped[i].Score > grouped[j].Score
+	})
+	for i := range grouped {
+		grouped[i].Rank = i + 1
+	}
+	return grouped
+}
+
+// headingOf 返回一个结果用于 OtherRanges 的 heading 文本。
+// 引入动机：SearchResult 没有独立的 Heading 字段，heading 信息承载在
+// SectionPath 的末级；取末级 heading 作为区间的可导航标签。
+func headingOf(r types.SearchResult) string {
+	if len(r.SectionPath) == 0 {
+		return ""
+	}
+	return r.SectionPath[len(r.SectionPath)-1]
+}
+
+// minNormalizedScore 是归一化分数的下限阈值。
+// 引入动机：归一化后低于该值的结果多为与主结果相关性差距过大的尾部噪声，
+// 直接丢弃以控制输出质量；0.15 是一个保守的经验阈值，只裁掉明显脱节的长尾。
+const minNormalizedScore = 0.15
+
+// normalizeAndTrimByScore 对结果 Score 做归一化并按阈值裁剪尾部噪声。
+//
+// 引入动机：RRF 融合分数是 ~0.0X 的不可读小数，模型难以理解；归一化到
+// 0~1（score /= top1Score）后分数具备可读性。归一化后低于 minNormalizedScore
+// 的结果与最相关结果差距过大，属于噪声，予以裁剪并计数返回。
+//
+// 参数 usedReranker 表示本批结果的 Score 是否来自 reranker：
+// reranker 分数本身通常已在 0~1，但若 reranker 返回全 0 或负分（异常/无效输出），
+// 归一化会把所有结果置 0 进而被全部裁掉——这是误删。因此当 usedReranker 为 true
+// 且 top1 <= 0 时跳过裁剪，原样返回，避免 reranker 异常输出导致结果全灭。
+//
+// 返回值：(归一化并裁剪后的结果, 被裁剪掉的结果数)。
+func normalizeAndTrimByScore(results []types.SearchResult, usedReranker bool) ([]types.SearchResult, int) {
+	if len(results) == 0 {
+		return results, 0
+	}
+
+	// 找出归一化基准（最大 Score）。结果已按 Score 降序，首位即 top1，
+	// 但显式取最大值以兼容独立调用时未排序的输入。
+	top1 := results[0].Score
+	for _, r := range results {
+		if r.Score > top1 {
+			top1 = r.Score
+		}
+	}
+
+	if top1 <= 0 {
+		if usedReranker {
+			// reranker 全 0/负分属于异常输出：跳过归一化与裁剪，避免误删全部结果。
+			return results, 0
+		}
+		// RRF 路径 top1==0：所有分数都是 0，归一化无意义，全部置 0，不裁剪。
+		for i := range results {
+			results[i].Score = 0
+		}
+		return results, 0
+	}
+
+	kept := make([]types.SearchResult, 0, len(results))
+	truncated := 0
+	for i := range results {
+		normalized := results[i].Score / top1
+		if normalized < minNormalizedScore {
+			truncated++
+			continue
+		}
+		results[i].Score = normalized
+		kept = append(kept, results[i])
+	}
+
+	// 裁剪后重排 Rank，保持连续性。
+	for i := range kept {
+		kept[i].Rank = i + 1
+	}
+	return kept, truncated
+}
+
+// truncateRunes 按 rune 截断文本到指定长度，超出时追加省略号。
+// 引入动机：原 truncate 按字节截断，遇到中文等多字节字符会在字符中间切断
+// 产生乱码；snippet 需要按 rune 截断保证输出合法 UTF-8。
+func truncateRunes(s string, maxRunes int) string {
+	runes := []rune(s)
+	if len(runes) <= maxRunes {
 		return s
 	}
-	return s[:maxLen] + "..."
+	return string(runes[:maxRunes]) + "..."
+}
+
+// truncate 截断文本到指定长度（按 rune）。
+// 保留原函数签名以兼容既有调用，内部改为 rune 安全截断。
+func truncate(s string, maxLen int) string {
+	return truncateRunes(s, maxLen)
 }
 
 // generateSearchID 生成搜索唯一标识。

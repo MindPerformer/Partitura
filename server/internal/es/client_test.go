@@ -123,9 +123,10 @@ func (c *FakeClient) Search(ctx context.Context, indexName string, query map[str
 	}
 	for id, body := range c.docs[indexName] {
 		hit := struct {
-			ID     string                 `json:"_id"`
-			Score  float64                `json:"_score"`
-			Source map[string]interface{} `json:"_source"`
+			ID        string                 `json:"_id"`
+			Score     float64                `json:"_score"`
+			Source    map[string]interface{} `json:"_source"`
+			Highlight map[string][]string    `json:"highlight"`
 		}{ID: id, Score: 1.0, Source: body}
 		resp.Hits.Hits = append(resp.Hits.Hits, hit)
 	}

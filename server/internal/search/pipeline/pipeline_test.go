@@ -9,6 +9,8 @@ package pipeline
 
 import (
 	"context"
+	"sort"
+	"strings"
 	"testing"
 
 	"partitura/server/internal/es"
@@ -35,6 +37,35 @@ type fakeESClient struct {
 	// 引入动机：design/01-SEARCH.md §Index Version 要求普通搜索打 alias
 	// knowledge_current；需要真实观察管线下发给 ES 的索引名来锁定该行为。
 	searchedIndices []string
+	// highlights 记录各文档 ID 对应的高亮片段，Search 时挂到对应 hit 上。
+	// 引入动机：buildSnippet 依赖 ES 返回的 highlight 生成命中点 snippet，
+	// fake 需要能按文档可控地返回高亮，才能驱动 snippet 的命中/降级路径。
+	highlights map[string]map[string][]string
+	// lastQuery 记录最近一次 Search 收到的原始 query 映射。
+	// 引入动机：需要断言 BM25 查询体包含 highlight 子句，
+	// 必须观察真实下发给 ES 的请求体而非仅校验返回值。
+	lastQuery map[string]interface{}
+	// scores 记录各文档 ID 的 BM25 _score，Search 时作为 hit.Score 返回。
+	// 引入动机：默认所有 hit Score=1.0 会导致同文档 chunk 同分，
+	// 组内主 chunk 选举依赖 map 遍历顺序而不稳定；按 ID 可控 score
+	// 让聚合的主结果与排序确定可断言。
+	scores map[string]float64
+}
+
+// highlightFor 返回指定文档 ID 配置的高亮片段，未配置时返回 nil。
+func (c *fakeESClient) highlightFor(docID string) map[string][]string {
+	if c.highlights == nil {
+		return nil
+	}
+	return c.highlights[docID]
+}
+
+// scoreFor 返回指定文档 ID 配置的 _score，未配置时返回默认 1.0。
+func (c *fakeESClient) scoreFor(docID string) float64 {
+	if s, ok := c.scores[docID]; ok {
+		return s
+	}
+	return 1.0
 }
 
 func newFakeESClient() *fakeESClient {
@@ -124,16 +155,18 @@ func (c *fakeESClient) DeleteByQuery(ctx context.Context, indexName string, quer
 
 func (c *fakeESClient) Search(ctx context.Context, indexName string, query map[string]interface{}) (*es.SearchResponse, error) {
 	c.searchedIndices = append(c.searchedIndices, indexName)
+	c.lastQuery = query
 	resp := &es.SearchResponse{}
 	if c.docs[indexName] == nil {
 		return resp, nil
 	}
 	for id, body := range c.docs[indexName] {
 		hit := struct {
-			ID     string                 `json:"_id"`
-			Score  float64                `json:"_score"`
-			Source map[string]interface{} `json:"_source"`
-		}{ID: id, Score: 1.0, Source: body}
+			ID        string                 `json:"_id"`
+			Score     float64                `json:"_score"`
+			Source    map[string]interface{} `json:"_source"`
+			Highlight map[string][]string    `json:"highlight"`
+		}{ID: id, Score: c.scoreFor(id), Source: body, Highlight: c.highlightFor(id)}
 		resp.Hits.Hits = append(resp.Hits.Hits, hit)
 	}
 	resp.Hits.Total.Value = int64(len(resp.Hits.Hits))
@@ -991,4 +1024,479 @@ func TestSearch_EmptyIndexNameAndProfileIndex_FallsBackToAlias(t *testing.T) {
 	}
 
 	assertSearchedIndices(t, client, []string{es.AliasName})
+}
+
+// scoringReranker 是测试用的 reranker，按候选文本内容给分。
+// 引入动机：reranker 路径下 Score 直接来自 reranker 返回值，需要按文档可控地
+// 制造分数差异以驱动归一化裁剪；候选的 DocumentID 不在 RerankerCandidate 中暴露，
+// 只能依据 Text（chunk.Content）内容匹配来区分文档给分。
+type scoringReranker struct {
+	// scoreByContentSubstr 按"候选 Text 包含的子串"→ 分数 映射给分。
+	scoreByContentSubstr map[string]float64
+	// defaultScore 是未匹配任何子串时的默认分。
+	defaultScore float64
+}
+
+func (s *scoringReranker) Rerank(ctx context.Context, query string, candidates []types.RerankerCandidate) ([]types.RerankerResult, error) {
+	results := make([]types.RerankerResult, len(candidates))
+	for i, c := range candidates {
+		score := s.defaultScore
+		for substr, sc := range s.scoreByContentSubstr {
+			if strings.Contains(c.Text, substr) {
+				score = sc
+				break
+			}
+		}
+		results[i] = types.RerankerResult{Index: i, Score: score}
+	}
+	// reranker 通常返回按分数降序的结果；按分数降序排列模拟真实行为。
+	sort.SliceStable(results, func(i, j int) bool { return results[i].Score > results[j].Score })
+	return results, nil
+}
+
+func (s *scoringReranker) Available(ctx context.Context) bool { return true }
+
+// ===== 搜索改造（highlight snippet / 文档级聚合 / score 归一化裁剪）测试 =====
+
+// TestSearchBM25_QueryContainsHighlight 验证 BM25 查询体携带 highlight 子句。
+//
+// 引入动机：buildSnippet 依赖 ES 返回的高亮 fragment 生成命中点 snippet，
+// 必须确认管线真实地把 highlight 请求下发给 ES，否则 snippet 永远走不到高亮路径。
+// 断言结构字段值而非源码字符串，保证验证的是真实下发的请求体。
+func TestSearchBM25_QueryContainsHighlight(t *testing.T) {
+	client := newFakeESClient()
+	ctx := context.Background()
+	_ = client.CreateIndex(ctx, "knowledge_v1", nil)
+	_ = client.BulkIndex(ctx, "knowledge_v1", []es.IndexDoc{
+		{ID: "doc1_0", Body: map[string]interface{}{
+			"document_id": "doc1",
+			"content":     "content",
+			"status":      "active",
+		}},
+	})
+
+	pipe := NewPipeline(client, nil, nil)
+	_, err := pipe.Search(ctx, SearchInput{
+		WorkspaceID: "ws-1",
+		Query:       "test",
+		Profile:     testProfile(),
+		Limit:       10,
+		Mode:        "lexical",
+	})
+	if err != nil {
+		t.Fatalf("Search 失败: %v", err)
+	}
+
+	highlight, ok := client.lastQuery["highlight"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("BM25 查询体应包含 highlight 子句，实际 query: %#v", client.lastQuery)
+	}
+	fields, ok := highlight["fields"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("highlight 应包含 fields，实际: %#v", highlight)
+	}
+	// content fragment 应取 2 个、order=score，以覆盖多个命中点。
+	content, ok := fields["content"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("highlight.fields 应包含 content，实际: %#v", fields)
+	}
+	if content["number_of_fragments"] != 2 {
+		t.Errorf("content.number_of_fragments 应为 2，得到 %#v", content["number_of_fragments"])
+	}
+	if content["order"] != "score" {
+		t.Errorf("content.order 应为 score，得到 %#v", content["order"])
+	}
+	// pre_tags/post_tags 必须是 <em></em>，buildSnippet 依赖该标记识别命中点。
+	preTags, ok := highlight["pre_tags"].([]string)
+	if !ok || len(preTags) == 0 || preTags[0] != "<em>" {
+		t.Errorf("highlight.pre_tags 应为 [<em>]，得到 %#v", highlight["pre_tags"])
+	}
+	postTags, ok := highlight["post_tags"].([]string)
+	if !ok || len(postTags) == 0 || postTags[0] != "</em>" {
+		t.Errorf("highlight.post_tags 应为 [</em>]，得到 %#v", highlight["post_tags"])
+	}
+	if highlight["require_field_match"] != false {
+		t.Errorf("highlight.require_field_match 应为 false，得到 %#v", highlight["require_field_match"])
+	}
+}
+
+// TestBuildSnippet_ContentHighlightPreferred 验证 content 高亮优先且保留 <em>。
+//
+// 引入动机：snippet 应定位到真实命中点而非开头套话；content 高亮是正文命中，
+// 优先级最高，且保留 <em> 标记让模型/前端能识别命中词。
+func TestBuildSnippet_ContentHighlightPreferred(t *testing.T) {
+	chunk := types.Chunk{Content: "这是 chunk 开头的内容，与命中点无关。"}
+	highlights := map[string][]string{
+		"content": {"这是包含 <em>关键词</em> 的正文片段。"},
+		"heading": {"标题 <em>关键词</em>"},
+	}
+	got := buildSnippet(chunk, highlights)
+	if got != "这是包含 <em>关键词</em> 的正文片段。" {
+		t.Errorf("应优先返回 content 高亮 fragment，得到 %q", got)
+	}
+}
+
+// TestBuildSnippet_MultipleContentFragmentsJoined 验证多 content fragment 用 " … " 连接。
+//
+// 引入动机：content 配置了 number_of_fragments=2，多命中点应合并呈现，
+// 让模型看到多个命中上下文；连接符 " … " 表达片段间存在省略。
+func TestBuildSnippet_MultipleContentFragmentsJoined(t *testing.T) {
+	chunk := types.Chunk{Content: "正文"}
+	highlights := map[string][]string{
+		"content": {"片段一 <em>词</em>", "片段二 <em>词</em>"},
+	}
+	got := buildSnippet(chunk, highlights)
+	want := "片段一 <em>词</em> … 片段二 <em>词</em>"
+	if got != want {
+		t.Errorf("多 fragment 应用 … 连接，得到 %q，期望 %q", got, want)
+	}
+}
+
+// TestBuildSnippet_FallbackToHeadingThenTitle 验证 content 缺失时降级到 heading/title。
+//
+// 引入动机：命中可能落在 heading 或 title 而非正文，此时 snippet 仍应反映命中处；
+// heading 比 title 更具体（指向小节），优先于 title。
+func TestBuildSnippet_FallbackToHeadingThenTitle(t *testing.T) {
+	chunk := types.Chunk{Content: "正文内容"}
+
+	// 仅 heading 高亮
+	got := buildSnippet(chunk, map[string][]string{"heading": {"小节 <em>词</em>"}})
+	if got != "小节 <em>词</em>" {
+		t.Errorf("content 缺失时应降级到 heading，得到 %q", got)
+	}
+
+	// 仅 title 高亮
+	got = buildSnippet(chunk, map[string][]string{"title": {"标题 <em>词</em>"}})
+	if got != "标题 <em>词</em>" {
+		t.Errorf("content/heading 缺失时应降级到 title，得到 %q", got)
+	}
+}
+
+// TestBuildSnippet_NoHighlight_FallsBackToContent 验证无高亮时回退 chunk 开头截断。
+//
+// 引入动机：vector-only 命中没有高亮片段，snippet 仍需给出可读内容，
+// 回退到 content 开头截断是合理的兜底，且必须按 rune 截断不乱码。
+func TestBuildSnippet_NoHighlight_FallsBackToContent(t *testing.T) {
+	// 构造超过 200 rune 的中文 content，验证按 rune 截断而非按字节乱码。
+	long := ""
+	for i := 0; i < 250; i++ {
+		long += "中"
+	}
+	chunk := types.Chunk{Content: long}
+	got := buildSnippet(chunk, nil)
+	runes := []rune(got)
+	// 200 个 '中' + "..."(3 个 ASCII rune) = 203 rune
+	if len(runes) != contentFallbackRunes+3 {
+		t.Errorf("无高亮时应回退 content 截断到 %d rune+省略号，得到 %d rune", contentFallbackRunes, len(runes))
+	}
+	if got[len(got)-3:] != "..." {
+		t.Errorf("截断后应以 ... 结尾，得到末尾 %q", got[len(got)-3:])
+	}
+}
+
+// TestBuildSnippet_TruncatesByRune 验证高亮片段总长超限按 rune 截断。
+//
+// 引入动机：多 fragment 连接后可能超过 snippetMaxRunes，
+// 必须按 rune 截断保证中文输出合法且长度受控。
+func TestBuildSnippet_TruncatesByRune(t *testing.T) {
+	long := ""
+	for i := 0; i < 300; i++ {
+		long += "汉"
+	}
+	chunk := types.Chunk{Content: "x"}
+	highlights := map[string][]string{"content": {long}}
+	got := buildSnippet(chunk, highlights)
+	if n := len([]rune(got)); n != snippetMaxRunes+3 {
+		t.Errorf("超长 snippet 应截断到 %d rune+省略号，得到 %d rune", snippetMaxRunes, n)
+	}
+}
+
+// TestGroupByDocument_SingleResultPerDoc 验证每个文档只产出一条主结果。
+//
+// 引入动机：文档级聚合要求"一个文档一条"，主结果是组内最高分 chunk，
+// MatchedChunks 记录命中总数，其余命中段折叠进 OtherRanges。
+func TestGroupByDocument_SingleResultPerDoc(t *testing.T) {
+	results := []types.SearchResult{
+		{DocumentID: "d1", Score: 0.9, StartLine: 1, EndLine: 10, SectionPath: []string{"A"}},
+		{DocumentID: "d1", Score: 0.7, StartLine: 20, EndLine: 30, SectionPath: []string{"B"}},
+		{DocumentID: "d1", Score: 0.5, StartLine: 40, EndLine: 50, SectionPath: []string{"C"}},
+		{DocumentID: "d2", Score: 0.8, StartLine: 1, EndLine: 10, SectionPath: []string{"X"}},
+	}
+
+	grouped := groupByDocument(results)
+	if len(grouped) != 2 {
+		t.Fatalf("聚合后应有 2 条文档级结果，得到 %d", len(grouped))
+	}
+
+	// d1 主结果应是最高分 chunk（0.9, lines 1-10）
+	var d1 types.SearchResult
+	for _, r := range grouped {
+		if r.DocumentID == "d1" {
+			d1 = r
+		}
+	}
+	if d1.Score != 0.9 {
+		t.Errorf("d1 主 chunk 应为最高分 0.9，得到 %v", d1.Score)
+	}
+	if d1.MatchedChunks != 3 {
+		t.Errorf("d1 MatchedChunks 应为 3，得到 %d", d1.MatchedChunks)
+	}
+	if len(d1.OtherRanges) != 2 {
+		t.Fatalf("d1 应有 2 条 OtherRanges，得到 %d", len(d1.OtherRanges))
+	}
+	// OtherRanges 按组内 score 降序：先 0.7(lines 20-30,B)，再 0.5(lines 40-50,C)。
+	if d1.OtherRanges[0].StartLine != 20 || d1.OtherRanges[0].EndLine != 30 || d1.OtherRanges[0].Heading != "B" {
+		t.Errorf("d1.OtherRanges[0] 应为 {20,30,B}，得到 %+v", d1.OtherRanges[0])
+	}
+	if d1.OtherRanges[1].StartLine != 40 || d1.OtherRanges[1].Heading != "C" {
+		t.Errorf("d1.OtherRanges[1] 应为 {40,50,C}，得到 %+v", d1.OtherRanges[1])
+	}
+}
+
+// TestGroupByDocument_OtherRangesCappedAt3 验证 OtherRanges 上限为 3。
+//
+// 引入动机：OtherRanges 是可导航提示而非完整列表，限制 3 条防止
+// 单文档命中过多时响应体积膨胀。
+func TestGroupByDocument_OtherRangesCappedAt3(t *testing.T) {
+	results := []types.SearchResult{
+		{DocumentID: "d1", Score: 0.95, StartLine: 1, EndLine: 5},
+		{DocumentID: "d1", Score: 0.9, StartLine: 10, EndLine: 15},
+		{DocumentID: "d1", Score: 0.8, StartLine: 20, EndLine: 25},
+		{DocumentID: "d1", Score: 0.7, StartLine: 30, EndLine: 35},
+		{DocumentID: "d1", Score: 0.6, StartLine: 40, EndLine: 45},
+	}
+	grouped := groupByDocument(results)
+	if len(grouped) != 1 {
+		t.Fatalf("应聚合成 1 条结果，得到 %d", len(grouped))
+	}
+	if grouped[0].MatchedChunks != 5 {
+		t.Errorf("MatchedChunks 应为 5（含主 chunk），得到 %d", grouped[0].MatchedChunks)
+	}
+	if len(grouped[0].OtherRanges) != 3 {
+		t.Errorf("OtherRanges 应截断到 3 条，得到 %d", len(grouped[0].OtherRanges))
+	}
+}
+
+// TestGroupByDocument_InterDocOrderingAndRank 验证组间按主 chunk 分数降序并重排 Rank。
+//
+// 引入动机：聚合后结果顺序必须由各文档主 chunk 的相关性决定，
+// Rank 需连续，保证下游分页/展示一致。
+func TestGroupByDocument_InterDocOrderingAndRank(t *testing.T) {
+	results := []types.SearchResult{
+		{DocumentID: "d-low", Score: 0.4, StartLine: 1, EndLine: 5},
+		{DocumentID: "d-high", Score: 0.95, StartLine: 1, EndLine: 5},
+		{DocumentID: "d-high", Score: 0.5, StartLine: 10, EndLine: 15},
+		{DocumentID: "d-mid", Score: 0.7, StartLine: 1, EndLine: 5},
+	}
+	grouped := groupByDocument(results)
+	if len(grouped) != 3 {
+		t.Fatalf("应有 3 个文档，得到 %d", len(grouped))
+	}
+	wantOrder := []string{"d-high", "d-mid", "d-low"}
+	for i, id := range wantOrder {
+		if grouped[i].DocumentID != id {
+			t.Errorf("第 %d 位应为 %s，得到 %s", i, id, grouped[i].DocumentID)
+		}
+		if grouped[i].Rank != i+1 {
+			t.Errorf("第 %d 位 Rank 应为 %d，得到 %d", i, i+1, grouped[i].Rank)
+		}
+	}
+}
+
+// TestNormalizeAndTrimByScore_Normalizes 验证 score 归一化到 0~1。
+//
+// 引入动机：RRF 分数是不可读小数，归一化后 top1=1.0、其余按比例缩放，
+// 模型可直接理解相对相关性。
+func TestNormalizeAndTrimByScore_Normalizes(t *testing.T) {
+	results := []types.SearchResult{
+		{DocumentID: "a", Score: 0.04},
+		{DocumentID: "b", Score: 0.02},
+		{DocumentID: "c", Score: 0.01},
+	}
+	kept, truncated := normalizeAndTrimByScore(results, false)
+	// top1=0.04，归一化：a=1.0, b=0.5, c=0.25，均 >= 0.15，不裁剪。
+	if truncated != 0 {
+		t.Errorf("不应有裁剪，得到 %d", truncated)
+	}
+	if len(kept) != 3 {
+		t.Fatalf("应保留 3 条，得到 %d", len(kept))
+	}
+	if kept[0].Score != 1.0 {
+		t.Errorf("top1 归一化应为 1.0，得到 %v", kept[0].Score)
+	}
+	if kept[1].Score != 0.5 {
+		t.Errorf("b 归一化应为 0.5，得到 %v", kept[1].Score)
+	}
+	if kept[2].Score != 0.25 {
+		t.Errorf("c 归一化应为 0.25，得到 %v", kept[2].Score)
+	}
+}
+
+// TestNormalizeAndTrimByScore_TrimsTail 验证低分尾部被裁剪并计数。
+//
+// 引入动机：归一化后 < minNormalizedScore 的结果是与主结果脱节的噪声，
+// 应被丢弃且数量可观测（返回 truncated 计数供响应透传）。
+func TestNormalizeAndTrimByScore_TrimsTail(t *testing.T) {
+	results := []types.SearchResult{
+		{DocumentID: "a", Score: 0.10},  // 归一化 1.0
+		{DocumentID: "b", Score: 0.05},  // 归一化 0.5
+		{DocumentID: "c", Score: 0.01},  // 归一化 0.1 < 0.15 → 裁
+		{DocumentID: "d", Score: 0.005}, // 归一化 0.05 < 0.15 → 裁
+	}
+	kept, truncated := normalizeAndTrimByScore(results, false)
+	if truncated != 2 {
+		t.Errorf("应裁剪 2 条，得到 %d", truncated)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("应保留 2 条，得到 %d", len(kept))
+	}
+	if kept[0].DocumentID != "a" || kept[1].DocumentID != "b" {
+		t.Errorf("保留的应为 a,b，得到 %v", []string{kept[0].DocumentID, kept[1].DocumentID})
+	}
+	// 裁剪后 Rank 连续。
+	for i := range kept {
+		if kept[i].Rank != i+1 {
+			t.Errorf("kept[%d].Rank 应为 %d，得到 %d", i, i+1, kept[i].Rank)
+		}
+	}
+}
+
+// TestNormalizeAndTrimByScore_Top1Zero_RRF 验证 RRF 全零分数时归一化为 0 且不裁剪。
+//
+// 引入动机：top1==0 时除以 0 会产生 NaN/Inf，必须显式置 0；
+// 全零分数不表示"低相关"而是"无区分度"，不应触发裁剪。
+func TestNormalizeAndTrimByScore_Top1Zero_RRF(t *testing.T) {
+	results := []types.SearchResult{
+		{DocumentID: "a", Score: 0},
+		{DocumentID: "b", Score: 0},
+	}
+	kept, truncated := normalizeAndTrimByScore(results, false)
+	if truncated != 0 {
+		t.Errorf("全零分数不应裁剪，得到 %d", truncated)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("应保留全部 2 条，得到 %d", len(kept))
+	}
+	for _, r := range kept {
+		if r.Score != 0 {
+			t.Errorf("top1==0 时所有 score 应置 0，得到 %v", r.Score)
+		}
+	}
+}
+
+// TestNormalizeAndTrimByScore_RerankerZeroSkipsTrim 验证 reranker 全零/负分跳过裁剪。
+//
+// 引入动机：reranker 若返回全 0 或负分属于异常输出，此时归一化会把所有
+// 结果置 0 再被阈值全裁掉，造成结果全灭。必须识别该情形跳过裁剪保护结果。
+func TestNormalizeAndTrimByScore_RerankerZeroSkipsTrim(t *testing.T) {
+	results := []types.SearchResult{
+		{DocumentID: "a", Score: 0},
+		{DocumentID: "b", Score: -0.5},
+	}
+	kept, truncated := normalizeAndTrimByScore(results, true)
+	if truncated != 0 {
+		t.Errorf("reranker 异常分数不应裁剪，得到 %d", truncated)
+	}
+	if len(kept) != 2 {
+		t.Fatalf("reranker 异常时应原样保留全部结果，得到 %d", len(kept))
+	}
+}
+
+// TestSearch_EndToEnd_DocAggregationAndSnippet 端到端验证管线：
+// BM25 高亮 → snippet 命中点 → 文档级聚合 → 归一化。
+//
+// 引入动机：单元测试分别覆盖了各环节，本测试驱动完整 Search 验证它们
+// 在真实管线里串联生效：同文档多 chunk 折叠为一条、snippet 来自高亮、
+// score 归一化到 0~1。
+func TestSearch_EndToEnd_DocAggregationAndSnippet(t *testing.T) {
+	client := newFakeESClient()
+	ctx := context.Background()
+	_ = client.CreateIndex(ctx, "knowledge_v1", nil)
+
+	// 同一文档两个 chunk + 另一文档一个 chunk。fake Search 给每个 hit Score=1.0。
+	// 注意必须设置不同的 chunk_index：rrf.chunkKey 用 document_id+path+chunk_index
+	// 作为候选唯一键，缺省同为 0 会被 RRF 合并成同一候选，无法覆盖聚合路径。
+	_ = client.BulkIndex(ctx, "knowledge_v1", []es.IndexDoc{
+		{ID: "d1_c0", Body: map[string]interface{}{
+			"document_id": "d1", "path": "a.md", "title": "DocA",
+			"content": "开头套话", "status": "active", "is_special": false,
+			"start_line": 1, "end_line": 10, "chunk_index": 0, "section_path": []interface{}{"S1"},
+		}},
+		{ID: "d1_c1", Body: map[string]interface{}{
+			"document_id": "d1", "path": "a.md", "title": "DocA",
+			"content": "其他段", "status": "active", "is_special": false,
+			"start_line": 20, "end_line": 30, "chunk_index": 1, "section_path": []interface{}{"S2"},
+		}},
+		{ID: "d2_c0", Body: map[string]interface{}{
+			"document_id": "d2", "path": "b.md", "title": "DocB",
+			"content": "另一个文档", "status": "active", "is_special": false,
+			"start_line": 1, "end_line": 10, "chunk_index": 0, "section_path": []interface{}{"T1"},
+		}},
+	})
+	// 给 d1_c0 配高亮，验证 snippet 走高亮路径。
+	client.highlights = map[string]map[string][]string{
+		"d1_c0": {"content": {"这是 <em>test</em> 命中的正文片段"}},
+	}
+
+	// 使用 reranker 路径制造可裁剪的分数差异：RRF 分数被压扁（rank 只差 1/(60+rank)），
+	// 无法触发 0.15 阈值；reranker 直接给 Score，给 d2 极低分使其归一化后被裁。
+	// candidates 顺序即 RRF 排序后的索引；fake Rerank 按 Index 引用候选，
+	// 但我们无法预知 map 遍历决定的候选顺序，因此给"内容含 d2 的候选"打低分
+	// 不可行——改为给所有候选高分，只把排最后的 d2 候选压低。
+	// 由于候选顺序不确定，改用 reranker results 显式指定每个候选 index 的分数：
+	// 先跑一遍拿到候选顺序太脆弱。更稳妥：用 fakeRerankerProvider 默认实现按
+	// Index 递减给分不可靠。这里直接构造一个按候选内容返回分数的 reranker。
+	// d1 两 chunk 的 content 是"开头套话"/"其他段"，d2 是"另一个文档"。
+	// 给 d1 高分、d2 极低分（归一化 0.05/0.9≈0.056 < 0.15 → 裁剪）。
+	rrProvider := &scoringReranker{scoreByContentSubstr: map[string]float64{
+		"开头套话":   0.9,
+		"其他段":    0.6,
+		"另一个文档": 0.05,
+	}}
+
+	pipe := NewPipeline(client, nil, rrProvider)
+	output, err := pipe.Search(ctx, SearchInput{
+		WorkspaceID: "ws-1",
+		Query:       "test",
+		Profile:     testProfile(),
+		Limit:       10,
+		Mode:        "lexical",
+	})
+	if err != nil {
+		t.Fatalf("Search 失败: %v", err)
+	}
+
+	// 文档级聚合：d1 两 chunk 折叠为一条；d2 归一化 score=0.1<0.15 被裁剪 → 仅 1 条结果。
+	if len(output.Results) != 1 {
+		t.Fatalf("应聚合并裁剪为 1 条文档级结果，得到 %d: %+v", len(output.Results), output.Results)
+	}
+	if output.Total != 1 {
+		t.Errorf("Total 应为裁剪后文档数 1，得到 %d", output.Total)
+	}
+	if output.TruncatedByScore != 1 {
+		t.Errorf("应裁掉 1 条低分结果，TruncatedByScore=%d", output.TruncatedByScore)
+	}
+
+	// 唯一结果即 d1，验证 matched_chunks / other_ranges / snippet / score。
+	d1 := output.Results[0]
+	if d1.DocumentID != "d1" {
+		t.Fatalf("唯一结果应为 d1，得到 %s", d1.DocumentID)
+	}
+	if d1.MatchedChunks != 2 {
+		t.Errorf("d1 MatchedChunks 应为 2，得到 %d", d1.MatchedChunks)
+	}
+	if len(d1.OtherRanges) != 1 {
+		t.Fatalf("d1 应有 1 条 OtherRanges，得到 %d", len(d1.OtherRanges))
+	}
+	if d1.OtherRanges[0].StartLine != 20 || d1.OtherRanges[0].EndLine != 30 || d1.OtherRanges[0].Heading != "S2" {
+		t.Errorf("d1.OtherRanges[0] 应为 {20,30,S2}，得到 %+v", d1.OtherRanges[0])
+	}
+	// snippet 应来自高亮片段而非 content 开头"开头套话"。
+	if d1.Snippet != "这是 <em>test</em> 命中的正文片段" {
+		t.Errorf("d1 snippet 应来自高亮片段，得到 %q", d1.Snippet)
+	}
+	// score 归一化：d1_c0 是 top1，归一化后应为 1.0。
+	if d1.Score != 1.0 {
+		t.Errorf("归一化后 top score 应为 1.0，得到 %v", d1.Score)
+	}
 }

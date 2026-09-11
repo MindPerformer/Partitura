@@ -166,6 +166,11 @@ type SearchResponse struct {
 			ID     string                 `json:"_id"`
 			Score  float64                `json:"_score"`
 			Source map[string]interface{} `json:"_source"`
+			// Highlight 是 ES 为本次命中返回的高亮片段，key 为字段名，
+			// value 为带 pre_tags/post_tags 标记的 fragment 列表。
+			// 引入动机：搜索管线需要用命中位置的高亮片段生成 snippet，
+			// 取代原先"永远取 chunk 开头"的截断方式，让 snippet 反映真实命中点。
+			Highlight map[string][]string `json:"highlight"`
 		} `json:"hits"`
 	} `json:"hits"`
 	// Aggregations 是 ES 聚合响应的原始 map。
