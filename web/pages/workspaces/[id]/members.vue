@@ -288,13 +288,18 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
           <h3 class="text-lg font-semibold mb-4">{{ t('workspace.addMember') }}</h3>
           <form @submit.prevent="handleAdd" class="space-y-4">
             <UFormField :label="t('workspace.username')" name="username">
-              <!-- 候选下拉改用 UInputMenu（combobox）：自带 listbox/方向键/Esc/外点关闭 a11y -->
+              <!-- 候选下拉改用 UInputMenu（combobox）：自带 listbox/方向键/Esc/外点关闭 a11y。
+                   :reset-search-term-on-select="false" 是必需的——该 prop 默认 true，
+                   选中项时组件会把 searchTerm（绑定 addForm.username）置空，
+                   中间态 "" 触发 username watcher 误判「输入与选中不一致」而清掉
+                   selectedCandidate，导致提交时报「请先从候选列表选择用户」。 -->
               <UInputMenu
                 v-model="selectedCandidate"
                 v-model:search-term="addForm.username"
                 :items="candidateItems"
                 :loading="candidateLoading"
                 :placeholder="t('workspace.usernamePlaceholder')"
+                :reset-search-term-on-select="false"
                 label-key="username"
                 class="w-full"
                 open-on-focus
