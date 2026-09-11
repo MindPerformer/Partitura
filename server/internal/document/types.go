@@ -110,6 +110,11 @@ type Document struct {
 	IsSpecial       bool
 	CreatedBy       string
 	UpdatedBy       string
+	// CreatedByUsername / UpdatedByUsername 是 created_by/updated_by 对应 users.username 的展示名。
+	// 引入动机：前端需要显示操作者用户名而非裸 UUID；仓储层通过 LEFT JOIN users 填充，
+	// created_by/updated_by 为 NULL 或 users 行已删时为空字符串。
+	CreatedByUsername string
+	UpdatedByUsername string
 	CreatedAt       string
 	UpdatedAt       string
 }
@@ -127,6 +132,8 @@ type Revision struct {
 	ContentHash     string
 	Status          string
 	CreatedBy       string
+	// CreatedByUsername 是 created_by 对应 users.username 的展示名（LEFT JOIN，缺省为空串）。
+	CreatedByUsername string
 	CreatedAt       string
 }
 
@@ -144,6 +151,8 @@ type Source struct {
 	RefreshIntervalDays int
 	SourceDocumentID   string
 	CreatedBy          string
+	// CreatedByUsername 是 created_by 对应 users.username 的展示名（LEFT JOIN，缺省为空串）。
+	CreatedByUsername  string
 	CreatedAt          string
 }
 

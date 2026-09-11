@@ -24,7 +24,8 @@ watch(rendered, (value) => {
 </script>
 
 <template>
-  <div class="markdown-body" v-html="html" />
+  <!-- article 语义化容器：渲染的 markdown 是独立文档内容 -->
+  <article class="markdown-body" v-html="html" />
 </template>
 
 <style>
@@ -79,12 +80,16 @@ watch(rendered, (value) => {
   @apply my-1;
 }
 
+/* blockquote 正文用 text-default 保证暗色对比度；
+   语义色 text-muted 仅保留在装饰性 h6/元信息，正文不降低可读性。 */
 .markdown-body blockquote {
-  @apply border-l-4 border-muted pl-4 my-3 italic text-muted;
+  @apply border-l-4 border-muted pl-4 my-3 italic text-default;
 }
 
+/* code 文本用 text-highlighted（而非 text-primary on bg-elevated）：
+   主色在暗色 elevated 背景上对比度不足，正文/代码统一走前景色层级。 */
 .markdown-body code {
-  @apply bg-elevated rounded px-1.5 py-0.5 text-sm font-mono text-primary;
+  @apply bg-elevated rounded px-1.5 py-0.5 text-sm font-mono text-highlighted;
 }
 
 .markdown-body pre {

@@ -21,7 +21,7 @@ describe('Workspace Switch', () => {
       user: { id: 'user-1', username: 'test', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     let callCount = 0
     ctrl.setImpl(async () => {
@@ -65,7 +65,7 @@ describe('Workspace Switch', () => {
       user: { id: 'user-1', username: 'test', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     ctrl.setError({
       response: { status: 404, _data: { error: 'workspace not found' } },
@@ -90,7 +90,7 @@ describe('Workspace Switch', () => {
       user: { id: 'user-1', username: 'test', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     ctrl.setError({
       response: { status: 403, _data: { error: 'access denied' } },
@@ -114,7 +114,7 @@ describe('Workspace Switch', () => {
       user: { id: 'user-2', username: 'viewer', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     let callCount = 0
     ctrl.setImpl(async () => {

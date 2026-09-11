@@ -17,6 +17,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"partitura/server/internal/audit"
 	"partitura/server/internal/auth"
@@ -269,6 +270,10 @@ func isDuplicateKeyErr(err error) bool {
 // 引入动机：design/04-WEB-API.md §Admin 要求 users endpoint。
 // 仅 system_admin 可访问——RequireSystemAdmin 中间件已处理。
 // 使用单条参数化 SQL 一次性返回用户基础信息、系统角色和 workspace:create 权限，避免 N+1 查询。
+//
+// 可选筛选 query 参数：
+//   - system_role：user / system_admin（非法值返回 400，不静默忽略）
+//   - q：按 username / email ILIKE 模糊匹配
 func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 	limit, offset, err := parsePagination(r)
 	if err != nil {
@@ -276,7 +281,19 @@ func (h *AdminHandler) ListUsers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.repo.ListAllUsersWithSystemInfo(r.Context(), limit, offset)
+	q := r.URL.Query()
+	userFilter := AdminUserFilter{
+		SystemRole: q.Get("system_role"),
+		Query:      q.Get("q"),
+	}
+	// Fail Fast：非法 system_role 直接 400，与 UpdateUser 的校验口径一致，
+	// 避免管理员误以为筛选生效却拿到全量结果。
+	if userFilter.SystemRole != "" && userFilter.SystemRole != SystemRoleAdmin && userFilter.SystemRole != SystemRoleUser {
+		writeWorkspaceError(w, http.StatusBadRequest, "非法 system_role")
+		return
+	}
+
+	result, err := h.repo.ListAllUsersWithSystemInfo(r.Context(), userFilter, limit, offset)
 	if err != nil {
 		slog.Error("查询用户列表（含系统信息）失败", "error", err)
 		writeWorkspaceError(w, http.StatusInternalServerError, "内部错误")
@@ -435,6 +452,10 @@ func (h *AdminHandler) recordAdminAudit(r *http.Request, targetUserID, targetUse
 // 引入动机：design/04-WEB-API.md §Admin 要求 workspace permissions 管理，需要列出全部 workspace 供管理员查看。
 // 仅 system_admin 可访问——RequireSystemAdmin 中间件已处理。
 // 返回全部 workspace 不受成员关系限制，支持分页。
+//
+// 可选筛选 query 参数：
+//   - status：active / archived（非法值返回 400，不静默忽略）
+//   - q：按 name / display_name ILIKE 模糊匹配
 func (h *AdminHandler) ListAllWorkspaces(w http.ResponseWriter, r *http.Request) {
 	limit, offset, err := parsePagination(r)
 	if err != nil {
@@ -442,7 +463,18 @@ func (h *AdminHandler) ListAllWorkspaces(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
-	result, err := h.repo.ListAllWorkspaces(r.Context(), limit, offset)
+	q := r.URL.Query()
+	wsFilter := AdminWorkspaceFilter{
+		Status: q.Get("status"),
+		Query:  q.Get("q"),
+	}
+	// Fail Fast：非法 status 直接 400，与 workspaces 表 CHECK 约束口径一致。
+	if wsFilter.Status != "" && !IsValidWorkspaceStatus(wsFilter.Status) {
+		writeWorkspaceError(w, http.StatusBadRequest, "非法 status")
+		return
+	}
+
+	result, err := h.repo.ListAllWorkspaces(r.Context(), wsFilter, limit, offset)
 	if err != nil {
 		slog.Error("查询全部 workspace 列表失败", "error", err)
 		writeWorkspaceError(w, http.StatusInternalServerError, "内部错误")
@@ -465,6 +497,11 @@ func (h *AdminHandler) ListAllWorkspaces(w http.ResponseWriter, r *http.Request)
 // ListAuditLogs 处理 GET /api/admin/audit。
 // 引入动机：design/04-WEB-API.md §Admin 列出 audit endpoint。
 // 仅 system_admin 可读取审计日志。
+//
+// 可选筛选 query 参数（均为精确匹配，from/to 为 RFC3339 时间范围）：
+//   - user_id, action, resource_type, workspace_id
+//   - from, to：created_at 的下/上界
+// 所有筛选参数缺省时退化为全量分页列表，保持既有契约不变。
 func (h *AdminHandler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
 	if h.auditRepo == nil {
 		writeWorkspaceError(w, http.StatusInternalServerError, "审计模块未配置")
@@ -477,7 +514,34 @@ func (h *AdminHandler) ListAuditLogs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	result, err := h.auditRepo.List(r.Context(), limit, offset)
+	q := r.URL.Query()
+	filter := audit.ListFilter{
+		UserID:       q.Get("user_id"),
+		Action:       q.Get("action"),
+		ResourceType: q.Get("resource_type"),
+		WorkspaceID:  q.Get("workspace_id"),
+	}
+
+	// from/to 为可选 RFC3339 时间范围；非法值 Fail Fast 返回 400，
+	// 不静默忽略（否则管理员会误以为筛选生效却拿到全量结果）。
+	if fromStr := q.Get("from"); fromStr != "" {
+		from, err := time.Parse(time.RFC3339, fromStr)
+		if err != nil {
+			writeWorkspaceError(w, http.StatusBadRequest, "from 必须是 RFC3339 时间格式")
+			return
+		}
+		filter.From = &from
+	}
+	if toStr := q.Get("to"); toStr != "" {
+		to, err := time.Parse(time.RFC3339, toStr)
+		if err != nil {
+			writeWorkspaceError(w, http.StatusBadRequest, "to 必须是 RFC3339 时间格式")
+			return
+		}
+		filter.To = &to
+	}
+
+	result, err := h.auditRepo.List(r.Context(), filter, limit, offset)
 	if err != nil {
 		slog.Error("查询审计日志失败", "error", err)
 		writeWorkspaceError(w, http.StatusInternalServerError, "内部错误")

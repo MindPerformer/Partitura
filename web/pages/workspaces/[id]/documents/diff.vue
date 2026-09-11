@@ -19,6 +19,15 @@ const docPath = computed(() => route.query.path as string)
 const revA = computed(() => parseInt(route.query.rev_a as string))
 const revB = computed(() => parseInt(route.query.rev_b as string))
 
+// 参数缺失/非法（path 缺、rev_a 缺失或 NaN、rev_b 提供但 NaN）时给明确错误态。
+const paramError = computed(() => {
+  if (!docPath.value) return t('document.pathMissing')
+  // rev_a 必须为正整数版本号；缺失/NaN/0 均视为非法参数。
+  if (Number.isNaN(revA.value) || revA.value < 1) return t('document.revParamInvalid')
+  if (route.query.rev_b !== undefined && (Number.isNaN(revB.value) || revB.value < 1)) return t('document.revParamInvalid')
+  return null
+})
+
 const { workspace } = useWorkspaceContext(workspaceId)
 
 const revAData = ref<Revision | null>(null)
@@ -30,6 +39,7 @@ const error = ref<string | null>(null)
 
 async function loadDiff() {
   if (!workspaceId.value || !docPath.value || !revA.value) return
+  if (paramError.value) { error.value = paramError.value; return }
   loading.value = true
   error.value = null
 
@@ -54,6 +64,7 @@ async function loadDiff() {
         content_hash: currentDoc.content_hash,
         status: currentDoc.status,
         created_by: currentDoc.updated_by,
+        created_by_username: currentDoc.updated_by_username,
         created_at: currentDoc.updated_at
       }
       diffLines.value = computeLineDiff(revAData.value!.content_markdown, revBData.value!.content_markdown)
@@ -84,11 +95,11 @@ useHead({ title: () => t('document.diffViewer') + ' · ' + t('common.appName') }
 
 <template>
   <WorkspaceLayout>
-    <div class="max-w-5xl mx-auto px-4 py-8">
+    <div class="max-w-3xl mx-auto px-4 py-8">
       <div class="flex items-center justify-between mb-6">
         <div>
           <h1 class="text-2xl font-bold text-highlighted">{{ t('document.diffViewer') }}</h1>
-          <p class="text-sm text-muted mt-1">{{ docPath }}</p>
+          <DocBreadcrumb :workspace-id="workspaceId" :path="docPath" class="mt-1" />
         </div>
         <UButton
           variant="ghost"
@@ -97,7 +108,9 @@ useHead({ title: () => t('document.diffViewer') + ' · ' + t('common.appName') }
         >{{ t('common.back') }}</UButton>
       </div>
 
-      <div v-if="loading" class="flex justify-center py-8">
+      <ErrorDisplay v-if="paramError" :message="paramError" />
+
+      <div v-else-if="loading" class="flex justify-center py-8">
         <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
       </div>
 
@@ -119,12 +132,13 @@ useHead({ title: () => t('document.diffViewer') + ' · ' + t('common.appName') }
           <div class="bg-elevated font-mono text-sm overflow-x-auto">
             <table class="w-full">
               <tbody>
+                <!-- 提升暗色对比度：背景 /10→/20，左侧 2px 语义色条强化增删行识别 -->
                 <tr
                   v-for="(line, i) in diffLines"
                   :key="i"
                   :class="{
-                    'bg-success/10': line.type === 'added',
-                    'bg-error/10': line.type === 'removed'
+                    'bg-success/20 border-l-2 border-l-success': line.type === 'added',
+                    'bg-error/20 border-l-2 border-l-error': line.type === 'removed'
                   }"
                 >
                   <td class="w-12 text-right text-xs text-muted px-2 select-none border-r border-default">

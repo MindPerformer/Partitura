@@ -188,8 +188,6 @@ PROJECT.md 和 AGENTS.md 不通过 search 找。
 - document_list
 - document_outline
 - document_read
-- document_read_section
-- document_read_lines
 - document_create
 - document_patch
 - document_replace
@@ -211,24 +209,16 @@ PROJECT.md 和 AGENTS.md 不通过 search 找。
 - end_line
 - section_path
 
-## document_read_section
+## document_read
 
 输入：
-- path
-- section_path[]
+- `path`（必传）
+- `section_path`（可选 string[]）：非空时按 Section 读取，返回该 Section Markdown；使用结构化数组，避免同名 heading 冲突
+- `start_line` + `end_line`（可选 int，必须成对给出）：按行区间读取，限制最大 500 行，防止一次返回超大内容
 
-返回该 Section Markdown。
+互斥：`section_path` 与 `start_line`/`end_line` 不可同时给出；`start_line` 与 `end_line` 必须同时出现或同时缺省。
 
-section_path 使用结构化数组，避免同名 heading 冲突。
-
-## document_read_lines
-
-输入：
-- path
-- start_line
-- end_line
-
-限制最大行数，防止一次返回超大内容。
+三种模式都不带其它参数时默认返回 metadata + 完整正文（走 read 缓存）；段读与行读不缓存。
 
 ## 写操作响应与 verbose
 
@@ -246,7 +236,7 @@ section_path 使用结构化数组，避免同名 heading 冲突。
 - 默认 false：响应移除 `content_markdown`，只返回 revision/hash/path 等元数据，避免把整篇文档重新灌回 Agent 上下文。
 - `verbose: true`：返回服务端完整响应，包含 `content_markdown`。
 
-只读工具（document_read / document_read_section / document_read_lines / document_revision）不适用该参数，它们的存在意义就是返回正文。
+只读工具（document_read / document_revision）不适用该参数，它们的存在意义就是返回正文。
 
 ## document_patch
 

@@ -21,7 +21,7 @@ describe('RBAC', () => {
       user: { id: '1', username: 'admin', system_role: 'system_admin' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     expect(auth.isSystemAdmin.value).toBe(true)
   })
@@ -34,7 +34,7 @@ describe('RBAC', () => {
       user: { id: '2', username: 'user', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     expect(auth.isSystemAdmin.value).toBe(false)
   })

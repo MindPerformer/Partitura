@@ -248,19 +248,71 @@ func (m *mockEvalRepo) GetDataset(ctx context.Context, id string) (*evaluation.D
 	if ds, ok := m.datasets[id]; ok {
 		return ds, nil
 	}
-	return nil, fmt.Errorf("数据集不存在: %s", id)
+	// 与 PG 实现一致：不存在返回 sql.ErrNoRows，由 handler 映射为 404。
+	return nil, sql.ErrNoRows
 }
+// AddItem 模拟 PGRepository.AddItem：向数据集追加条目。
+// 引入动机：handler 对 archived 数据集的 409 校验依赖 mock 中条目真实落库，
+// 需要可观察的追加行为供断言。
 func (m *mockEvalRepo) AddItem(ctx context.Context, datasetID, query string, expectedDocs []evaluation.ExpectedDocument, relevanceGrade int, queryClass string) (*evaluation.Item, error) {
-	return nil, nil
+	item := evaluation.Item{
+		ID:                fmt.Sprintf("item-%d", len(m.items[datasetID])+1),
+		DatasetID:         datasetID,
+		Query:             query,
+		ExpectedDocuments: expectedDocs,
+		RelevanceGrade:    relevanceGrade,
+		QueryClass:        queryClass,
+	}
+	m.items[datasetID] = append(m.items[datasetID], item)
+	return &item, nil
 }
+// ListItems 模拟 PGRepository.ListItems：按 datasetID 返回分页条目。
+// 引入动机：GET items 端点测试需要真实的 total/items 数据来断言分页契约。
 func (m *mockEvalRepo) ListItems(ctx context.Context, datasetID string, limit, offset int) (*evaluation.ListItemsResult, error) {
-	return &evaluation.ListItemsResult{}, nil
+	items := m.items[datasetID]
+	total := len(items)
+	if offset >= total {
+		return &evaluation.ListItemsResult{Items: []evaluation.Item{}, Total: total}, nil
+	}
+	end := offset + limit
+	if end > total {
+		end = total
+	}
+	return &evaluation.ListItemsResult{Items: items[offset:end], Total: total}, nil
 }
 func (m *mockEvalRepo) ListAllItems(ctx context.Context, datasetID string) ([]evaluation.Item, error) {
 	if items, ok := m.items[datasetID]; ok {
 		return items, nil
 	}
 	return nil, nil
+}
+
+// DeleteItem 模拟 PGRepository.DeleteItem：按 datasetID+itemID 定位并删除。
+// 引入动机：handler 的 404/200 语义依赖 mock 真实区分"条目不存在"与"删除成功"。
+func (m *mockEvalRepo) DeleteItem(ctx context.Context, datasetID, itemID string) error {
+	items, ok := m.items[datasetID]
+	if !ok {
+		return sql.ErrNoRows
+	}
+	for i, it := range items {
+		if it.ID == itemID {
+			m.items[datasetID] = append(items[:i], items[i+1:]...)
+			return nil
+		}
+	}
+	return sql.ErrNoRows
+}
+
+// ArchiveDataset 模拟 PGRepository.ArchiveDataset：将数据集软删为 archived。
+// 与 PG 实现一致：数据集与条目均保留（历史评测结果可审计），仅翻转 status；
+// 数据集不存在返回 sql.ErrNoRows；对已 archived 的数据集重复调用幂等成功。
+func (m *mockEvalRepo) ArchiveDataset(ctx context.Context, datasetID string) error {
+	ds, ok := m.datasets[datasetID]
+	if !ok {
+		return sql.ErrNoRows
+	}
+	ds.Status = evaluation.DatasetStatusArchived
+	return nil
 }
 
 // mockEvalResultRepo 用于测试的 evaluation result repository mock。
@@ -1533,3 +1585,361 @@ func TestRegisterRoutes_RegistersNewProfileRoutes(t *testing.T) {
 
 // 确保 io 包被使用（用于 httptest）
 var _ = io.EOF
+
+// --- Evaluation Items 管理与删除 ---
+//
+// 引入动机：前端审计发现管理端缺少 GET items / DELETE item / DELETE dataset 端点，
+// 以下测试驱动真实 handler 验证分页契约、越权防护与 404 语义。
+
+// newEvalRepoWithData 构造含数据集与条目的 mock eval repo。
+func newEvalRepoWithData() *mockEvalRepo {
+	return &mockEvalRepo{
+		datasets: map[string]*evaluation.Dataset{
+			"ds-1": {ID: "ds-1", Name: "dataset-one", Status: evaluation.DatasetStatusActive},
+			"ds-2": {ID: "ds-2", Name: "dataset-two", Status: evaluation.DatasetStatusActive},
+		},
+		items: map[string][]evaluation.Item{
+			"ds-1": {
+				{ID: "item-1", DatasetID: "ds-1", Query: "q1", RelevanceGrade: 1, QueryClass: "general"},
+				{ID: "item-2", DatasetID: "ds-1", Query: "q2", RelevanceGrade: 2, QueryClass: "general"},
+			},
+			"ds-2": {
+				{ID: "item-9", DatasetID: "ds-2", Query: "q9", RelevanceGrade: 0, QueryClass: "general"},
+			},
+		},
+	}
+}
+
+// TestListItems_ReturnsPagedItems 验证 GET items 返回 items+total+limit+offset 契约。
+func TestListItems_ReturnsPagedItems(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/evaluation/datasets/ds-1/items", nil)
+	req.SetPathValue("id", "ds-1")
+	w := httptest.NewRecorder()
+	handler.ListItems(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d，body: %s", w.Code, w.Body.String())
+	}
+
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	for _, key := range []string{"items", "total", "limit", "offset"} {
+		if _, ok := resp[key]; !ok {
+			t.Errorf("响应顶层缺少字段 %q，实际字段: %v", key, keysOf(resp))
+		}
+	}
+	items, ok := resp["items"].([]interface{})
+	if !ok {
+		t.Fatalf("items 不是数组，类型为 %T", resp["items"])
+	}
+	if len(items) != 2 {
+		t.Errorf("期望 2 条条目，得到 %d", len(items))
+	}
+	if total := resp["total"].(float64); total != 2 {
+		t.Errorf("期望 total=2，得到 %v", total)
+	}
+}
+
+// TestListItems_EmptyIsArray 验证空条目列表序列化为 [] 而非 null。
+func TestListItems_EmptyIsArray(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	// ds-2 只有 1 条，limit 默认 20 offset=20 越过末尾 → 空页
+	req := httptest.NewRequest(http.MethodGet, "/api/admin/evaluation/datasets/ds-2/items?offset=5", nil)
+	req.SetPathValue("id", "ds-2")
+	w := httptest.NewRecorder()
+	handler.ListItems(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d", w.Code)
+	}
+	var resp map[string]interface{}
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	items, ok := resp["items"].([]interface{})
+	if !ok {
+		t.Fatalf("items 不是数组（可能为 null），类型为 %T", resp["items"])
+	}
+	if len(items) != 0 {
+		t.Errorf("期望 0 条，得到 %d", len(items))
+	}
+}
+
+// TestDeleteItem_Succeeds 验证删除存在的条目返回 200 并写审计。
+func TestDeleteItem_Succeeds(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	auditRepo := &mockAuditRepo{}
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, auditRepo, evalRepo, &mockEvalResultRepo{})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/evaluation/datasets/ds-1/items/item-1", nil)
+	req.SetPathValue("id", "ds-1")
+	req.SetPathValue("itemId", "item-1")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.DeleteItem(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d，body: %s", w.Code, w.Body.String())
+	}
+
+	// 条目真实被删除
+	remaining := evalRepo.items["ds-1"]
+	if len(remaining) != 1 || remaining[0].ID != "item-2" {
+		t.Errorf("ds-1 应剩 item-2，实际 %v", remaining)
+	}
+	// ds-2 的条目不受影响
+	if len(evalRepo.items["ds-2"]) != 1 {
+		t.Errorf("ds-2 条目不应受影响，实际 %v", evalRepo.items["ds-2"])
+	}
+
+	if len(auditRepo.records) != 1 || auditRepo.records[0].action != "admin.eval.item.delete" {
+		t.Errorf("期望审计动作 admin.eval.item.delete，实际 %v", auditRepo.actions())
+	}
+}
+
+// TestDeleteItem_NotFound 验证条目不存在返回 404。
+func TestDeleteItem_NotFound(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/evaluation/datasets/ds-1/items/nonexistent", nil)
+	req.SetPathValue("id", "ds-1")
+	req.SetPathValue("itemId", "nonexistent")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.DeleteItem(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("期望 404，得到 %d", w.Code)
+	}
+}
+
+// TestDeleteItem_CrossDatasetDenied 验证不能凭条目 ID 越权删除其它数据集的条目。
+// 引入动机：item-9 属于 ds-2，用 ds-1 的路径删除必须 404 且 ds-2 数据完好。
+func TestDeleteItem_CrossDatasetDenied(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/evaluation/datasets/ds-1/items/item-9", nil)
+	req.SetPathValue("id", "ds-1")
+	req.SetPathValue("itemId", "item-9")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.DeleteItem(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("跨数据集删除应返回 404，实际 %d", w.Code)
+	}
+	if len(evalRepo.items["ds-2"]) != 1 {
+		t.Error("item-9 不应被删除")
+	}
+}
+
+// TestDeleteDataset_Succeeds 验证 DELETE 数据集执行软删：返回 status=archived，
+// 数据集状态翻转为 archived，条目与历史评测结果保留（不被级联删除），审计动作 archive。
+func TestDeleteDataset_Succeeds(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	auditRepo := &mockAuditRepo{}
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, auditRepo, evalRepo, &mockEvalResultRepo{})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/evaluation/datasets/ds-1", nil)
+	req.SetPathValue("id", "ds-1")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.DeleteDataset(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("期望 200，得到 %d，body: %s", w.Code, w.Body.String())
+	}
+	var resp map[string]string
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("解析响应失败: %v", err)
+	}
+	if resp["status"] != "archived" {
+		t.Errorf("响应 status = %q，期望 archived", resp["status"])
+	}
+	// 软删：记录保留，status 翻转为 archived
+	ds, ok := evalRepo.datasets["ds-1"]
+	if !ok {
+		t.Fatal("ds-1 应保留（软删不删除记录）")
+	}
+	if ds.Status != evaluation.DatasetStatusArchived {
+		t.Errorf("ds-1 status = %q，期望 archived", ds.Status)
+	}
+	// 软删保留条目与历史评测结果：items 不应被级联删除
+	if items := evalRepo.items["ds-1"]; len(items) != 2 {
+		t.Errorf("ds-1 的条目应保留（软删），实际 %d 条", len(items))
+	}
+	if _, ok := evalRepo.datasets["ds-2"]; !ok || evalRepo.datasets["ds-2"].Status != evaluation.DatasetStatusActive {
+		t.Error("ds-2 不应受影响")
+	}
+	if len(auditRepo.records) != 1 || auditRepo.records[0].action != "admin.eval.dataset.archive" {
+		t.Errorf("期望审计动作 admin.eval.dataset.archive，实际 %v", auditRepo.actions())
+	}
+}
+
+// TestDeleteDataset_ArchivedIdempotent 验证对已归档数据集重复 DELETE 幂等返回 200。
+// 引入动机：归档是状态迁移而非删除，重复归档不应产生假失败。
+func TestDeleteDataset_ArchivedIdempotent(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	for i := 0; i < 2; i++ {
+		req := httptest.NewRequest(http.MethodDelete, "/api/admin/evaluation/datasets/ds-1", nil)
+		req.SetPathValue("id", "ds-1")
+		req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+		w := httptest.NewRecorder()
+		handler.DeleteDataset(w, req)
+		if w.Code != http.StatusOK {
+			t.Fatalf("第 %d 次归档期望 200，得到 %d，body: %s", i+1, w.Code, w.Body.String())
+		}
+	}
+	if evalRepo.datasets["ds-1"].Status != evaluation.DatasetStatusArchived {
+		t.Error("重复归档后 status 应为 archived")
+	}
+}
+
+// TestRunEvaluation_ArchivedDatasetConflict 验证对 archived 数据集运行评测返回 409。
+// 引入动机：归档是 API 层终态，继续评测会产生与"已归档"语义矛盾的新结果。
+func TestRunEvaluation_ArchivedDatasetConflict(t *testing.T) {
+	profileRepo := &mockProfileRepo{
+		profiles: map[string]*profile.ProfileRecord{
+			"profile-1": {ID: "profile-1", Name: "test-profile"},
+		},
+	}
+	jobRepo := &mockJobRepo{}
+	evalRepo := &mockEvalRepo{
+		datasets: map[string]*evaluation.Dataset{
+			"ds-archived": {ID: "ds-archived", Name: "archived-dataset", Status: evaluation.DatasetStatusArchived},
+		},
+	}
+	handler := NewHandler(profileRepo, jobRepo, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/evaluation/run", strings.NewReader(`{"dataset_id":"ds-archived","profile_id":"profile-1"}`))
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.RunEvaluation(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("期望 409，得到 %d，body: %s", w.Code, w.Body.String())
+	}
+	if len(jobRepo.enqueuedJobs) != 0 {
+		t.Errorf("archived 数据集不应入队评测 job，实际入队 %d 个", len(jobRepo.enqueuedJobs))
+	}
+}
+
+// TestAddItem_ArchivedDatasetConflict 验证向 archived 数据集新增条目返回 409。
+// 引入动机：归档数据集的历史条目与评测结果被保留用于审计，
+// 若允许写入新条目会混淆归档语义。
+func TestAddItem_ArchivedDatasetConflict(t *testing.T) {
+	evalRepo := &mockEvalRepo{
+		datasets: map[string]*evaluation.Dataset{
+			"ds-archived": {ID: "ds-archived", Name: "archived-dataset", Status: evaluation.DatasetStatusArchived},
+		},
+		items: map[string][]evaluation.Item{},
+	}
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	body := `{"query":"q","expected_documents":[],"relevance_grade":1,"query_class":"general"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/evaluation/datasets/ds-archived/items", strings.NewReader(body))
+	req.SetPathValue("id", "ds-archived")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.AddItem(w, req)
+
+	if w.Code != http.StatusConflict {
+		t.Fatalf("期望 409，得到 %d，body: %s", w.Code, w.Body.String())
+	}
+	if len(evalRepo.items["ds-archived"]) != 0 {
+		t.Error("archived 数据集不应新增条目")
+	}
+}
+
+// TestAddItem_ActiveDatasetSucceeds 验证向 active 数据集新增条目返回 201。
+func TestAddItem_ActiveDatasetSucceeds(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	body := `{"query":"new-q","expected_documents":[],"relevance_grade":2,"query_class":"general"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/evaluation/datasets/ds-1/items", strings.NewReader(body))
+	req.SetPathValue("id", "ds-1")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.AddItem(w, req)
+
+	if w.Code != http.StatusCreated {
+		t.Fatalf("期望 201，得到 %d，body: %s", w.Code, w.Body.String())
+	}
+	if got := len(evalRepo.items["ds-1"]); got != 3 {
+		t.Errorf("ds-1 应有 3 条条目（原 2 + 新 1），实际 %d", got)
+	}
+}
+
+// TestAddItem_DatasetNotFound 验证向不存在数据集新增条目返回 404。
+// 引入动机：归档改造为 AddItem 引入了存在性前置校验，
+// 将原先"外键冲突→500"的行为收敛为明确的 404。
+func TestAddItem_DatasetNotFound(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	body := `{"query":"q","expected_documents":[],"relevance_grade":1,"query_class":"general"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/admin/evaluation/datasets/nonexistent/items", strings.NewReader(body))
+	req.SetPathValue("id", "nonexistent")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.AddItem(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Fatalf("期望 404，得到 %d，body: %s", w.Code, w.Body.String())
+	}
+}
+
+// TestDeleteDataset_NotFound 验证删除不存在的数据集返回 404。
+func TestDeleteDataset_NotFound(t *testing.T) {
+	evalRepo := newEvalRepoWithData()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, evalRepo, &mockEvalResultRepo{})
+
+	req := httptest.NewRequest(http.MethodDelete, "/api/admin/evaluation/datasets/nonexistent", nil)
+	req.SetPathValue("id", "nonexistent")
+	req = req.WithContext(auth.WithIdentity(req.Context(), &auth.Identity{UserID: "admin-1"}))
+	w := httptest.NewRecorder()
+	handler.DeleteDataset(w, req)
+
+	if w.Code != http.StatusNotFound {
+		t.Errorf("期望 404，得到 %d", w.Code)
+	}
+}
+
+// TestRegisterRoutes_EvaluationItemRoutes 验证新增 evaluation 路由注册不冲突且可匹配。
+//
+// 引入动机：Go 1.22 ServeMux 在 pattern 冲突时 panic 于注册期；
+// {id}/items/{itemId} 与既有 {id}/items 共存必须在测试期验证路由表存在。
+func TestRegisterRoutes_EvaluationItemRoutes(t *testing.T) {
+	mux := http.NewServeMux()
+	handler := NewHandler(&mockProfileRepo{}, &mockJobRepo{}, &mockAuditRepo{}, &mockEvalRepo{}, &mockEvalResultRepo{})
+	RegisterRoutes(mux, handler, nil, auth.AuthConfig{})
+
+	cases := []struct {
+		method  string
+		path    string
+		pattern string
+	}{
+		{http.MethodGet, "/api/admin/evaluation/datasets/ds-1/items", "GET /api/admin/evaluation/datasets/{id}/items"},
+		{http.MethodDelete, "/api/admin/evaluation/datasets/ds-1/items/item-1", "DELETE /api/admin/evaluation/datasets/{id}/items/{itemId}"},
+		{http.MethodDelete, "/api/admin/evaluation/datasets/ds-1", "DELETE /api/admin/evaluation/datasets/{id}"},
+	}
+	for _, tc := range cases {
+		req := httptest.NewRequest(tc.method, tc.path, nil)
+		if _, pattern := mux.Handler(req); pattern != tc.pattern {
+			t.Errorf("%s %s 路由未注册，匹配到 pattern %q", tc.method, tc.path, pattern)
+		}
+	}
+}
+

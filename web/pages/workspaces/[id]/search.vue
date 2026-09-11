@@ -13,6 +13,7 @@ definePageMeta({
 
 const { t } = useI18n()
 const route = useRoute()
+const router = useRouter()
 const workspaceId = computed(() => route.params.id as string)
 
 const { workspace } = useWorkspaceContext(workspaceId)
@@ -36,6 +37,9 @@ async function performSearch() {
   loading.value = true
   error.value = null
   hasSearched.value = true
+
+  // 搜索词写回 URL ?q=，便于刷新/分享后恢复同一查询。
+  router.replace({ query: { ...route.query, q: query.value.trim() } })
 
   try {
     const api = useSearchApi()
@@ -77,6 +81,63 @@ function navigateToResult(result: SearchResult) {
   navigateTo(`/workspaces/${workspaceId.value}/documents/read?path=${encodeURIComponent(result.path)}`)
 }
 
+// ============================ 页面级快捷键 ============================
+// escape：清空 query + 结果并回焦输入框。
+// - 输入框内 Escape：由 UInput 的 @keydown.escape 直接处理（useHotkey 对无修饰单键
+//   在输入框中默认抑制，但这里我们希望在输入态也能 esc 清空）。
+// - 非输入态 Escape：走 useHotkey（此时 focus 不在输入框，esc 才有意义）。
+// UInput 通过 defineExpose 暴露内部 inputRef；autofocus prop 负责初始聚焦。
+const searchInputRef = ref<{ inputRef?: HTMLInputElement | null } | null>(null)
+
+function focusSearchInput() {
+  searchInputRef.value?.inputRef?.focus()
+}
+
+function clearSearch() {
+  query.value = ''
+  results.value = []
+  total.value = 0
+  hasSearched.value = false
+  degraded.value = false
+  degradationReason.value = ''
+  error.value = null
+  // 清除 URL 中的 ?q=，避免刷新后恢复旧查询。
+  router.replace({ query: { ...route.query, q: undefined } })
+  focusSearchInput()
+}
+
+useHotkey('escape', () => {
+  // 仅当有可清内容时才消费 esc；空态下让位给浏览器/其它 esc 语义（如关模态）。
+  if (query.value || hasSearched.value) clearSearch()
+})
+
+// j/k 结果导航 + enter/o 打开：选中项用 selectedIndex 跟踪并滚动到可视区。
+// 单键在输入框聚焦时由 useHotkey 内置规则自动抑制，不干扰打字。
+const selectedIndex = ref(-1)
+
+watch(results, () => { selectedIndex.value = -1 })
+
+function moveSelection(delta: number) {
+  if (results.value.length === 0) return
+  const next = selectedIndex.value + delta
+  selectedIndex.value = Math.max(0, Math.min(results.value.length - 1, next))
+  // 滚动选中项进入可视区
+  nextTick(() => {
+    document.querySelectorAll<HTMLElement>('[data-search-result]')[selectedIndex.value]
+      ?.scrollIntoView({ block: 'nearest' })
+  })
+}
+
+function openSelected() {
+  const r = results.value[selectedIndex.value]
+  if (r) navigateToResult(r)
+}
+
+useHotkey('j', () => moveSelection(1))
+useHotkey('k', () => moveSelection(-1))
+useHotkey('enter', openSelected)
+useHotkey('o', openSelected)
+
 const modeOptions = computed<SelectItem[]>(() => [
   { label: t('search.modeHybrid'), value: 'hybrid' },
   { label: t('search.modeLexical'), value: 'lexical' },
@@ -94,11 +155,14 @@ useHead({ title: () => t('search.title') + ' · ' + t('common.appName') })
       <!-- Search bar -->
       <div class="flex gap-2 mb-4">
         <UInput
+          ref="searchInputRef"
           v-model="query"
           :placeholder="t('search.searchInWorkspace')"
           class="flex-1"
           icon="i-lucide-search"
+          autofocus
           @keyup.enter="performSearch"
+          @keydown.escape="clearSearch"
         />
         <USelect
           v-model="mode"
@@ -127,19 +191,31 @@ useHead({ title: () => t('search.title') + ' · ' + t('common.appName') })
         <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
       </div>
 
-      <div v-else-if="hasSearched && results.length === 0 && !error" class="text-center py-12">
-        <UIcon name="i-lucide-search" class="w-12 h-12 text-muted mx-auto mb-3" />
-        <p class="text-muted">{{ t('search.noResults') }}</p>
-      </div>
+      <!-- 初始引导态：尚未发起任何搜索时给操作指引 -->
+      <EmptyState
+        v-if="!hasSearched && !loading"
+        icon="i-lucide-search"
+        :title="t('search.hint')"
+        :description="t('search.hintModes')"
+      />
+
+      <EmptyState
+        v-else-if="hasSearched && results.length === 0 && !error"
+        icon="i-lucide-search-x"
+        :title="t('search.noResults')"
+      />
 
       <div v-else-if="results.length > 0" class="space-y-3">
         <div class="text-sm text-muted mb-2">
           {{ t('search.resultsCount', { total, mode: rerankerUsed ? t('search.reranked') : t('search.rrfOnly') }) }}
         </div>
         <div
-          v-for="result in results"
+          v-for="(result, i) in results"
           :key="result.document_id + result.rank"
-          class="border border-default rounded-lg p-4 hover:border-primary/50 cursor-pointer transition-colors"
+          data-search-result
+          class="border rounded-lg p-4 hover:border-primary/50 cursor-pointer transition-colors"
+          :class="i === selectedIndex ? 'border-primary/60 bg-elevated ring-1 ring-primary/40' : 'border-default'"
+          :aria-selected="i === selectedIndex"
           @click="navigateToResult(result)"
         >
           <div class="flex items-start justify-between mb-1">

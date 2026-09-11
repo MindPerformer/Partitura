@@ -10,6 +10,7 @@
 // - 分页支持
 // - CSRF 自动注入
 
+import { clearAuthState } from '~/composables/useAuth'
 import type {
   ApiError,
   PaginationParams,
@@ -59,8 +60,12 @@ import type {
   ListDatasetsResponse,
   CreateDatasetRequest,
   AddItemRequest,
+  ListItemsResponse,
   RunEvaluationRequest,
   ListEvaluationResultsResponse,
+  AdminAuditFilterParams,
+  AdminUserFilterParams,
+  AdminWorkspaceFilterParams,
   Job,
   ListJobsResponse,
   DeviceAuthStartResponse,
@@ -99,22 +104,42 @@ const MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
  * 引入动机：server 在 login 时设置非 HttpOnly 的 csrf cookie，
  * 前端 JS 读取后以 header 回传，实现 double-submit CSRF 防护。
  *
- * 在 SSR 和客户端均可使用。
+ * 本项目 ssr:false 纯 CSR，只保留客户端 document.cookie 读取。
+ * cookie 被禁用/环境异常时安全降级返回空串并 console.warn（不静默吞掉）。
  */
 function getCsrfToken(): string {
-  if (import.meta.server) {
-    // SSR: 从请求 cookie 读取
-    const headers = useRequestHeaders(['cookie'])
-    const cookies = headers.cookie || ''
-    const match = cookies.match(new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]+)`))
-    return match ? decodeURIComponent(match[1]!) : ''
+  if (typeof document === 'undefined') {
+    console.warn('[useApi] document 不可用，无法读取 CSRF cookie')
+    return ''
   }
-  // 客户端：从 document.cookie 读取
-  if (typeof document !== 'undefined') {
-    const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]+)`))
-    return match ? decodeURIComponent(match[1]!) : ''
+  if (typeof navigator !== 'undefined' && navigator.cookieEnabled === false) {
+    console.warn('[useApi] 浏览器 cookie 已禁用，CSRF token 不可用，状态变更请求可能被服务端拒绝')
+    return ''
   }
-  return ''
+  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]+)`))
+  return match ? decodeURIComponent(match[1]!) : ''
+}
+
+/**
+ * 模块级 401 处理：清理认证状态并跳转登录页。
+ *
+ * 设计动机：此函数运行在 apiFetch 的异步 catch 回调中，Nuxt 上下文已丢失，
+ * 不能调用 useAuth()/useCookie()/useRouter()。因此：
+ * - 认证清理委托给 useAuth.ts 的模块级 clearAuthState()（直接操作模块级 ref + document.cookie）
+ * - 跳转直接使用 window.location.assign（CSR 全量刷新，顺带清空内存态）
+ * - /auth/me 探测本身就是会话检查，由路由守卫决定跳转，这里跳过避免重复导航；
+ *   已在 /login 或 /bootstrap 时也不再跳转，避免刷新循环。
+ */
+function handleUnauthorized(failedPath: string): void {
+  clearAuthState()
+
+  if (typeof window === 'undefined') return
+  const pathname = window.location.pathname
+  if (failedPath === '/auth/me' || pathname === '/login' || pathname === '/bootstrap') {
+    return
+  }
+  const redirect = encodeURIComponent(pathname + window.location.search)
+  window.location.assign(`/login?redirect=${redirect}`)
 }
 
 /**
@@ -201,10 +226,9 @@ export async function apiFetch<T>(
       console.error(`[API] ${method} ${path} → ${status}: ${message}`)
     }
 
-    // 401 时清理认证状态
+    // 401：清理认证态（含 pkw_user cookie）并跳转登录页；/auth/me 探测除外（守卫负责跳转）
     if (status === 401) {
-      const auth = useAuth()
-      auth.clearAuth()
+      handleUnauthorized(path)
     }
 
     const apiError: ApiError = { error: message, status }
@@ -404,7 +428,7 @@ export function useSearchApi() {
 
 export function useAdminApi() {
   return {
-    listUsers: (params?: PaginationParams) =>
+    listUsers: (params?: AdminUserFilterParams) =>
       apiFetch<ListUsersResponse>('/admin/users', { query: params }),
 
     createUser: (req: CreateUserRequest) =>
@@ -413,10 +437,10 @@ export function useAdminApi() {
     updateUser: (id: string, req: UpdateUserRequest) =>
       apiFetch<AdminUser>(`/admin/users/${id}`, { method: 'PUT', body: req }),
 
-    listAllWorkspaces: (params?: PaginationParams) =>
+    listAllWorkspaces: (params?: AdminWorkspaceFilterParams) =>
       apiFetch<ListWorkspacesResponse>('/admin/workspaces', { query: params }),
 
-    listAudit: (params?: PaginationParams) =>
+    listAudit: (params?: AdminAuditFilterParams) =>
       apiFetch<ListAuditResponse>('/admin/audit', { query: params })
   }
 }
@@ -461,6 +485,22 @@ export function useSearchAdminApi() {
 
     addItem: (datasetId: string, req: AddItemRequest) =>
       apiFetch<{ id: string }>(`/admin/evaluation/datasets/${datasetId}/items`, { method: 'POST', body: req }),
+
+    /** GET /admin/evaluation/datasets/{id}/items — 评测条目分页列表 */
+    listItems: (datasetId: string, params?: PaginationParams) =>
+      apiFetch<ListItemsResponse>(`/admin/evaluation/datasets/${datasetId}/items`, { query: params }),
+
+    /** DELETE /admin/evaluation/datasets/{id}/items/{itemId} — 删除单条评测条目（CSRF + system_admin） */
+    deleteItem: (datasetId: string, itemId: string) =>
+      apiFetch<{ status: string }>(`/admin/evaluation/datasets/${datasetId}/items/${itemId}`, { method: 'DELETE' }),
+
+    /**
+     * DELETE /admin/evaluation/datasets/{id} — 软删（归档）数据集。
+     * 后端将 status 置为 'archived'，保留全部 items 和 evaluation_results。
+     * 归档为 API 层终态，无 restore 端点；归档后 RunEvaluation/AddItem 返回 409。
+     */
+    deleteDataset: (datasetId: string) =>
+      apiFetch<{ status: string }>(`/admin/evaluation/datasets/${datasetId}`, { method: 'DELETE' }),
 
     runEvaluation: (req: RunEvaluationRequest) =>
       apiFetch<{ status: string; job_id: string; dataset_id: string; profile_id: string }>('/admin/evaluation/run', { method: 'POST', body: req }),

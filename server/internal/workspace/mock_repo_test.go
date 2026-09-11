@@ -102,6 +102,10 @@ func (m *MockRepository) CreateWorkspaceWithInitializer(ctx context.Context, nam
 		MaxDocumentSizeBytes:  2097152,
 		CreatedBy:             createdBy,
 	}
+	// 模拟 LEFT JOIN users：如果 mock 中存在该用户，填充 CreatedByUsername。
+	if u, ok := m.users[createdBy]; ok {
+		ws.CreatedByUsername = u.Username
+	}
 	m.workspaces[wsID] = ws
 	m.wsByName[name] = ws
 
@@ -410,11 +414,22 @@ func (m *MockRepository) ListMemberCandidates(ctx context.Context, workspaceID, 
 }
 
 // ListAllWorkspaces 实现 Repository 接口。
-func (m *MockRepository) ListAllWorkspaces(ctx context.Context, limit, offset int) (*ListWorkspacesResult, error) {
+// 引入动机：handler 测试需要验证 status/q 筛选真实收窄结果，mock 复现同一过滤语义。
+func (m *MockRepository) ListAllWorkspaces(ctx context.Context, filter AdminWorkspaceFilter, limit, offset int) (*ListWorkspacesResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var all []Workspace
 	for _, ws := range m.workspaces {
+		if filter.Status != "" && ws.Status != filter.Status {
+			continue
+		}
+		if filter.Query != "" {
+			lower := strings.ToLower(filter.Query)
+			if !strings.Contains(strings.ToLower(ws.Name), lower) &&
+				!strings.Contains(strings.ToLower(ws.DisplayName), lower) {
+				continue
+			}
+		}
 		all = append(all, *ws)
 	}
 	total := len(all)
@@ -450,7 +465,8 @@ func (m *MockRepository) ListAllUsers(ctx context.Context, limit, offset int) (*
 // ListAllUsersWithSystemInfo 实现 Repository 接口。
 // 引入动机：admin ListUsers handler 使用此方法一次性获取用户基础信息和系统角色/权限，
 // 避免逐用户 N+1 查询。mock 中递增调用计数器供测试验证单次调用。
-func (m *MockRepository) ListAllUsersWithSystemInfo(ctx context.Context, limit, offset int) (*ListAdminUsersResult, error) {
+// filter 中零值字段不参与过滤，mock 复现同一过滤语义供 handler 测试断言收窄结果。
+func (m *MockRepository) ListAllUsersWithSystemInfo(ctx context.Context, filter AdminUserFilter, limit, offset int) (*ListAdminUsersResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.listAllUsersWithSystemInfoCallCount++
@@ -458,6 +474,16 @@ func (m *MockRepository) ListAllUsersWithSystemInfo(ctx context.Context, limit, 
 	var all []AdminUser
 	for userID, u := range m.users {
 		info := m.userSysInfo[userID]
+		if filter.SystemRole != "" && info.systemRole != filter.SystemRole {
+			continue
+		}
+		if filter.Query != "" {
+			lower := strings.ToLower(filter.Query)
+			if !strings.Contains(strings.ToLower(u.Username), lower) &&
+				!strings.Contains(strings.ToLower(u.Email), lower) {
+				continue
+			}
+		}
 		all = append(all, AdminUser{
 			UserID:              u.UserID,
 			Username:            u.Username,
@@ -581,10 +607,36 @@ func (m *MockAuditRepository) Record(ctx context.Context, userID, workspaceID, a
 }
 
 // List 实现 audit.Repository 接口。
-func (m *MockAuditRepository) List(ctx context.Context, limit, offset int) (*audit.ListResult, error) {
+// 引入动机：handler 测试需要验证筛选参数真实收窄结果，mock 复现同一过滤语义。
+// From/To 比较基于记录时的 timestamp；零值字段不参与过滤。
+func (m *MockAuditRepository) List(ctx context.Context, filter audit.ListFilter, limit, offset int) (*audit.ListResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	total := len(m.entries)
+
+	var filtered []mockAuditEntry
+	for _, e := range m.entries {
+		if filter.UserID != "" && e.userID != filter.UserID {
+			continue
+		}
+		if filter.Action != "" && e.action != filter.Action {
+			continue
+		}
+		if filter.ResourceType != "" && e.resourceType != filter.ResourceType {
+			continue
+		}
+		if filter.WorkspaceID != "" && e.workspaceID != filter.WorkspaceID {
+			continue
+		}
+		if filter.From != nil && e.timestamp.Before(*filter.From) {
+			continue
+		}
+		if filter.To != nil && e.timestamp.After(*filter.To) {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+
+	total := len(filtered)
 	if offset >= total {
 		return &audit.ListResult{Entries: nil, Total: total}, nil
 	}
@@ -596,7 +648,7 @@ func (m *MockAuditRepository) List(ctx context.Context, limit, offset int) (*aud
 	// 反转顺序（按时间降序）
 	var result []audit.Entry
 	for i := total - 1 - offset; i >= total-end; i-- {
-		e := m.entries[i]
+		e := filtered[i]
 		result = append(result, audit.Entry{
 			UserID:       e.userID,
 			WorkspaceID:  e.workspaceID,

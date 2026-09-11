@@ -114,7 +114,8 @@ useHead({ title: () => t('device.authorize') + ' · ' + t('common.appName') })
 </script>
 
 <template>
-  <div class="min-h-screen flex items-center justify-center px-4 py-8 bg-elevated">
+  <!-- 顶栏由 layouts/default.vue 统一注入；内容区保留居中卡片布局 -->
+  <div class="flex items-center justify-center px-4 py-8 min-h-[calc(100vh-3.5rem)]">
     <UCard class="w-full max-w-md">
       <template #header>
         <div class="flex items-center gap-3">

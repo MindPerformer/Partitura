@@ -400,7 +400,7 @@ func (m *mockAuditRepo) Record(ctx context.Context, userID, workspaceID, action,
 	return nil
 }
 
-func (m *mockAuditRepo) List(ctx context.Context, limit, offset int) (*audit.ListResult, error) {
+func (m *mockAuditRepo) List(ctx context.Context, filter audit.ListFilter, limit, offset int) (*audit.ListResult, error) {
 	return &audit.ListResult{}, nil
 }
 

@@ -17,6 +17,7 @@ const workspaceId = computed(() => route.params.id as string)
 
 const { workspace, canManageMembers, currentMemberRole } = useWorkspaceContext(workspaceId)
 const { workspaceRoleLabel } = useEnumLabels()
+const toast = useToast()
 
 const members = ref<Member[]>([])
 const total = ref(0)
@@ -27,16 +28,20 @@ const error = ref<string | null>(null)
 
 const showAddModal = ref(false)
 const addForm = ref({ username: '', role: 'viewer' })
-const selectedCandidate = ref<Member | null>(null)
+const selectedCandidate = ref<Member | undefined>(undefined)
 const candidates = ref<Member[]>([])
 const candidateLoading = ref(false)
 const candidateSearched = ref(false)
-const candidateOpen = ref(false)
 const candidateError = ref<string | null>(null)
 const addLoading = ref(false)
 const addError = ref<string | null>(null)
 let candidateTimer: ReturnType<typeof setTimeout> | undefined
 let candidateSearchVersion = 0
+
+// 移除成员确认（UModal 取代原生 confirm，i18n/暗色/焦点管理统一）
+const showRemoveModal = ref(false)
+const memberToRemove = ref<Member | null>(null)
+const removeLoading = ref(false)
 
 async function loadMembers() {
   if (!workspaceId.value) return
@@ -62,21 +67,26 @@ function handleOffsetChange(newOffset: number) {
   loadMembers()
 }
 
+// 候选搜索防抖：username 变化后延迟 250ms 触发 listMemberCandidates；
+// version 计数丢弃过期响应，candidateTimer 在卸载/重置时清理。
 watch(() => addForm.value.username, (value) => {
   const version = ++candidateSearchVersion
-  selectedCandidate.value = null
   candidateError.value = null
   candidateSearched.value = false
   candidates.value = []
-  candidateOpen.value = false
   if (candidateTimer) clearTimeout(candidateTimer)
+
+  // 输入文本与已选候选不一致时清除选中态，强制用户重新从列表选择，
+  // 避免 selectedCandidate 残留旧对象而 username 已变的错配提交。
+  if (selectedCandidate.value && selectedCandidate.value.username !== value.trim()) {
+    selectedCandidate.value = undefined
+  }
 
   const query = value.trim()
   if (!query || !workspaceId.value || !canManageMembers.value) return
 
   candidateTimer = setTimeout(async () => {
     candidateLoading.value = true
-    candidateOpen.value = true
     try {
       const res = await useWorkspaceApi().listMemberCandidates(workspaceId.value, query, 8)
       if (version !== candidateSearchVersion) return
@@ -93,10 +103,14 @@ watch(() => addForm.value.username, (value) => {
   }, 250)
 })
 
-function selectCandidate(candidate: Member) {
-  selectedCandidate.value = candidate
-  addForm.value.username = candidate.username
-  candidateOpen.value = false
+// UInputMenu 的候选条目：显示 username + email，value 取整个 Member 以便提交校验。
+const candidateItems = computed<Member[]>(() => candidates.value)
+
+function onCandidateSelect(member: Member | undefined) {
+  selectedCandidate.value = member
+  if (member) {
+    addForm.value.username = member.username
+  }
   candidateError.value = null
 }
 
@@ -104,10 +118,9 @@ function resetAddForm() {
   candidateSearchVersion++
   if (candidateTimer) clearTimeout(candidateTimer)
   addForm.value = { username: '', role: 'viewer' }
-  selectedCandidate.value = null
+  selectedCandidate.value = undefined
   candidates.value = []
   candidateSearched.value = false
-  candidateOpen.value = false
   candidateError.value = null
   addError.value = null
 }
@@ -130,6 +143,7 @@ async function handleAdd() {
     showAddModal.value = false
     resetAddForm()
     await loadMembers()
+    toast.add({ title: t('workspace.memberAdded'), color: 'success' })
   } catch (err) {
     const apiErr = err as ApiError
     if (apiErr.status === 409) {
@@ -154,21 +168,33 @@ async function handleUpdateRole(member: Member, newRole: string) {
     const updated = await api.updateMemberRole(workspaceId.value, member.user_id, { role: newRole })
     const idx = members.value.findIndex(m => m.user_id === member.user_id)
     if (idx >= 0) members.value[idx] = updated
+    toast.add({ title: t('workspace.roleUpdated'), color: 'success' })
   } catch (err) {
     const apiErr = err as ApiError
     error.value = apiErr.error || t('workspace.updateRoleFailed')
   }
 }
 
-async function handleRemove(member: Member) {
-  if (!confirm(t('workspace.removeMemberConfirm', { name: member.username }))) return
+function promptRemove(member: Member) {
+  memberToRemove.value = member
+  showRemoveModal.value = true
+}
+
+async function confirmRemove() {
+  if (!memberToRemove.value) return
+  removeLoading.value = true
   try {
     const api = useWorkspaceApi()
-    await api.removeMember(workspaceId.value, member.user_id)
-    members.value = members.value.filter(m => m.user_id !== member.user_id)
+    await api.removeMember(workspaceId.value, memberToRemove.value.user_id)
+    members.value = members.value.filter(m => m.user_id !== memberToRemove.value!.user_id)
+    showRemoveModal.value = false
+    memberToRemove.value = null
+    toast.add({ title: t('workspace.memberRemoved'), color: 'success' })
   } catch (err) {
     const apiErr = err as ApiError
     error.value = apiErr.error || t('workspace.removeMemberFailed')
+  } finally {
+    removeLoading.value = false
   }
 }
 
@@ -236,7 +262,8 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
                 variant="ghost"
                 color="error"
                 icon="i-lucide-trash-2"
-                @click="handleRemove(member)"
+                :aria-label="t('workspace.removeMember')"
+                @click="promptRemove(member)"
               />
             </div>
           </div>
@@ -261,42 +288,34 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
           <h3 class="text-lg font-semibold mb-4">{{ t('workspace.addMember') }}</h3>
           <form @submit.prevent="handleAdd" class="space-y-4">
             <UFormField :label="t('workspace.username')" name="username">
-              <div class="relative">
-                <UInput
-                  v-model="addForm.username"
-                  :placeholder="t('workspace.usernamePlaceholder')"
-                  autocomplete="off"
-                  class="w-full"
-                  @focus="candidateOpen = addForm.username.trim().length > 0"
-                />
-                <div
-                  v-if="candidateOpen && addForm.username.trim()"
-                  class="absolute left-0 right-0 top-full z-10 mt-1 overflow-hidden rounded-lg border border-default bg-default shadow-lg"
-                >
-                  <div v-if="candidateLoading" class="flex items-center gap-2 px-3 py-3 text-sm text-muted">
-                    <UIcon name="i-lucide-loader-circle" class="h-4 w-4 animate-spin" />
-                    {{ t('workspace.searchingCandidates') }}
-                  </div>
-                  <ErrorDisplay v-else-if="candidateError" :message="candidateError" class="m-2" />
-                  <div v-else-if="candidateSearched && candidates.length === 0" class="px-3 py-3 text-sm text-muted">
-                    {{ t('workspace.noCandidateResults') }}
-                  </div>
-                  <button
-                    v-for="candidate in candidates"
-                    :key="candidate.user_id"
-                    type="button"
-                    class="flex w-full items-center gap-3 px-3 py-2 text-left transition-colors hover:bg-elevated"
-                    @mousedown.prevent
-                    @click="selectCandidate(candidate)"
-                  >
-                    <UAvatar :alt="candidate.username.charAt(0).toUpperCase()" size="xs" />
+              <!-- 候选下拉改用 UInputMenu（combobox）：自带 listbox/方向键/Esc/外点关闭 a11y -->
+              <UInputMenu
+                v-model="selectedCandidate"
+                v-model:search-term="addForm.username"
+                :items="candidateItems"
+                :loading="candidateLoading"
+                :placeholder="t('workspace.usernamePlaceholder')"
+                label-key="username"
+                class="w-full"
+                open-on-focus
+                @update:model-value="onCandidateSelect"
+              >
+                <template #item="{ item }">
+                  <span class="flex items-center gap-2 min-w-0">
+                    <UAvatar :alt="item.username.charAt(0).toUpperCase()" size="xs" />
                     <span class="min-w-0">
-                      <span class="block truncate text-sm font-medium text-highlighted">{{ candidate.username }}</span>
-                      <span class="block truncate text-xs text-muted">{{ candidate.email }}</span>
+                      <span class="block truncate text-sm font-medium text-highlighted">{{ item.username }}</span>
+                      <span class="block truncate text-xs text-muted">{{ item.email }}</span>
                     </span>
-                  </button>
-                </div>
-              </div>
+                  </span>
+                </template>
+                <template #empty>
+                  <span class="px-3 py-2 text-sm text-muted">
+                    {{ candidateSearched ? t('workspace.noCandidateResults') : t('workspace.searchingCandidates') }}
+                  </span>
+                </template>
+              </UInputMenu>
+              <ErrorDisplay v-if="candidateError" :message="candidateError" class="mt-2" />
             </UFormField>
             <p v-if="selectedCandidate" class="text-xs text-success">
               {{ t('workspace.selectedCandidate', { username: selectedCandidate.username }) }}
@@ -310,6 +329,27 @@ useHead({ title: () => t('workspace.members') + ' · ' + t('common.appName') })
               <UButton type="submit" :loading="addLoading">{{ t('common.add') }}</UButton>
             </div>
           </form>
+        </div>
+      </template>
+    </UModal>
+
+    <!-- 移除成员确认 -->
+    <UModal v-model:open="showRemoveModal">
+      <template #content>
+        <div class="p-6">
+          <div class="flex items-start gap-3 mb-4">
+            <UIcon name="i-lucide-triangle-alert" class="w-6 h-6 text-error flex-shrink-0" />
+            <div>
+              <h3 class="text-lg font-semibold text-highlighted">{{ t('workspace.removeMember') }}</h3>
+              <p class="text-sm text-muted mt-1">
+                {{ t('workspace.removeMemberConfirm', { name: memberToRemove?.username ?? '' }) }}
+              </p>
+            </div>
+          </div>
+          <div class="flex justify-end gap-2 mt-6">
+            <UButton color="neutral" variant="ghost" @click="showRemoveModal = false; memberToRemove = null">{{ t('common.cancel') }}</UButton>
+            <UButton color="error" :loading="removeLoading" @click="confirmRemove">{{ t('workspace.removeMember') }}</UButton>
+          </div>
         </div>
       </template>
     </UModal>

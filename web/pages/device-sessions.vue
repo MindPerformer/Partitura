@@ -7,6 +7,9 @@ definePageMeta({
 })
 
 const { t } = useI18n()
+// 时间格式化统一走 useFormatDate：非法值返回"时间不可用"文案，
+// 不渲染 "Invalid Date"，并集中记录 console.error。
+const { formatDate } = useFormatDate()
 
 const sessions = ref<DeviceSession[]>([])
 const sessionsLoading = ref(false)
@@ -99,19 +102,13 @@ async function handleRevoke(session: DeviceSession) {
   }
 }
 
-function formatDate(value: string): string {
-  const date = new Date(value)
-  return Number.isNaN(date.getTime()) ? t('common.timeUnavailable') : date.toLocaleString()
-}
-
 useHead({ title: () => t('device.title') + ' · ' + t('common.appName') })
 </script>
 
 <template>
   <div>
-    <AppHeader />
-
-    <div class="max-w-3xl mx-auto px-4 py-8">
+    <!-- 顶栏由 layouts/default.vue 统一注入 -->
+    <div class="max-w-4xl mx-auto px-4 py-8">
       <h1 class="text-2xl font-bold text-highlighted mb-6">{{ t('device.title') }}</h1>
 
       <UCard class="mb-6">
@@ -126,7 +123,7 @@ useHead({ title: () => t('device.title') + ' · ' + t('common.appName') })
           <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
         </div>
         <div v-else-if="sessions.length" class="space-y-3">
-          <div v-for="session in sessions" :key="session.id" class="rounded-lg border border-default p-4">
+          <div v-for="session in sessions" :key="session.id" class="rounded-xl border border-default p-4">
             <div class="flex items-start justify-between gap-4">
               <div class="min-w-0">
                 <p class="font-medium text-highlighted">{{ session.device_name }}</p>
@@ -140,7 +137,7 @@ useHead({ title: () => t('device.title') + ' · ' + t('common.appName') })
             </div>
           </div>
         </div>
-        <p v-else class="text-center text-muted py-6">{{ t('device.noSessions') }}</p>
+        <EmptyState v-else icon="i-lucide-monitor-off" :title="t('device.noSessions')" />
       </UCard>
 
       <UCard class="mb-6">

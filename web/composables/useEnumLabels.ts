@@ -130,13 +130,25 @@ export function useEnumLabels() {
     return keys[type] ? translate(keys[type], type) : unknownLabel('任务类型', type)
   }
 
+  function datasetStatusLabel(status: string | null | undefined): string {
+    if (!status) return '-'
+    const keys: Record<string, string> = {
+      active: 'admin.statusActive',
+      archived: 'admin.statusArchived'
+    }
+    return keys[status] ? translate(keys[status], status) : unknownLabel('数据集状态', status)
+  }
+
   function settingTypeLabel(type: string | null | undefined): string {
     if (!type) return '-'
+    // 后端 SystemSetting.type 词汇为 string/int/bool/float/duration；
+    // json 保留以兼容后端可能扩展返回的类型。
     const keys: Record<string, string> = {
       string: 'admin.settingTypeString',
-      boolean: 'admin.settingTypeBoolean',
-      integer: 'admin.settingTypeInteger',
-      number: 'admin.settingTypeNumber',
+      bool: 'admin.settingTypeBoolean',
+      int: 'admin.settingTypeInteger',
+      float: 'admin.settingTypeNumber',
+      duration: 'admin.settingTypeDuration',
       json: 'admin.settingTypeJson'
     }
     return keys[type] ? translate(keys[type], type) : unknownLabel('配置类型', type)
@@ -152,6 +164,7 @@ export function useEnumLabels() {
     documentTypeLabel,
     sourceTypeLabel,
     jobTypeLabel,
+    datasetStatusLabel,
     settingTypeLabel
   }
 }

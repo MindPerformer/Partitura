@@ -187,8 +187,9 @@ func cleanTestDB(ctx context.Context, db *sql.DB) {
 	for _, table := range tables {
 		_, _ = db.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", table))
 	}
-	// 删除扩展
+	// 删除扩展（pg_trgm 由 M011 引入，与 pgcrypto 一并清理保证干净起始状态）
 	_, _ = db.ExecContext(ctx, `DROP EXTENSION IF EXISTS "pgcrypto"`)
+	_, _ = db.ExecContext(ctx, `DROP EXTENSION IF EXISTS pg_trgm`)
 }
 
 func TestIntegration_MigrationUp(t *testing.T) {
@@ -283,7 +284,19 @@ func TestIntegration_MigrationDown(t *testing.T) {
 		t.Fatalf("迁移 Up 失败: %v", err)
 	}
 
-	// 回退 1 步——应回退最高版本（M006 device_authorizations）
+	// 计算当前最高迁移版本与其下一个最高版本，使断言不随新增迁移而过期。
+	maxVersion := 0
+	secondMax := 0
+	for _, m := range migrations {
+		if m.Version > maxVersion {
+			secondMax = maxVersion
+			maxVersion = m.Version
+		} else if m.Version > secondMax {
+			secondMax = m.Version
+		}
+	}
+
+	// 回退 1 步——应回退最高版本
 	reverted, err := runner.Down(ctx, 1)
 	if err != nil {
 		t.Fatalf("迁移 Down 失败: %v", err)
@@ -292,35 +305,24 @@ func TestIntegration_MigrationDown(t *testing.T) {
 		t.Errorf("期望回退 1 个迁移，实际回退 %d 个", reverted)
 	}
 
-	// 验证 device_authorizations 表已被删除（M006 down 删除该表）
-	var exists bool
-	err = db.QueryRowContext(ctx,
-		"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'device_authorizations')").Scan(&exists)
-	if err != nil {
-		t.Fatalf("查询 device_authorizations 表是否存在: %v", err)
-	}
-	if exists {
-		t.Error("回退 M006 后 device_authorizations 表不应存在")
-	}
-
 	// 验证 users 表仍存在（Down(1) 只回退最高 migration，不影响 M001）
+	var exists bool
 	err = db.QueryRowContext(ctx,
 		"SELECT EXISTS (SELECT FROM information_schema.tables WHERE table_name = 'users')").Scan(&exists)
 	if err != nil {
 		t.Fatalf("查询 users 表是否存在: %v", err)
 	}
 	if !exists {
-		t.Error("回退 M006 后 users 表应仍存在（Down(1) 只回退最高 migration）")
+		t.Error("回退最高版本后 users 表应仍存在（Down(1) 只回退最高 migration）")
 	}
 
-	// 验证 schema_migrations 中 M006 版本已被删除，当前版本为 5（M005 不存在，M004 是第二高）
+	// 验证最高版本已从 schema_migrations 删除，当前版本回落到第二高
 	version, err := runner.CurrentVersion(ctx)
 	if err != nil {
 		t.Fatalf("查询当前版本: %v", err)
 	}
-	// 项目最高 migration 为 M006，Down(1) 后应为 4（M005 不存在，M004 是下一个最高）
-	if version != 4 {
-		t.Errorf("回退 M006 后当前版本应为 4（M004 为下一个最高），实际 %d", version)
+	if version != secondMax {
+		t.Errorf("回退最高版本（M%03d）后当前版本应为 %d（下一个最高），实际 %d", maxVersion, secondMax, version)
 	}
 }
 
@@ -834,15 +836,15 @@ func TestLoadMigrations_ProjectDir_NoM005(t *testing.T) {
 		}
 	}
 
-	// 验证最高版本为 10（M010 provider_secrets）
+	// 验证最高版本为 11（M011 pg_trgm_fuzzy_indexes）
 	maxVersion := 0
 	for _, m := range migrations {
 		if m.Version > maxVersion {
 			maxVersion = m.Version
 		}
 	}
-	if maxVersion != 10 {
-		t.Errorf("最高迁移版本应为 10（M010），实际 %d", maxVersion)
+	if maxVersion != 11 {
+		t.Errorf("最高迁移版本应为 11（M011），实际 %d", maxVersion)
 	}
 }
 
@@ -950,14 +952,20 @@ func TestIntegration_M004DownDropsEvaluationResults(t *testing.T) {
 		t.Fatalf("迁移 Up 失败: %v", err)
 	}
 
-	// 回退到 M004：项目迁移版本为 1,2,3,4,6（无 M005），
-	// 降序排列为 6,4,3,2,1，需要 Down(2) 才能回退 M006 和 M004
-	reverted, err := runner.Down(ctx, 2)
+	// 回退到 M004：计算需要回退多少个高于 4 的迁移（M005 不存在，但 M006-M011 存在）。
+	// 降序应用 Down，直到版本 4 被回退为止。
+	aboveFour := 0
+	for _, m := range migrations {
+		if m.Version > 4 {
+			aboveFour++
+		}
+	}
+	reverted, err := runner.Down(ctx, aboveFour+1)
 	if err != nil {
 		t.Fatalf("迁移 Down 失败: %v", err)
 	}
-	if reverted != 2 {
-		t.Errorf("期望回退 2 个迁移（M006 + M004），实际回退 %d 个", reverted)
+	if reverted != aboveFour+1 {
+		t.Errorf("期望回退 %d 个迁移（所有高于 M004 的 + M004 自身），实际回退 %d 个", aboveFour+1, reverted)
 	}
 
 	// 验证 evaluation_results 表已删除

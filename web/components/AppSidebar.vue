@@ -2,6 +2,9 @@
 //
 // 引入动机：design/04-WEB-API.md §Frontend 要求 Sidebar 显示 document tree。
 // 从 document list 构建树形结构，支持目录展开/折叠。
+//
+// a11y：外层 <ul role="tree">，目录子列表 <ul role="group">；
+// 文件节点为 NuxtLink（支持 Ctrl+Click 新标签打开），目录节点保留 button + aria-expanded。
 -->
 <script setup lang="ts">
 import type { DocumentListItem } from '~/types/api'
@@ -54,21 +57,22 @@ function selectNode(node: TreeNode) {
 </script>
 
 <template>
-  <nav class="h-full overflow-y-auto py-4 px-2">
-    <ul v-if="tree.length > 0" class="space-y-0.5">
+  <nav class="h-full overflow-y-auto py-4 px-2" :aria-label="t('document.documents')">
+    <ul v-if="tree.length > 0" class="space-y-0.5" role="tree">
       <AppSidebarNode
         v-for="node in tree"
         :key="node.path"
         :node="node"
         :current-path="currentPath"
         :expanded-dirs="expandedDirs"
+        :workspace-id="workspaceId"
         :level="0"
         @select="selectNode"
         @toggle="toggleDir"
       />
     </ul>
     <p v-else class="text-sm text-muted px-2 py-4">
-      {{ t('document.documents') }}
+      {{ t('document.noDocuments') }}
     </p>
   </nav>
 </template>

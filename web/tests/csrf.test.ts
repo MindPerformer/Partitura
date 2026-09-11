@@ -1,6 +1,6 @@
 // tests/csrf.test.ts — CSRF token header/cookie 测试
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { createFetchMock } from './setup'
 
 const ctrl = createFetchMock()
@@ -17,9 +17,27 @@ function setDocumentCookie(name: string, value: string) {
   }
 }
 
+/**
+ * 过期所有测试写入的 cookie，消除跨用例污染。
+ * 逐个读取 document.cookie 中的 name，用 Max-Age=0 使其过期。
+ */
+function clearAllCookies() {
+  if (typeof document === 'undefined') return
+  for (const pair of document.cookie.split(';')) {
+    const name = pair.split('=')[0]?.trim()
+    if (name) {
+      document.cookie = `${name}=; Path=/; Max-Age=0`
+    }
+  }
+}
+
 describe('CSRF Token Handling', () => {
   beforeEach(() => {
     ctrl.reset()
+  })
+
+  afterEach(() => {
+    clearAllCookies()
   })
 
   it('GET 请求不携带 CSRF header', async () => {

@@ -1,148 +1,25 @@
-// tests/workspace-navigation.test.ts — workspace 导航和分页文档树测试
+// tests/workspace-navigation.test.ts — workspace 导航相关 API 契约测试
 //
-// 引入动机：计划要求所有 workspace 页面使用统一左侧文档树，
-// 侧栏顶部保留固定"主页"入口，文档树必须完整分页加载。
-// 此测试验证：
-// 1. WorkspaceLayout 分页加载所有文档（超过 100 篇）
-// 2. workspace stats API 可用并在主页数据中合并展示
-// 3. 路由切换保持正确 workspace
+// 引入动机：计划要求所有 workspace 页面使用统一左侧文档树 + 顶部主页入口。
+// 文档分页加载的真实行为已由 tests/sidebar-pagination.test.ts 覆盖
+// （挂载真实 WorkspaceLayout 驱动 loadDocuments/loadMoreDocuments）。
+// 本文件保留真正属于"API 契约"的断言：workspace stats 聚合接口可用。
+//
+// 说明：此前此文件手抄了一份 loadDocuments 分页循环做断言，与真实实现脱钩
+// （违反 TDD「测试驱动真实代码」），已在 Phase 4 移除——分页行为统一由
+// sidebar-pagination.test.ts 覆盖。
 
 import { describe, it, expect, beforeEach } from 'vitest'
 import { createFetchMock } from './setup'
-import type { DocumentListItem, ListDocumentsResponse } from '~/types/api'
 
 const ctrl = createFetchMock()
 
-function makeDoc(i: number): DocumentListItem {
-  return {
-    id: `doc-${i}`,
-    path: `docs/doc-${i}.md`,
-    title: `Document ${i}`,
-    type: '',
-    status: 'active',
-    content_hash: `hash-${i}`,
-    revision_number: 1,
-    is_special: false,
-    updated_by: 'user-1',
-    updated_at: '2026-03-08T12:34:56Z'
-  }
-}
-
-describe('Workspace Navigation', () => {
+describe('Workspace Navigation — stats API 契约', () => {
   beforeEach(() => {
     ctrl.reset()
   })
 
-  it('文档数 > 100 时，WorkspaceLayout 分页加载所有文档', async () => {
-    const PAGE_SIZE = 100
-    const TOTAL = 250
-
-    ctrl.setImpl((url: string) => {
-      const u = new URL(url, 'http://test.local')
-      const offset = parseInt(u.searchParams.get('offset') || '0', 10)
-      const limit = parseInt(u.searchParams.get('limit') || '100', 10)
-      const docs: DocumentListItem[] = []
-      const end = Math.min(offset + limit, TOTAL)
-      for (let i = offset; i < end; i++) {
-        docs.push(makeDoc(i))
-      }
-      return Promise.resolve({
-        _data: { documents: docs, total: TOTAL, limit, offset } as ListDocumentsResponse,
-        status: 200
-      })
-    })
-
-    const { useDocumentApi } = await import('~/composables/useApi')
-    const api = useDocumentApi()
-
-    // 复现 WorkspaceLayout loadDocuments 的分页循环逻辑
-    const all: DocumentListItem[] = []
-    let offset = 0
-    while (true) {
-      const res = await api.list('ws-1', { limit: PAGE_SIZE, offset })
-      all.push(...res.documents)
-      if (all.length >= res.total || res.documents.length === 0) {
-        break
-      }
-      offset += res.limit
-    }
-
-    // 验证：所有 250 个文档都被加载
-    expect(all).toHaveLength(TOTAL)
-    expect(all[0]!.id).toBe('doc-0')
-    expect(all[100]!.id).toBe('doc-100')
-    expect(all[249]!.id).toBe('doc-249')
-
-    // 验证：发起了 3 次请求
-    expect(ctrl.mockFn.mock.calls).toHaveLength(3)
-  })
-
-  it('文档数恰好 100 时不请求第二页', async () => {
-    const PAGE_SIZE = 100
-    const TOTAL = 100
-
-    ctrl.setImpl((url: string) => {
-      const u = new URL(url, 'http://test.local')
-      const offset = parseInt(u.searchParams.get('offset') || '0', 10)
-      const limit = parseInt(u.searchParams.get('limit') || '100', 10)
-      const docs: DocumentListItem[] = []
-      const end = Math.min(offset + limit, TOTAL)
-      for (let i = offset; i < end; i++) {
-        docs.push(makeDoc(i))
-      }
-      return Promise.resolve({
-        _data: { documents: docs, total: TOTAL, limit, offset } as ListDocumentsResponse,
-        status: 200
-      })
-    })
-
-    const { useDocumentApi } = await import('~/composables/useApi')
-    const api = useDocumentApi()
-
-    const all: DocumentListItem[] = []
-    let offset = 0
-    while (true) {
-      const res = await api.list('ws-1', { limit: PAGE_SIZE, offset })
-      all.push(...res.documents)
-      if (all.length >= res.total || res.documents.length === 0) {
-        break
-      }
-      offset += res.limit
-    }
-
-    expect(all).toHaveLength(TOTAL)
-    expect(ctrl.mockFn.mock.calls).toHaveLength(1)
-  })
-
-  it('空文档列表时立即终止', async () => {
-    ctrl.setImpl((url: string) => {
-      const u = new URL(url, 'http://test.local')
-      const offset = parseInt(u.searchParams.get('offset') || '0', 10)
-      return Promise.resolve({
-        _data: { documents: [], total: 0, limit: 100, offset } as ListDocumentsResponse,
-        status: 200
-      })
-    })
-
-    const { useDocumentApi } = await import('~/composables/useApi')
-    const api = useDocumentApi()
-
-    const all: DocumentListItem[] = []
-    let offset = 0
-    while (true) {
-      const res = await api.list('ws-1', { limit: 100, offset })
-      all.push(...res.documents)
-      if (all.length >= res.total || res.documents.length === 0) {
-        break
-      }
-      offset += res.limit
-    }
-
-    expect(all).toHaveLength(0)
-    expect(ctrl.mockFn.mock.calls).toHaveLength(1)
-  })
-
-  it('workspace stats API 被正确调用', async () => {
+  it('workspace stats API 返回聚合统计并被正确调用', async () => {
     ctrl.setResponse({
       stats: {
         total_documents: 10,
@@ -162,5 +39,10 @@ describe('Workspace Navigation', () => {
     expect(result.stats.total_documents).toBe(10)
     expect(result.stats.active_documents).toBe(8)
     expect(result.stats.member_count).toBe(3)
+
+    // 验证请求确实打到了 stats 端点
+    const call = ctrl.mockFn.mock.calls[0]
+    expect(call).toBeTruthy()
+    expect(String(call![0])).toContain('/workspaces/ws-1/stats')
   })
 })

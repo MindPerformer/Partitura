@@ -37,8 +37,12 @@ function isListJobsResponse(value: unknown): value is ListJobsResponse {
  * @returns jobs, total, loading, error, load
  */
 export function useIndexJobs() {
-  // i18n：在 setup 上下文外（如单元测试直接调用）安全降级
-  // 测试需要断言中文错误消息，因此提供最小 fallback 映射。
+  // i18n：在 setup 上下文外（如单元测试直接调用）安全降级。
+  // 动机：useI18n() 只能在 setup 上下文调用；单元测试在裸环境调用本 composable，
+  //   且断言固定的中文错误文案（如「服务器返回的任务列表格式不正确」），
+  //   因此提供与 locales/zh.json 对齐的最小 fallback 映射，缺键时返回 key 本身。
+  // 为何不返回 key 由组件翻译：错误在 composable 内立即写入 error ref 供模板直接渲染，
+  //   组件无法可靠区分「已是文案」与「待翻译 key」，故在边界处就地解析为可读文本。
   let t: (key: string) => string
   try {
     t = useI18n().t

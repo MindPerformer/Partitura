@@ -17,6 +17,7 @@ package admin
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -794,6 +795,24 @@ func (h *Handler) AddItem(w http.ResponseWriter, r *http.Request) {
 		req.QueryClass = "general"
 	}
 
+	// 软删语义校验：数据集不存在返回 404，archived 数据集不再接受新条目返回 409。
+	// 引入动机：数据集删除已改为归档（status='archived'），归档数据集的历史条目与评测结果
+	// 被保留用于审计，若仍允许写入新条目会混淆"已归档"语义并让历史评测与新增条目混杂。
+	ds, err := h.evalRepo.GetDataset(r.Context(), datasetID)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			writeAdminError(w, http.StatusNotFound, "数据集不存在")
+			return
+		}
+		slog.Error("查询评测数据集失败", "error", err, "dataset_id", datasetID)
+		writeAdminError(w, http.StatusInternalServerError, "查询失败")
+		return
+	}
+	if ds.Status == evaluation.DatasetStatusArchived {
+		writeAdminError(w, http.StatusConflict, "数据集已归档，不能新增条目")
+		return
+	}
+
 	item, err := h.evalRepo.AddItem(r.Context(), datasetID, req.Query, req.ExpectedDocuments, req.RelevanceGrade, req.QueryClass)
 	if err != nil {
 		slog.Error("添加评测条目失败", "error", err)
@@ -803,6 +822,103 @@ func (h *Handler) AddItem(w http.ResponseWriter, r *http.Request) {
 
 	h.recordAudit(r, id.UserID, "admin.eval.item.add", "evaluation_item", item.ID, map[string]string{"dataset_id": datasetID})
 	writeAdminJSON(w, http.StatusCreated, item)
+}
+
+// ListItems 处理 GET /api/admin/evaluation/datasets/{id}/items。
+// 引入动机：前端审计发现管理端缺少"查看数据集条目"端点，无法核对条目内容。
+// 返回 items + total + limit + offset，与既有列表端点契约一致。
+func (h *Handler) ListItems(w http.ResponseWriter, r *http.Request) {
+	limit, offset, err := parsePagination(r)
+	if err != nil {
+		writeAdminError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	datasetID := r.PathValue("id")
+	if datasetID == "" {
+		writeAdminError(w, http.StatusBadRequest, "缺少 dataset ID")
+		return
+	}
+
+	result, err := h.evalRepo.ListItems(r.Context(), datasetID, limit, offset)
+	if err != nil {
+		slog.Error("查询评测条目列表失败", "error", err, "dataset_id", datasetID)
+		writeAdminError(w, http.StatusInternalServerError, "查询失败")
+		return
+	}
+
+	writeAdminJSON(w, http.StatusOK, map[string]interface{}{
+		"items":  result.Items,
+		"total":  result.Total,
+		"limit":  limit,
+		"offset": offset,
+	})
+}
+
+// DeleteItem 处理 DELETE /api/admin/evaluation/datasets/{id}/items/{itemId}。
+// 引入动机：前端审计发现管理端缺少条目删除能力。
+// 仓储层 WHERE 同时限定 itemId 与 datasetID，防止仅凭条目 ID 越权删除其它数据集的条目。
+func (h *Handler) DeleteItem(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeAdminError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+
+	datasetID := r.PathValue("id")
+	itemID := r.PathValue("itemId")
+	if datasetID == "" || itemID == "" {
+		writeAdminError(w, http.StatusBadRequest, "缺少 dataset ID 或 item ID")
+		return
+	}
+
+	if err := h.evalRepo.DeleteItem(r.Context(), datasetID, itemID); err != nil {
+		if err == sql.ErrNoRows {
+			writeAdminError(w, http.StatusNotFound, "条目不存在")
+			return
+		}
+		slog.Error("删除评测条目失败", "error", err, "dataset_id", datasetID, "item_id", itemID)
+		writeAdminError(w, http.StatusInternalServerError, "删除失败")
+		return
+	}
+
+	h.recordAudit(r, id.UserID, "admin.eval.item.delete", "evaluation_item", itemID, map[string]string{"dataset_id": datasetID})
+	writeAdminJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// DeleteDataset 处理 DELETE /api/admin/evaluation/datasets/{id}。
+// 引入动机：前端审计发现管理端缺少数据集删除能力。
+//
+// 软删语义：DELETE 端点执行归档而非物理删除——evaluation_items.dataset_id 与
+// evaluation_results.dataset_id 均为 ON DELETE CASCADE，物理 DELETE 会连带、
+// 不可恢复地删除历史评测结果。归档仅将 status 置为 'archived'，
+// 条目与评测历史保留用于审计；归档后数据集拒绝新增条目与运行评测（见 AddItem/RunEvaluation）。
+// 归档是 API 层终态：不提供恢复端点，需恢复时只能由 DBA 直接 UPDATE status。
+func (h *Handler) DeleteDataset(w http.ResponseWriter, r *http.Request) {
+	id := auth.IdentityFromContext(r.Context())
+	if id == nil {
+		writeAdminError(w, http.StatusUnauthorized, "未认证")
+		return
+	}
+
+	datasetID := r.PathValue("id")
+	if datasetID == "" {
+		writeAdminError(w, http.StatusBadRequest, "缺少 dataset ID")
+		return
+	}
+
+	if err := h.evalRepo.ArchiveDataset(r.Context(), datasetID); err != nil {
+		if err == sql.ErrNoRows {
+			writeAdminError(w, http.StatusNotFound, "数据集不存在")
+			return
+		}
+		slog.Error("归档评测数据集失败", "error", err, "dataset_id", datasetID)
+		writeAdminError(w, http.StatusInternalServerError, "归档失败")
+		return
+	}
+
+	h.recordAudit(r, id.UserID, "admin.eval.dataset.archive", "evaluation_dataset", datasetID, nil)
+	writeAdminJSON(w, http.StatusOK, map[string]string{"status": "archived"})
 }
 
 // RunEvaluation 处理 POST /api/admin/evaluation/run。
@@ -833,9 +949,20 @@ func (h *Handler) RunEvaluation(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 验证数据集存在
-	_, err := h.evalRepo.GetDataset(r.Context(), req.DatasetID)
+	ds, err := h.evalRepo.GetDataset(r.Context(), req.DatasetID)
 	if err != nil {
-		writeAdminError(w, http.StatusNotFound, "数据集不存在")
+		if err == sql.ErrNoRows {
+			writeAdminError(w, http.StatusNotFound, "数据集不存在")
+			return
+		}
+		slog.Error("查询评测数据集失败", "error", err, "dataset_id", req.DatasetID)
+		writeAdminError(w, http.StatusInternalServerError, "查询失败")
+		return
+	}
+	// archived 数据集不再参与评测：归档是 API 层终态，历史评测结果只读保留，
+	// 继续对归档数据集跑评测会产生与"已归档"语义矛盾的新结果。
+	if ds.Status == evaluation.DatasetStatusArchived {
+		writeAdminError(w, http.StatusConflict, "数据集已归档，不能运行评测")
 		return
 	}
 
@@ -915,7 +1042,10 @@ func (h *Handler) ListEvaluationResults(w http.ResponseWriter, r *http.Request) 
 //   - POST /api/admin/search-profiles/candidates/{id}/confirm — system_admin，确认候选
 //   - GET  /api/admin/evaluation/datasets — system_admin，评测数据集列表
 //   - POST /api/admin/evaluation/datasets — system_admin，创建数据集
+//   - DELETE /api/admin/evaluation/datasets/{id} — system_admin，归档数据集（软删，保留条目与评测历史）
+//   - GET  /api/admin/evaluation/datasets/{id}/items — system_admin，评测条目列表
 //   - POST /api/admin/evaluation/datasets/{id}/items — system_admin，添加评测条目
+//   - DELETE /api/admin/evaluation/datasets/{id}/items/{itemId} — system_admin，删除评测条目
 //   - POST /api/admin/evaluation/run — system_admin，运行评测
 //   - GET  /api/admin/jobs — system_admin，Job 列表
 //   - POST /api/admin/jobs/{id}/retry — system_admin，重试 Job
@@ -1059,6 +1189,43 @@ func RegisterRoutes(
 				auth.RequireCSRF(authRepo, authCfg)(
 					workspace.RequireSystemAdmin(
 						http.HandlerFunc(handler.AddItem),
+					),
+				),
+			),
+		),
+	)
+
+	// GET /api/admin/evaluation/datasets/{id}/items — system_admin
+	mux.Handle("GET /api/admin/evaluation/datasets/{id}/items",
+		auth.AuthMiddleware(authRepo, authCfg)(
+			auth.RequireAuth(
+				workspace.RequireSystemAdmin(
+					http.HandlerFunc(handler.ListItems),
+				),
+			),
+		),
+	)
+
+	// DELETE /api/admin/evaluation/datasets/{id}/items/{itemId} — system_admin + CSRF
+	mux.Handle("DELETE /api/admin/evaluation/datasets/{id}/items/{itemId}",
+		auth.AuthMiddleware(authRepo, authCfg)(
+			auth.RequireAuth(
+				auth.RequireCSRF(authRepo, authCfg)(
+					workspace.RequireSystemAdmin(
+						http.HandlerFunc(handler.DeleteItem),
+					),
+				),
+			),
+		),
+	)
+
+	// DELETE /api/admin/evaluation/datasets/{id} — system_admin + CSRF
+	mux.Handle("DELETE /api/admin/evaluation/datasets/{id}",
+		auth.AuthMiddleware(authRepo, authCfg)(
+			auth.RequireAuth(
+				auth.RequireCSRF(authRepo, authCfg)(
+					workspace.RequireSystemAdmin(
+						http.HandlerFunc(handler.DeleteDataset),
 					),
 				),
 			),

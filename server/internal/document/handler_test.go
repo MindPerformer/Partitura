@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1145,5 +1146,166 @@ func TestListDocuments_PathParamNoQuery(t *testing.T) {
 	if resp.Offset != 0 {
 		t.Errorf("默认 offset = %d, 期望 0", resp.Offset)
 	}
+}
+
+// --- created_by/updated_by username 展示字段 ---
+
+// TestDocumentResponse_UsernameFields 验证 read/list/history/revision/sources 响应
+// 均携带 created_by_username / updated_by_username（snake_case），且值等于操作者。
+// 引入动机：前端需要直接显示用户名而非 UUID；仓储层 LEFT JOIN users + COALESCE
+// 保证字段始终存在（无对应 user 时为空串），此测试锁定契约。
+func TestDocumentResponse_UsernameFields(t *testing.T) {
+	mux, authRepo, wsRepo, docRepo, cfg := setupTestEnv(t)
+	createTestUser(t, authRepo, cfg, "dummy-owner-u1", "uowner1", "user", true)
+	createTestUser(t, authRepo, cfg, "uname-1", "unameuser", "user", true)
+	wsID := createTestWorkspace(t, wsRepo, "unamews", "dummy-owner-u1")
+	addMember(t, wsRepo, wsID, "uname-1", workspace.RoleEditor)
+	docRepo.SetWorkspaceMaxSize(wsID, 2097152)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "unameuser")
+
+	// 创建文档：响应应带 created_by_username / updated_by_username
+	createBody := `{"path":"test/uname.md","title":"Uname Doc","content_markdown":"# Uname\n\nbody\n"}`
+	req := authedRequest(http.MethodPost, "/api/workspaces/"+wsID+"/documents", sessionToken, csrfToken, createBody)
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("创建文档应返回 201，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+	var created map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &created); err != nil {
+		t.Fatalf("解析创建响应失败: %v", err)
+	}
+	for _, key := range []string{"created_by_username", "updated_by_username"} {
+		v, ok := created[key]
+		if !ok {
+			t.Errorf("创建响应缺少字段 %q，实际字段: %v", key, keysOf(created))
+			continue
+		}
+		if v != "uname-1" {
+			t.Errorf("%s = %v，期望操作者 uname-1", key, v)
+		}
+	}
+
+	// 列表项：updated_by_username 存在
+	req = authedRequest(http.MethodGet, "/api/workspaces/"+wsID+"/documents", sessionToken, csrfToken, "")
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("列表应返回 200，实际 %d", rr.Code)
+	}
+	var listResp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &listResp); err != nil {
+		t.Fatalf("解析列表响应失败: %v", err)
+	}
+	docs, ok := listResp["documents"].([]interface{})
+	if !ok || len(docs) == 0 {
+		t.Fatalf("列表应至少含 1 条文档，实际: %v", listResp["documents"])
+	}
+	// 找到刚创建的文档（列表还会包含 PROJECT.md/AGENTS.md 等特殊文件时逐条检查目标 path）
+	var foundListItem map[string]interface{}
+	for _, d := range docs {
+		item, _ := d.(map[string]interface{})
+		if item["path"] == "test/uname.md" {
+			foundListItem = item
+		}
+	}
+	if foundListItem == nil {
+		t.Fatal("列表中未找到 test/uname.md")
+	}
+	if v, ok := foundListItem["updated_by_username"]; !ok {
+		t.Errorf("列表项缺少 updated_by_username，实际字段: %v", keysOf(foundListItem))
+	} else if v != "uname-1" {
+		t.Errorf("列表项 updated_by_username = %v，期望 uname-1", v)
+	}
+
+	// 历史版本：created_by_username 存在
+	req = authedRequest(http.MethodGet, "/api/workspaces/"+wsID+"/documents/history?path=test/uname.md", sessionToken, csrfToken, "")
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("history 应返回 200，实际 %d", rr.Code)
+	}
+	var histResp map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &histResp); err != nil {
+		t.Fatalf("解析 history 响应失败: %v", err)
+	}
+	revs, ok := histResp["revisions"].([]interface{})
+	if !ok || len(revs) == 0 {
+		t.Fatalf("history 应至少含 1 条版本，实际: %v", histResp["revisions"])
+	}
+	firstRev, _ := revs[0].(map[string]interface{})
+	if v, ok := firstRev["created_by_username"]; !ok {
+		t.Errorf("版本缺少 created_by_username，实际字段: %v", keysOf(firstRev))
+	} else if v != "uname-1" {
+		t.Errorf("版本 created_by_username = %v，期望 uname-1", v)
+	}
+
+	// 单版本：created_by_username 存在
+	req = authedRequest(http.MethodGet, "/api/workspaces/"+wsID+"/documents/revision?path=test/uname.md&revision=1", sessionToken, csrfToken, "")
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("revision 应返回 200，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+	var rev map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &rev); err != nil {
+		t.Fatalf("解析 revision 响应失败: %v", err)
+	}
+	if v, ok := rev["created_by_username"]; !ok {
+		t.Errorf("revision 缺少 created_by_username，实际字段: %v", keysOf(rev))
+	} else if v != "uname-1" {
+		t.Errorf("revision created_by_username = %v，期望 uname-1", v)
+	}
+
+	// 来源：created_by_username 存在（先添加一条 source）
+	srcBody := `{"source_type":"manual","value":"note","title":"t"}`
+	req = authedRequest(http.MethodPost, "/api/workspaces/"+wsID+"/documents/sources?path=test/uname.md", sessionToken, csrfToken, srcBody)
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusCreated {
+		t.Fatalf("添加 source 应返回 201，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+	var src map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &src); err != nil {
+		t.Fatalf("解析 source 响应失败: %v", err)
+	}
+	if v, ok := src["created_by_username"]; !ok {
+		t.Errorf("source 缺少 created_by_username，实际字段: %v", keysOf(src))
+	} else if v != "uname-1" {
+		t.Errorf("source created_by_username = %v，期望 uname-1", v)
+	}
+
+	// 来源列表：created_by_username 存在
+	req = authedRequest(http.MethodGet, "/api/workspaces/"+wsID+"/documents/sources?path=test/uname.md", sessionToken, csrfToken, "")
+	rr = httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("sources 列表应返回 200，实际 %d", rr.Code)
+	}
+	var srcList map[string]interface{}
+	if err := json.Unmarshal(rr.Body.Bytes(), &srcList); err != nil {
+		t.Fatalf("解析 sources 响应失败: %v", err)
+	}
+	srcs, ok := srcList["sources"].([]interface{})
+	if !ok || len(srcs) == 0 {
+		t.Fatalf("sources 应至少含 1 条，实际: %v", srcList["sources"])
+	}
+	firstSrc, _ := srcs[0].(map[string]interface{})
+	if v, ok := firstSrc["created_by_username"]; !ok {
+		t.Errorf("来源列表项缺少 created_by_username，实际字段: %v", keysOf(firstSrc))
+	} else if v != "uname-1" {
+		t.Errorf("来源列表项 created_by_username = %v，期望 uname-1", v)
+	}
+}
+
+// keysOf 返回 map 的 key 列表（已排序），用于断言失败时输出实际字段集合。
+func keysOf(m map[string]interface{}) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 

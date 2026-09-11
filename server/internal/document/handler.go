@@ -91,6 +91,10 @@ type documentResponse struct {
 	IsSpecial       bool   `json:"is_special"`
 	CreatedBy       string `json:"created_by"`
 	UpdatedBy       string `json:"updated_by"`
+	// created_by_username/updated_by_username 供前端直接显示操作者用户名；
+	// 对应 user 已删除或字段为 NULL 时为空串。
+	CreatedByUsername string `json:"created_by_username"`
+	UpdatedByUsername string `json:"updated_by_username"`
 	CreatedAt       string `json:"created_at"`
 	UpdatedAt       string `json:"updated_at"`
 }
@@ -107,6 +111,8 @@ type documentListItemResponse struct {
 	RevisionNumber int    `json:"revision_number"`
 	IsSpecial      bool   `json:"is_special"`
 	UpdatedBy      string `json:"updated_by"`
+	// updated_by_username 供前端在列表中直接显示最后编辑者用户名。
+	UpdatedByUsername string `json:"updated_by_username"`
 	UpdatedAt      string `json:"updated_at"`
 }
 
@@ -196,6 +202,8 @@ type revisionResponse struct {
 	ContentHash     string `json:"content_hash"`
 	Status          string `json:"status"`
 	CreatedBy       string `json:"created_by"`
+	// created_by_username 供前端在版本历史中显示提交者用户名。
+	CreatedByUsername string `json:"created_by_username"`
 	CreatedAt       string `json:"created_at"`
 }
 
@@ -219,6 +227,8 @@ type sourceResponse struct {
 	RefreshIntervalDays int    `json:"refresh_interval_days,omitempty"`
 	SourceDocumentID    string `json:"source_document_id,omitempty"`
 	CreatedBy           string `json:"created_by"`
+	// created_by_username 供前端显示来源添加者用户名。
+	CreatedByUsername   string `json:"created_by_username"`
 	CreatedAt           string `json:"created_at"`
 }
 
@@ -258,6 +268,8 @@ func toDocumentResponse(doc *Document) documentResponse {
 		IsSpecial:       doc.IsSpecial,
 		CreatedBy:       doc.CreatedBy,
 		UpdatedBy:       doc.UpdatedBy,
+		CreatedByUsername: doc.CreatedByUsername,
+		UpdatedByUsername: doc.UpdatedByUsername,
 		CreatedAt:       doc.CreatedAt,
 		UpdatedAt:       doc.UpdatedAt,
 	}
@@ -275,6 +287,7 @@ func toDocumentListItemResponse(doc *Document) documentListItemResponse {
 		RevisionNumber: doc.RevisionNumber,
 		IsSpecial:      doc.IsSpecial,
 		UpdatedBy:      doc.UpdatedBy,
+		UpdatedByUsername: doc.UpdatedByUsername,
 		UpdatedAt:      doc.UpdatedAt,
 	}
 }
@@ -291,6 +304,7 @@ func toRevisionResponse(rev *Revision) revisionResponse {
 		ContentHash:     rev.ContentHash,
 		Status:          rev.Status,
 		CreatedBy:       rev.CreatedBy,
+		CreatedByUsername: rev.CreatedByUsername,
 		CreatedAt:       rev.CreatedAt,
 	}
 }
@@ -308,6 +322,7 @@ func toSourceResponse(src *Source) sourceResponse {
 		RefreshIntervalDays: src.RefreshIntervalDays,
 		SourceDocumentID:    src.SourceDocumentID,
 		CreatedBy:           src.CreatedBy,
+		CreatedByUsername:   src.CreatedByUsername,
 		CreatedAt:           src.CreatedAt,
 	}
 }

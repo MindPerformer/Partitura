@@ -351,7 +351,7 @@ async function mountPage(profiles: Array<Record<string, unknown>>, options: Moun
     user: { id: '1', username: 'admin', system_role: 'system_admin' },
     csrf_token: 'token',
     expires_at: '2025-01-01'
-  } as never)
+  })
 
   ctrl.setImpl(async (url, rawOptions) => {
     const opts = rawOptions as { method?: string; body?: string }
@@ -514,14 +514,23 @@ describe('search-profiles 页面 — 新建版本与归档操作', () => {
   })
 
   it('归档需要二次确认，确认后 POST 归档接口并刷新列表', async () => {
-    const confirmFn = vi.fn((_message?: string) => true)
-    vi.stubGlobal('confirm', confirmFn)
     const wrapper = await mountPage([{ ...sourceProfile }])
 
     await findButton(wrapper, 'admin.archiveProfile')!.trigger('click')
     await flushPromises()
 
-    expect(labelsOf('admin.archiveProfileConfirm')).toContain(confirmFn.mock.calls[0]?.[0])
+    // 确认弹窗打开，文案为归档确认
+    const content = modalContent()
+    expect(content).not.toBeNull()
+    const confirmText = content?.textContent ?? ''
+    expect(labelsOf('admin.archiveProfileConfirm').some(l => confirmText.includes(l))).toBe(true)
+
+    // 点击弹窗中的"归档"确认按钮触发请求
+    const confirmBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-slot="content"] button'))
+      .find(b => labelsOf('common.archive').includes(b.textContent?.trim() ?? ''))
+    expect(confirmBtn).toBeTruthy()
+    confirmBtn!.click()
+    await flushPromises()
 
     const archiveCall = calls.find(call => call.url.includes('/archive'))
     expect(archiveCall?.method).toBe('POST')
@@ -533,17 +542,22 @@ describe('search-profiles 页面 — 新建版本与归档操作', () => {
   })
 
   it('取消二次确认时不发起归档请求', async () => {
-    vi.stubGlobal('confirm', vi.fn((_message?: string) => false))
     const wrapper = await mountPage([{ ...sourceProfile }])
 
     await findButton(wrapper, 'admin.archiveProfile')!.trigger('click')
+    await flushPromises()
+
+    // 弹窗打开但不点确认：直接取消
+    const cancelBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-slot="content"] button'))
+      .find(b => labelsOf('common.cancel').includes(b.textContent?.trim() ?? ''))
+    expect(cancelBtn).toBeTruthy()
+    cancelBtn!.click()
     await flushPromises()
 
     expect(calls.some(call => call.url.includes('/archive'))).toBe(false)
   })
 
   it('归档 409 时展示后端返回的错误消息', async () => {
-    vi.stubGlobal('confirm', vi.fn((_message?: string) => true))
     const wrapper = await mountPage([{ ...sourceProfile }], {
       archiveError: {
         response: { status: 409, _data: { error: '此搜索配置处于生效状态，不能归档' } },
@@ -553,20 +567,29 @@ describe('search-profiles 页面 — 新建版本与归档操作', () => {
 
     await findButton(wrapper, 'admin.archiveProfile')!.trigger('click')
     await flushPromises()
+    const confirmBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-slot="content"] button'))
+      .find(b => labelsOf('common.archive').includes(b.textContent?.trim() ?? ''))
+    confirmBtn!.click()
+    await flushPromises()
 
-    expect(wrapper.text()).toContain('此搜索配置处于生效状态，不能归档')
+    // 失败消息渲染在确认弹窗内（弹窗保持打开）
+    const text = modalContent()?.textContent ?? wrapper.text()
+    expect(text).toContain('此搜索配置处于生效状态，不能归档')
   })
 
   it('归档 409 且后端未给出消息时展示本地化冲突提示', async () => {
-    vi.stubGlobal('confirm', vi.fn((_message?: string) => true))
     const wrapper = await mountPage([{ ...sourceProfile }], {
       archiveError: { response: { status: 409, _data: {} }, message: '' }
     })
 
     await findButton(wrapper, 'admin.archiveProfile')!.trigger('click')
     await flushPromises()
+    const confirmBtn = Array.from(document.querySelectorAll<HTMLButtonElement>('[data-slot="content"] button'))
+      .find(b => labelsOf('common.archive').includes(b.textContent?.trim() ?? ''))
+    confirmBtn!.click()
+    await flushPromises()
 
-    const text = wrapper.text()
+    const text = modalContent()?.textContent ?? wrapper.text()
     expect(labelsOf('admin.archiveActiveConflict').some(label => text.includes(label))).toBe(true)
   })
 

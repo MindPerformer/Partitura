@@ -20,6 +20,10 @@ const docsLoading = ref(false)
 const docsError = ref<string | null>(null)
 const docsHasMore = ref(false)
 
+// 文档列表分页上限：防止后端 total 异常导致 while(true) 死循环。
+// 50 页 * 100/页 = 5000 条文档已远超一般 workspace 规模。
+const MAX_DOC_PAGES = 50
+
 async function loadDocuments() {
   if (!workspaceId.value || !workspace.value) {
     documents.value = []
@@ -39,12 +43,15 @@ async function loadDocuments() {
     let offset = 0
     const all: DocumentListItem[] = []
     let total = 0
+    let pages = 0
 
-    // 循环分页直至返回数量达到 total，或一次返回为空时安全停止。
-    while (true) {
+    // 循环分页直至返回数量达到 total，或一次返回为空时安全停止；
+    // MAX_DOC_PAGES 作为后端 total 异常时的硬性熔断上限。
+    while (pages < MAX_DOC_PAGES) {
       const res = await api.list(workspaceId.value, { limit, offset })
       total = res.total
       all.push(...res.documents)
+      pages++
       if (all.length >= res.total || res.documents.length === 0) {
         break
       }
@@ -66,6 +73,46 @@ async function loadDocuments() {
   }
 }
 
+// 「加载更多」：在已加载列表末尾继续分页拉取剩余文档，直到 total 或上限。
+async function loadMoreDocuments() {
+  if (!workspaceId.value || !workspace.value || !docsHasMore.value) return
+
+  docsLoading.value = true
+  docsError.value = null
+
+  try {
+    const api = useDocumentApi()
+    const limit = 100
+    // 从当前已加载数量继续，避免重复拉取。
+    let offset = documents.value.length
+    const all = [...documents.value]
+    let total = all.length
+    let pages = 0
+
+    while (pages < MAX_DOC_PAGES) {
+      const res = await api.list(workspaceId.value, { limit, offset })
+      total = res.total
+      all.push(...res.documents)
+      pages++
+      if (all.length >= res.total || res.documents.length === 0) {
+        break
+      }
+      offset += res.limit
+    }
+
+    documents.value = all
+    docsHasMore.value = all.length < total
+  } catch (err) {
+    const apiErr = err as { error?: string; status?: number }
+    docsError.value = apiErr.error || t('document.loadFailed')
+    if (import.meta.dev) {
+      console.error('[WorkspaceLayout] 加载更多文档失败', err)
+    }
+  } finally {
+    docsLoading.value = false
+  }
+}
+
 watch(workspace, () => {
   loadDocuments()
 }, { immediate: true })
@@ -75,6 +122,101 @@ const mobileSidebarOpen = ref(false)
 
 function toggleSidebar() {
   sidebarOpen.value = !sidebarOpen.value
+}
+
+// ---------------------------------------------------------------------------
+// 侧栏宽度拖拽调宽（展开态）
+// - 宽度持久化到 localStorage（key: pkw_sidebar_w），范围 200–480px。
+// - 拖拽 handle 为键盘可达的 role="separator"，方向键 ←/→ 步进 16px。
+// ---------------------------------------------------------------------------
+const SIDEBAR_MIN_W = 200
+const SIDEBAR_MAX_W = 480
+const SIDEBAR_DEFAULT_W = 256
+const SIDEBAR_KEY_STEP = 16
+const SIDEBAR_LS_KEY = 'pkw_sidebar_w'
+
+const sidebarWidth = ref(SIDEBAR_DEFAULT_W)
+
+function clampSidebarWidth(w: number): number {
+  return Math.min(SIDEBAR_MAX_W, Math.max(SIDEBAR_MIN_W, Math.round(w)))
+}
+
+function persistSidebarWidth() {
+  try {
+    localStorage.setItem(SIDEBAR_LS_KEY, String(sidebarWidth.value))
+  } catch (err) {
+    // localStorage 可能因隐私模式/配额失败，仅记录不中断交互。
+    if (import.meta.dev) {
+      console.warn('[WorkspaceLayout] 侧栏宽度持久化失败', err)
+    }
+  }
+}
+
+onMounted(() => {
+  try {
+    const raw = localStorage.getItem(SIDEBAR_LS_KEY)
+    if (raw !== null) {
+      const n = parseInt(raw, 10)
+      if (Number.isFinite(n)) sidebarWidth.value = clampSidebarWidth(n)
+    }
+  } catch (err) {
+    if (import.meta.dev) {
+      console.warn('[WorkspaceLayout] 读取侧栏宽度失败', err)
+    }
+  }
+})
+
+// 拖拽状态：记录起始 x 与起始宽度，move 时按 delta 更新。
+const resizing = ref(false)
+let resizeStartX = 0
+let resizeStartW = 0
+
+function onResizePointerDown(e: PointerEvent) {
+  if (!sidebarOpen.value) return
+  resizing.value = true
+  resizeStartX = e.clientX
+  resizeStartW = sidebarWidth.value
+  window.addEventListener('pointermove', onResizePointerMove)
+  window.addEventListener('pointerup', onResizePointerUp, { once: true })
+  // 防止拖拽过程中选中文本
+  e.preventDefault()
+}
+
+function onResizePointerMove(e: PointerEvent) {
+  if (!resizing.value) return
+  const delta = e.clientX - resizeStartX
+  sidebarWidth.value = clampSidebarWidth(resizeStartW + delta)
+}
+
+function onResizePointerUp() {
+  resizing.value = false
+  window.removeEventListener('pointermove', onResizePointerMove)
+  persistSidebarWidth()
+}
+
+function onResizeKeydown(e: KeyboardEvent) {
+  if (!sidebarOpen.value) return
+  if (e.key === 'ArrowLeft') {
+    sidebarWidth.value = clampSidebarWidth(sidebarWidth.value - SIDEBAR_KEY_STEP)
+    persistSidebarWidth()
+    e.preventDefault()
+  } else if (e.key === 'ArrowRight') {
+    sidebarWidth.value = clampSidebarWidth(sidebarWidth.value + SIDEBAR_KEY_STEP)
+    persistSidebarWidth()
+    e.preventDefault()
+  }
+}
+
+onBeforeUnmount(() => {
+  window.removeEventListener('pointermove', onResizePointerMove)
+  window.removeEventListener('pointerup', onResizePointerUp)
+})
+
+// 收起态 rail：聚焦顶栏搜索框（与 CommandPalette 的 `/` 行为一致）。
+function focusHeaderSearch() {
+  if (typeof document === 'undefined') return
+  const input = document.querySelector<HTMLElement>('header input')
+  input?.focus()
 }
 
 function handleSelectDoc(path: string) {
@@ -113,41 +255,112 @@ function handleSelectDoc(path: string) {
 
     <!-- Workspace content -->
     <div v-else-if="workspace" class="flex min-h-0 min-w-0 flex-1 overflow-hidden">
-      <!-- Desktop sidebar toggle -->
-      <button
-        class="hidden w-6 flex-shrink-0 items-center justify-center border-r border-default bg-default transition-colors hover:bg-elevated md:flex"
-        :aria-label="sidebarOpen ? t('workspace.collapseSidebar') : t('workspace.expandSidebar')"
-        @click="toggleSidebar"
-      >
-        <UIcon :name="sidebarOpen ? 'i-lucide-panel-left-close' : 'i-lucide-panel-left-open'" class="h-4 w-4 text-muted" />
-      </button>
-
-      <!-- Desktop sidebar -->
+      <!-- Desktop sidebar：展开态为可拖宽文档树（贴屏幕左边框），收起态为 ~48px 图标 rail -->
       <aside
         v-if="sidebarOpen"
-        class="hidden h-full w-64 min-h-0 flex-shrink-0 overflow-hidden border-r border-default bg-default md:block"
+        class="relative hidden h-full min-h-0 flex-shrink-0 overflow-hidden border-r border-default bg-default md:flex md:flex-col"
+        :style="{ width: `${sidebarWidth}px` }"
+        :aria-label="t('document.documents')"
       >
         <WorkspaceSidebar
+          class="min-h-0 flex-1"
           :workspace-id="workspaceId"
           :documents="documents"
           :current-path="route.query.path as string"
           :can-edit="canEdit"
           @select="handleSelectDoc"
+          @collapse="toggleSidebar"
         />
-        <div class="border-t border-default px-3 py-2">
+        <div class="shrink-0 border-t border-default px-3 py-2">
           <ErrorDisplay v-if="docsError" :message="docsError" />
           <div v-if="docsLoading" class="flex items-center justify-center py-4">
             <UIcon name="i-lucide-loader-circle" class="h-4 w-4 animate-spin text-muted" />
           </div>
+          <UButton
+            v-else-if="docsHasMore"
+            size="xs"
+            variant="ghost"
+            block
+            icon="i-lucide-chevron-down"
+            @click="loadMoreDocuments"
+          >{{ t('common.loadMore') }}</UButton>
         </div>
+
+        <!-- 拖拽调宽 handle：键盘可达（role=separator + 方向键），鼠标/触控按住拖动 -->
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          tabindex="0"
+          :aria-label="t('workspace.resizeSidebar')"
+          :aria-valuenow="sidebarWidth"
+          :aria-valuemin="SIDEBAR_MIN_W"
+          :aria-valuemax="SIDEBAR_MAX_W"
+          class="absolute inset-y-0 right-0 w-1.5 cursor-col-resize touch-none select-none outline-none transition-colors hover:bg-primary/30 focus-visible:bg-primary/40"
+          :class="resizing ? 'bg-primary/40' : 'bg-transparent'"
+          @pointerdown="onResizePointerDown"
+          @keydown="onResizeKeydown"
+        />
       </aside>
 
-      <!-- Main content -->
-      <main class="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
+      <!-- 收起态：贴边图标 rail -->
+      <nav
+        v-else
+        class="hidden h-full w-12 flex-shrink-0 flex-col items-center gap-1 border-r border-default bg-default py-2 md:flex"
+        :aria-label="t('workspace.sidebarRail')"
+      >
+        <UTooltip :text="t('workspace.expandSidebar')">
+          <UButton
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            icon="i-lucide-panel-right-open"
+            :aria-label="t('workspace.expandSidebar')"
+            :title="t('workspace.expandSidebar')"
+            @click="toggleSidebar"
+          />
+        </UTooltip>
+        <UTooltip :text="t('workspace.goWorkspaceHome')">
+          <UButton
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            icon="i-lucide-home"
+            :to="`/workspaces/${workspaceId}`"
+            :aria-label="t('workspace.goWorkspaceHome')"
+            :title="t('workspace.goWorkspaceHome')"
+          />
+        </UTooltip>
+        <UTooltip v-if="canEdit" :text="t('document.newDocument')">
+          <UButton
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            icon="i-lucide-plus"
+            :to="`/workspaces/${workspaceId}/documents/edit`"
+            :aria-label="t('document.newDocument')"
+            :title="t('document.newDocument')"
+          />
+        </UTooltip>
+        <UTooltip :text="t('workspace.focusSearch')">
+          <UButton
+            color="neutral"
+            variant="ghost"
+            size="sm"
+            icon="i-lucide-search"
+            :aria-label="t('workspace.focusSearch')"
+            :title="t('workspace.focusSearch')"
+            @click="focusHeaderSearch"
+          />
+        </UTooltip>
+      </nav>
+
+      <!-- 主内容区：外层 layouts/default.vue 已提供 <main id="main-content">，
+           此处用 div + role="main" 避免双 main 地标（skip-link 仍锚定外层）。 -->
+      <div role="main" class="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden">
         <div class="min-w-0">
           <slot :workspace="workspace" :can-edit="canEdit" :can-read="canRead" :current-role="currentMemberRole" />
         </div>
-      </main>
+      </div>
     </div>
 
     <!-- Fallback -->
@@ -175,6 +388,14 @@ function handleSelectDoc(path: string) {
           <div v-if="docsLoading" class="flex items-center justify-center py-4">
             <UIcon name="i-lucide-loader-circle" class="h-4 w-4 animate-spin text-muted" />
           </div>
+          <UButton
+            v-else-if="docsHasMore"
+            size="xs"
+            variant="ghost"
+            block
+            icon="i-lucide-chevron-down"
+            @click="loadMoreDocuments"
+          >{{ t('common.loadMore') }}</UButton>
         </div>
       </template>
     </USlideover>

@@ -13,6 +13,8 @@ definePageMeta({
 
 const { t } = useI18n()
 const route = useRoute()
+const router = useRouter()
+const toast = useToast()
 const workspaceId = computed(() => route.params.id as string)
 const docPath = computed(() => route.query.path as string)
 
@@ -28,7 +30,14 @@ const loading = ref(false)
 const error = ref<string | null>(null)
 
 async function loadDocument() {
-  if (!workspaceId.value || !docPath.value) return
+  if (!workspaceId.value) return
+  // path 缺失属非法访问：显示明确错误态而非静默空白，并给返回入口。
+  if (!docPath.value) {
+    error.value = t('document.pathMissing')
+    loading.value = false
+    doc.value = null
+    return
+  }
   loading.value = true
   error.value = null
   doc.value = null
@@ -82,6 +91,8 @@ function handleSelectDoc(path: string) {
 }
 
 const mobilePanelOpen = ref(false)
+// 窄屏头部菜单打开态：escape 快捷键需让位给菜单自身的 Esc 关闭行为。
+const headerMenuOpen = ref(false)
 
 function formatDate(s: string): string {
   return formatDateUtil(s)
@@ -89,6 +100,58 @@ function formatDate(s: string): string {
 
 // 归档/恢复
 const showArchiveConfirm = ref(false)
+
+// 窄屏（<sm）下页头按钮组折叠为下拉菜单；宽屏保持平铺按钮。
+// ToC 项仅在窄屏出现（桌面右栏已有 ToC），触发打开移动端面板。
+const headerMenuItems = computed(() => {
+  const items: any[] = []
+  if (canEdit.value) {
+    items.push({
+      label: t('common.edit'),
+      icon: 'i-lucide-pencil',
+      to: `/workspaces/${workspaceId.value}/documents/edit?path=${encodeURIComponent(docPath.value!)}`
+    })
+  }
+  items.push({
+    label: t('document.history'),
+    icon: 'i-lucide-clock',
+    to: `/workspaces/${workspaceId.value}/documents/history?path=${encodeURIComponent(docPath.value!)}`
+  })
+  items.push({
+    label: t('document.tableOfContents'),
+    icon: 'i-lucide-list',
+    onSelect: () => { mobilePanelOpen.value = true }
+  })
+  if (canArchive.value && doc.value?.status !== 'archived') {
+    items.push({
+      label: t('common.archive'),
+      icon: 'i-lucide-archive',
+      color: 'warning',
+      onSelect: () => { showArchiveConfirm.value = true }
+    })
+  }
+  return items
+})
+
+// ============================ 页面级快捷键 ============================
+// e 进入编辑（仅 canEdit）、h 查看历史、escape 返回 workspace 首页。
+// 单键在无修饰键时触发；输入框聚焦时自动抑制（useHotkey 内置规则）。
+// 模态/菜单/抽屉打开时让位给各组件自身的 Esc 处理，避免误触发导航。
+const overlayOpen = computed(() => showArchiveConfirm.value || mobilePanelOpen.value || headerMenuOpen.value)
+useHotkey('e', () => {
+  if (!canEdit.value || !docPath.value) return
+  if (overlayOpen.value) return
+  navigateTo(`/workspaces/${workspaceId.value}/documents/edit?path=${encodeURIComponent(docPath.value)}`)
+})
+useHotkey('h', () => {
+  if (!docPath.value) return
+  if (overlayOpen.value) return
+  navigateTo(`/workspaces/${workspaceId.value}/documents/history?path=${encodeURIComponent(docPath.value)}`)
+})
+useHotkey('escape', () => {
+  if (overlayOpen.value) return
+  navigateTo(`/workspaces/${workspaceId.value}`)
+})
 
 async function handleArchive() {
   if (!doc.value) return
@@ -99,6 +162,7 @@ async function handleArchive() {
       expected_hash: doc.value.content_hash
     })
     showArchiveConfirm.value = false
+    toast.add({ title: t('document.archived'), color: 'success' })
     navigateTo(`/workspaces/${workspaceId.value}`)
   } catch (err) {
     const apiErr = err as ApiError
@@ -120,15 +184,20 @@ useHead({ title: () => (doc.value?.title || t('document.documents')) + ' · ' + 
 
         <ErrorDisplay v-else-if="error" :message="error" />
 
-        <div v-else-if="doc" class="mx-auto min-w-0 max-w-4xl px-6 py-8">
+        <div v-else-if="doc" class="mx-auto min-w-0 max-w-3xl px-6 py-8">
           <!-- Document header -->
           <div class="mb-6 pb-4 border-b border-default">
-            <div class="flex items-start justify-between">
-              <div>
-                <h1 class="text-2xl font-bold text-highlighted">{{ doc.title }}</h1>
-                <p class="text-sm text-muted mt-1">{{ doc.path }}</p>
+            <div class="flex items-start justify-between gap-2">
+              <div class="min-w-0">
+                <!-- 页面级 h1：文档标题是此页唯一一级标题；
+                     markdown 正文中的 h1 位于 <article> 内，属于内容结构。 -->
+                <h1 class="text-2xl font-bold text-highlighted break-words">{{ doc.title }}</h1>
+                <DocBreadcrumb :workspace-id="workspaceId" :path="doc.path" class="mt-1" />
               </div>
-              <div class="flex flex-wrap items-center justify-end gap-1">
+              <!-- 宽屏（sm+）平铺按钮组 -->
+              <div class="hidden sm:flex flex-wrap items-center justify-end gap-1">
+                <!-- ToC 入口：sm–lg 区间右栏（DocumentSidePanel）尚未显示（lg:block），
+                     需此按钮打开移动端 USlideover ToC；lg+ 右栏出现则隐藏按钮。 -->
                 <UButton
                   class="lg:hidden"
                   size="xs"
@@ -159,6 +228,20 @@ useHead({ title: () => (doc.value?.title || t('document.documents')) + ' · ' + 
                   @click="showArchiveConfirm = true"
                 >{{ t('common.archive') }}</UButton>
               </div>
+              <!-- 窄屏（<sm）折叠为下拉菜单 -->
+              <UDropdownMenu
+                v-model:open="headerMenuOpen"
+                class="sm:hidden"
+                :items="headerMenuItems"
+                :content="{ align: 'end' }"
+              >
+                <UButton
+                  size="sm"
+                  variant="outline"
+                  icon="i-lucide-ellipsis-vertical"
+                  :aria-label="t('common.actions')"
+                />
+              </UDropdownMenu>
             </div>
             <div class="flex items-center gap-3 mt-2 text-xs text-muted">
               <span>{{ t('document.revision') }} {{ doc.revision_number }}</span>

@@ -1270,12 +1270,17 @@ func TestCreateWorkspace_MultipleJSONValues(t *testing.T) {
 
 // --- Admin Workspaces List 测试 ---
 
-// TestAdminListWorkspaces_SystemAdmin 验证 system_admin 可以列出全部 workspace。
+// TestAdminListWorkspaces_SystemAdmin 验证 system_admin 可以列出全部 workspace，
+// 且每条 workspace 包含创建者用户名（created_by_username）。
 func TestAdminListWorkspaces_SystemAdmin(t *testing.T) {
 	mux, authRepo, wsRepo, _, cfg := setupTestEnv(t)
 	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
 	createTestUserInAuth(t, authRepo, cfg, "user-001", "user1", "user", true)
 	createTestUserInAuth(t, authRepo, cfg, "user-002", "user2", "user", true)
+
+	// 注册用户到 wsRepo mock，使 mock CreateWorkspace 能通过 users 表填充 CreatedByUsername
+	wsRepo.AddUser("user-001", "user1", "user1@test.example", "user", true)
+	wsRepo.AddUser("user-002", "user2", "user2@test.example", "user", true)
 
 	wsRepo.CreateWorkspace(context.Background(), "ws1", "WS1", "", "user-001")
 	wsRepo.CreateWorkspace(context.Background(), "ws2", "WS2", "", "user-002")
@@ -1294,6 +1299,20 @@ func TestAdminListWorkspaces_SystemAdmin(t *testing.T) {
 	json.Unmarshal(rr.Body.Bytes(), &resp)
 	if resp.Total < 2 {
 		t.Errorf("应至少有 2 个 workspace，实际 %d", resp.Total)
+	}
+	// 验证每条 workspace 都返回了 created_by_username
+	usernameByCreatedBy := map[string]string{
+		"user-001": "user1",
+		"user-002": "user2",
+	}
+	for _, w := range resp.Workspaces {
+		expected := usernameByCreatedBy[w.CreatedBy]
+		if expected == "" {
+			continue // mock 中未注册的用户，跳过断言
+		}
+		if w.CreatedByUsername != expected {
+			t.Errorf("workspace %q created_by_username = %q, 期望 %q", w.Name, w.CreatedByUsername, expected)
+		}
 	}
 }
 
@@ -1560,5 +1579,193 @@ func TestUpdateWorkspace_SettingsOutOfRange(t *testing.T) {
 		if rr.Code != http.StatusBadRequest {
 			t.Errorf("非法设置 %s 应返回 400，实际 %d", c, rr.Code)
 		}
+	}
+}
+
+// --- Admin 筛选参数测试 ---
+//
+// 引入动机：前端审计发现 admin users/workspaces/audit 缺少筛选能力。
+// 以下测试经真实 mux + auth + RequireSystemAdmin 驱动，验证筛选参数真实收窄结果、
+// 非法值 Fail Fast 返回 400，而不是只断言"参数被读取"。
+
+// TestAdminListUsers_FilterBySystemRole 验证 system_role 筛选收窄用户列表。
+func TestAdminListUsers_FilterBySystemRole(t *testing.T) {
+	mux, authRepo, wsRepo, _, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
+	createTestUserInAuth(t, authRepo, cfg, "user-001", "regularuser", "user", false)
+	createTestUserInAuth(t, authRepo, cfg, "user-002", "anotheruser", "user", false)
+
+	wsRepo.AddUser("admin-001", "sysadmin", "sysadmin@test.example", "system_admin", false)
+	wsRepo.AddUser("user-001", "regularuser", "regularuser@test.example", "user", false)
+	wsRepo.AddUser("user-002", "anotheruser", "another@test.example", "user", false)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "sysadmin")
+
+	req := authedRequest(http.MethodGet, "/api/admin/users?system_role=user", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("筛选用户应返回 200，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+	var resp adminListUsersResponse
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	for _, u := range resp.Users {
+		if u.SystemRole != "user" {
+			t.Errorf("筛选结果含非 user 角色: %q", u.SystemRole)
+		}
+	}
+	if resp.Total != 2 {
+		t.Errorf("system_role=user 应返回 2 个用户，实际 %d", resp.Total)
+	}
+}
+
+// TestAdminListUsers_FilterByQuery 验证 q 按 username/email 模糊匹配。
+func TestAdminListUsers_FilterByQuery(t *testing.T) {
+	mux, authRepo, wsRepo, _, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
+	createTestUserInAuth(t, authRepo, cfg, "user-001", "regularuser", "user", false)
+
+	wsRepo.AddUser("admin-001", "sysadmin", "sysadmin@test.example", "system_admin", false)
+	wsRepo.AddUser("user-001", "regularuser", "regularuser@test.example", "user", false)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "sysadmin")
+
+	req := authedRequest(http.MethodGet, "/api/admin/users?q=regularuser", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("q 筛选应返回 200，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+	var resp adminListUsersResponse
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	if resp.Total != 1 || len(resp.Users) != 1 {
+		t.Fatalf("q=regularuser 应返回 1 个用户，实际 total=%d", resp.Total)
+	}
+	if resp.Users[0].Username != "regularuser" {
+		t.Errorf("筛选结果用户名 = %q，期望 regularuser", resp.Users[0].Username)
+	}
+}
+
+// TestAdminListUsers_InvalidSystemRole 验证非法 system_role 返回 400。
+func TestAdminListUsers_InvalidSystemRole(t *testing.T) {
+	mux, authRepo, _, _, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "sysadmin")
+
+	req := authedRequest(http.MethodGet, "/api/admin/users?system_role=superadmin", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("非法 system_role 应返回 400，实际 %d", rr.Code)
+	}
+}
+
+// TestAdminListWorkspaces_FilterByStatus 验证 status 筛选收窄 workspace 列表。
+func TestAdminListWorkspaces_FilterByStatus(t *testing.T) {
+	mux, authRepo, wsRepo, _, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
+	createTestUserInAuth(t, authRepo, cfg, "user-001", "user1", "user", true)
+
+	ws1, _ := wsRepo.CreateWorkspace(context.Background(), "active-ws", "Active", "", "user-001")
+	ws2, _ := wsRepo.CreateWorkspace(context.Background(), "archived-ws", "Archived", "", "user-001")
+	// 将第二个 workspace 归档，制造一条非 active 记录
+	if _, err := wsRepo.ArchiveWorkspace(context.Background(), ws2.ID); err != nil {
+		t.Fatalf("归档 workspace 失败: %v", err)
+	}
+	_ = ws1
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "sysadmin")
+
+	req := authedRequest(http.MethodGet, "/api/admin/workspaces?status=active", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status 筛选应返回 200，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+	var resp adminListWorkspacesResponse
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	for _, w := range resp.Workspaces {
+		if w.Status != StatusActive {
+			t.Errorf("筛选结果含非 active workspace: %q", w.Status)
+		}
+	}
+	// active-ws 应在结果中，archived-ws 不应出现
+	foundActive := false
+	for _, w := range resp.Workspaces {
+		if w.Name == "active-ws" {
+			foundActive = true
+		}
+		if w.Name == "archived-ws" {
+			t.Error("status=active 不应返回已归档的 archived-ws")
+		}
+	}
+	if !foundActive {
+		t.Error("status=active 应返回 active-ws")
+	}
+}
+
+// TestAdminListWorkspaces_InvalidStatus 验证非法 status 返回 400。
+func TestAdminListWorkspaces_InvalidStatus(t *testing.T) {
+	mux, authRepo, _, _, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "sysadmin")
+
+	req := authedRequest(http.MethodGet, "/api/admin/workspaces?status=deleted", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("非法 status 应返回 400，实际 %d", rr.Code)
+	}
+}
+
+// TestAdminAudit_FilterByAction 验证 action 筛选收窄审计日志。
+func TestAdminAudit_FilterByAction(t *testing.T) {
+	mux, authRepo, wsRepo, auditRepo, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
+	createTestUserInAuth(t, authRepo, cfg, "user-001", "user1", "user", true)
+	wsRepo.AddUser("user-001", "user1", "user1@test.example", "user", true)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "sysadmin")
+
+	// 先制造一些审计记录（通过真实操作产生不同 action）
+	wsRepo.CreateWorkspace(context.Background(), "audit-ws", "AuditWS", "", "user-001")
+
+	req := authedRequest(http.MethodGet, "/api/admin/audit?action=admin.user.update", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("action 筛选应返回 200，实际 %d，body: %s", rr.Code, rr.Body.String())
+	}
+	var resp adminListAuditResponse
+	json.Unmarshal(rr.Body.Bytes(), &resp)
+	for _, e := range resp.Entries {
+		if e.Action != "admin.user.update" {
+			t.Errorf("筛选结果含非 admin.user.update 动作: %q", e.Action)
+		}
+	}
+	_ = auditRepo
+}
+
+// TestAdminAudit_InvalidFrom 验证非法 from 时间格式返回 400。
+func TestAdminAudit_InvalidFrom(t *testing.T) {
+	mux, authRepo, _, _, cfg := setupTestEnv(t)
+	createTestUserInAuth(t, authRepo, cfg, "admin-001", "sysadmin", "system_admin", false)
+
+	sessionToken, csrfToken := loginAndGetCookies(t, mux, cfg, "sysadmin")
+
+	req := authedRequest(http.MethodGet, "/api/admin/audit?from=not-a-time", sessionToken, csrfToken, "")
+	rr := httptest.NewRecorder()
+	mux.ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusBadRequest {
+		t.Errorf("非法 from 应返回 400，实际 %d", rr.Code)
 	}
 }

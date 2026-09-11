@@ -23,8 +23,17 @@ const revision = ref<Revision | null>(null)
 const loading = ref(false)
 const error = ref<string | null>(null)
 
+// 参数缺失/非法（path 缺、rev 缺失或 NaN）时给明确错误态。
+const paramError = computed(() => {
+  if (!docPath.value) return t('document.pathMissing')
+  // rev 必须为正整数版本号；缺失/NaN/0 均视为非法参数。
+  if (Number.isNaN(revNumber.value) || revNumber.value < 1) return t('document.revParamInvalid')
+  return null
+})
+
 async function loadRevision() {
   if (!workspaceId.value || !docPath.value || !revNumber.value) return
+  if (paramError.value) { error.value = paramError.value; return }
   loading.value = true
   error.value = null
   try {
@@ -53,13 +62,13 @@ useHead({ title: () => `${t('document.revision')} #${revNumber} · ${t('common.a
 
 <template>
   <WorkspaceLayout>
-    <div class="max-w-4xl mx-auto px-4 py-8">
+    <div class="max-w-3xl mx-auto px-4 py-8">
       <div class="flex items-center justify-between mb-6">
         <div>
           <h1 class="text-2xl font-bold text-highlighted">
             {{ t('document.revision') }} #{{ revNumber }}
           </h1>
-          <p class="text-sm text-muted mt-1">{{ docPath }}</p>
+          <DocBreadcrumb :workspace-id="workspaceId" :path="docPath" class="mt-1" />
         </div>
         <div class="flex gap-2">
           <UButton
@@ -75,7 +84,9 @@ useHead({ title: () => `${t('document.revision')} #${revNumber} · ${t('common.a
         </div>
       </div>
 
-      <div v-if="loading" class="flex justify-center py-8">
+      <ErrorDisplay v-if="paramError" :message="paramError" />
+
+      <div v-else-if="loading" class="flex justify-center py-8">
         <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
       </div>
 
@@ -90,10 +101,10 @@ useHead({ title: () => `${t('document.revision')} #${revNumber} · ${t('common.a
             <div>
               <span class="font-medium">{{ t('document.created') }}:</span> {{ formatDate(revision.created_at) }}
             </div>
-            <div>
-              <span class="font-medium">{{ t('document.createdBy') }}:</span> {{ revision.created_by.substring(0, 8) }}...
+            <div :title="revision.created_by_username || revision.created_by">
+              <span class="font-medium">{{ t('document.createdBy') }}:</span> {{ revision.created_by_username || revision.created_by.substring(0, 8) + '...' }}
             </div>
-            <div>
+            <div :title="revision.content_hash">
               <span class="font-medium">{{ t('document.hash') }}:</span> {{ revision.content_hash.substring(0, 16) }}...
             </div>
           </div>

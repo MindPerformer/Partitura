@@ -274,16 +274,23 @@ export function renderMarkdownWithOutline(markdown: string): { html: string; hea
 
         headings.push({ id, level: depth, text })
         return `<h${depth} id="${id}">${inlineHtml}</h${depth}>\n`
+      },
+      // 自定义 table renderer：把 GFM 表格包进横向滚动容器，
+      // 替换原先对解析结果做 replaceAll('<table>'/…) 的脆弱字符串替换——
+      // 后者会把代码块内字面 `</table>` 误闭合，且无法感知真实表格边界。
+      table({ header, rows }) {
+        const headerHtml = `<thead><tr>${header.map(cell => `<th>${this.parser.parseInline(cell.tokens)}</th>`).join('')}</tr></thead>`
+        const bodyHtml = rows.length
+          ? `<tbody>${rows.map(row => `<tr>${row.map(cell => `<td>${this.parser.parseInline(cell.tokens)}</td>`).join('')}</tr>`).join('')}</tbody>`
+          : ''
+        return `<div class="markdown-table-scroll"><table>${headerHtml}${bodyHtml}</table></div>\n`
       }
     }
   })
 
   const rawHtml = parser.parse(markdown, { async: false }) as string
-  const htmlWithScrollableTables = rawHtml
-    .replaceAll('<table>', '<div class="markdown-table-scroll"><table>')
-    .replaceAll('</table>', '</table></div>')
   return {
-    html: sanitizeMarkdownHtml(htmlWithScrollableTables),
+    html: sanitizeMarkdownHtml(rawHtml),
     headings
   }
 }

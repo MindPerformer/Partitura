@@ -155,8 +155,8 @@ func TestProjectToolsRejectWithoutSwitch(t *testing.T) {
 
 	// 测试所有 project tools 在未 switch 时拒绝
 	projectTools := []string{
-		"document_list", "document_outline", "document_read", "document_read_section",
-		"document_read_lines", "document_history", "document_revision",
+		"document_list", "document_outline", "document_read",
+		"document_history", "document_revision",
 		"document_create", "document_patch", "document_replace", "upload_document_file", "document_move",
 		"document_archive", "knowledge_search", "source_attach", "workspace_bootstrap",
 	}
@@ -506,6 +506,93 @@ func TestDocumentPatch409RebaseStillConflict(t *testing.T) {
 	if resultMap["conflict"] == nil && resultMap["rebased"] == nil {
 		// 可能结果在更深层次
 		t.Errorf("期望结果包含 conflict 或 rebased 字段: %s", result.Content[0].Text)
+	}
+}
+
+// --- document_read 三模式（全文/段读/行读 + 互斥校验）---
+
+func TestDocumentReadModes(t *testing.T) {
+	fs := newFakeServer()
+	defer fs.close()
+
+	fs.mux.HandleFunc("GET /api/workspaces/ws-1/documents/read", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"id":"doc-1","path":"test.md","content_markdown":"full","content_hash":"h","revision_number":1}`))
+	}))
+	fs.mux.HandleFunc("GET /api/workspaces/ws-1/documents/section", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"path":"test.md","section_path":["A"],"content_markdown":"section body"}`))
+	}))
+	fs.mux.HandleFunc("GET /api/workspaces/ws-1/documents/lines", fs.recordMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"path":"test.md","start_line":1,"end_line":3,"lines":["a","b","c"]}`))
+	}))
+
+	cli := newTestClient(t, fs)
+	r := newTestRegistry(cli)
+	r.wsState.Switch("ws-1", "Test Workspace")
+
+	// (a) 无参=全文读
+	result, err := callToolByName(r, "document_read", json.RawMessage(`{"path":"test.md"}`))
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("全文读应成功: %s", result.Content[0].Text)
+	}
+	if last := fs.requests[len(fs.requests)-1]; !strings.HasSuffix(last.Path, "/documents/read") {
+		t.Errorf("全文读应打到 /documents/read, 得到 %s", last.Path)
+	}
+
+	// (b) section_path → 段读
+	result, err = callToolByName(r, "document_read", json.RawMessage(`{"path":"test.md","section_path":["A"]}`))
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("段读应成功: %s", result.Content[0].Text)
+	}
+	if last := fs.requests[len(fs.requests)-1]; !strings.HasSuffix(last.Path, "/documents/section") {
+		t.Errorf("段读应打到 /documents/section, 得到 %s", last.Path)
+	}
+
+	// (c) start_line+end_line → 行读
+	result, err = callToolByName(r, "document_read", json.RawMessage(`{"path":"test.md","start_line":1,"end_line":3}`))
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("行读应成功: %s", result.Content[0].Text)
+	}
+	if last := fs.requests[len(fs.requests)-1]; !strings.HasSuffix(last.Path, "/documents/lines") {
+		t.Errorf("行读应打到 /documents/lines, 得到 %s", last.Path)
+	}
+
+	// (d) 互斥：section_path + start_line 同时给出 → 报错
+	result, err = callToolByName(r, "document_read", json.RawMessage(`{"path":"test.md","section_path":["A"],"start_line":1,"end_line":2}`))
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "not both") {
+		t.Errorf("互斥参数应报错 'not both', 得到: %v", result.Content[0].Text)
+	}
+
+	// (d) 单边：只给 start_line → 报错
+	result, err = callToolByName(r, "document_read", json.RawMessage(`{"path":"test.md","start_line":1}`))
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "must be provided together") {
+		t.Errorf("单边参数应报错 'must be provided together', 得到: %v", result.Content[0].Text)
+	}
+
+	// (d) 行读范围超限 → 报错
+	result, err = callToolByName(r, "document_read", json.RawMessage(`{"path":"test.md","start_line":1,"end_line":600}`))
+	if err != nil {
+		t.Fatalf("意外错误: %v", err)
+	}
+	if !result.IsError || !strings.Contains(result.Content[0].Text, "500-line limit") {
+		t.Errorf("超限行读应报错 '500-line limit', 得到: %v", result.Content[0].Text)
 	}
 }
 
@@ -1075,7 +1162,7 @@ func TestWriteToolsOmitContentUnlessVerbose(t *testing.T) {
 			if strings.Contains(text, "content_markdown") {
 				t.Fatalf("默认响应不应包含 content_markdown: %s", text)
 			}
-			if !strings.Contains(text, `"revision_number": 3`) {
+			if !strings.Contains(text, `"revision_number":3`) {
 				t.Fatalf("默认响应应保留元数据: %s", text)
 			}
 
@@ -1389,7 +1476,7 @@ func TestToolsListContractIsEnglishAndComplete(t *testing.T) {
 	wantNames := []string{
 		"document_archive", "document_create", "document_history", "document_list",
 		"document_move", "document_outline", "document_patch", "document_read",
-		"document_read_lines", "document_read_section", "document_replace", "document_revision",
+		"document_replace", "document_revision",
 		"knowledge_search", "source_attach", "switch_workspace", "upload_document_file",
 		"workspace_bootstrap", "workspace_current", "workspace_list",
 	}

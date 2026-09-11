@@ -51,10 +51,30 @@ func (m *LocalAuditMockRepository) Record(ctx context.Context, userID, workspace
 }
 
 // List 实现 audit.Repository 接口。
-func (m *LocalAuditMockRepository) List(ctx context.Context, limit, offset int) (*audit.ListResult, error) {
+// 引入动机：接口签名含可选筛选条件，mock 复现同一过滤语义以适配签名。
+// From/To 在本 mock 中不参与过滤（entry 未持久化时间戳），仅字段级条件生效。
+func (m *LocalAuditMockRepository) List(ctx context.Context, filter audit.ListFilter, limit, offset int) (*audit.ListResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	total := len(m.entries)
+
+	var filtered []localAuditEntry
+	for _, e := range m.entries {
+		if filter.UserID != "" && e.userID != filter.UserID {
+			continue
+		}
+		if filter.Action != "" && e.action != filter.Action {
+			continue
+		}
+		if filter.ResourceType != "" && e.resourceType != filter.ResourceType {
+			continue
+		}
+		if filter.WorkspaceID != "" && e.workspaceID != filter.WorkspaceID {
+			continue
+		}
+		filtered = append(filtered, e)
+	}
+
+	total := len(filtered)
 	if offset >= total {
 		return &audit.ListResult{Total: total}, nil
 	}
@@ -64,7 +84,7 @@ func (m *LocalAuditMockRepository) List(ctx context.Context, limit, offset int) 
 	}
 	var result []audit.Entry
 	for i := total - 1 - offset; i >= total-end; i-- {
-		e := m.entries[i]
+		e := filtered[i]
 		result = append(result, audit.Entry{
 			UserID:       e.userID,
 			WorkspaceID:  e.workspaceID,

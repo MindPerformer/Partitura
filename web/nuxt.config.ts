@@ -89,7 +89,10 @@ export default defineNuxtConfig({
     head: {
       title: 'Partitura',
       meta: [
-        { name: 'viewport', content: 'width=device-width, initial-scale=1' }
+        { name: 'viewport', content: 'width=device-width, initial-scale=1' },
+        { name: 'description', content: 'Partitura — 内部知识库' },
+        // 内部知识库：禁止搜索引擎收录。
+        { name: 'robots', content: 'noindex,nofollow' }
       ]
     }
   }

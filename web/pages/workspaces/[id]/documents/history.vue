@@ -26,7 +26,8 @@ const loading = ref(false)
 const error = ref<string | null>(null)
 
 async function loadHistory() {
-  if (!workspaceId.value || !docPath.value) return
+  if (!workspaceId.value) return
+  if (!docPath.value) { error.value = t('document.pathMissing'); return }
   loading.value = true
   error.value = null
   try {
@@ -68,7 +69,7 @@ useHead({ title: () => t('document.revisionHistory') + ' · ' + t('common.appNam
       <div class="flex items-center justify-between mb-6">
         <div>
           <h1 class="text-2xl font-bold text-highlighted">{{ t('document.revisionHistory') }}</h1>
-          <p class="text-sm text-muted mt-1">{{ docPath }}</p>
+          <DocBreadcrumb :workspace-id="workspaceId" :path="docPath" class="mt-1" />
         </div>
         <UButton
           variant="ghost"
@@ -96,7 +97,7 @@ useHead({ title: () => t('document.revisionHistory') + ' · ' + t('common.appNam
               </div>
               <div>
                 <p class="text-sm font-medium text-highlighted">{{ rev.title }}</p>
-                <p class="text-xs text-muted">{{ formatDate(rev.created_at) }} · {{ rev.created_by.substring(0, 8) }}...</p>
+                <p class="text-xs text-muted" :title="rev.created_by_username || rev.created_by">{{ formatDate(rev.created_at) }} · {{ rev.created_by_username || rev.created_by.substring(0, 8) + '...' }}</p>
               </div>
             </div>
             <div class="flex items-center gap-1">

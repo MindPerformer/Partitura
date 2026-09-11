@@ -21,7 +21,7 @@ describe('Admin Guard', () => {
       user: { id: '1', username: 'normal', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     expect(auth.isSystemAdmin.value).toBe(false)
   })
@@ -34,7 +34,7 @@ describe('Admin Guard', () => {
       user: { id: '2', username: 'admin', system_role: 'system_admin' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     expect(auth.isSystemAdmin.value).toBe(true)
   })
@@ -46,7 +46,7 @@ describe('Admin Guard', () => {
       user: { id: '3', username: 'normal', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     const middleware = (await import('~/middleware/admin')).default
     const result = middleware({ path: '/admin/users', fullPath: '/admin/users' } as never, undefined as never)
@@ -61,7 +61,7 @@ describe('Admin Guard', () => {
       user: { id: '4', username: 'admin2', system_role: 'system_admin' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
 
     const middleware = (await import('~/middleware/admin')).default
     const result = middleware({ path: '/admin/users', fullPath: '/admin/users' } as never, undefined as never)

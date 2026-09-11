@@ -31,8 +31,10 @@ function isListProfilesResponse(value: unknown): value is ListProfilesResponse {
  * @returns profiles, total, loading, error, load
  */
 export function useSearchProfiles() {
-  // i18n：在 setup 上下文外（如单元测试直接调用）安全降级
-  // 测试需要断言中文错误消息，因此提供最小 fallback 映射。
+  // i18n：在 setup 上下文外（如单元测试直接调用）安全降级。
+  // 动机：单元测试在裸环境调用本 composable 并断言固定中文错误文案，
+  //   因此提供与 locales/zh.json 对齐的最小 fallback 映射，缺键时返回 key 本身。
+  //   错误在 composable 内写入 error ref 供模板直接渲染，故在边界处解析为可读文本。
   let t: (key: string) => string
   try {
     t = useI18n().t

@@ -84,8 +84,7 @@ useHead({ title: () => t('workspace.workspaces') + ' · ' + t('common.appName') 
 
 <template>
   <div>
-    <AppHeader />
-
+    <!-- 顶栏由 layouts/default.vue 统一注入；页面不再手动渲染 AppHeader -->
     <div class="max-w-5xl mx-auto px-4 py-8">
       <div class="flex items-center justify-between mb-6">
         <h1 class="text-2xl font-bold text-highlighted">{{ t('workspace.workspaces') }}</h1>
@@ -103,18 +102,23 @@ useHead({ title: () => t('workspace.workspaces') + ' · ' + t('common.appName') 
         <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
       </div>
 
-      <div v-else-if="workspaces.length === 0 && !error" class="text-center py-12">
-        <UIcon name="i-lucide-folder-open" class="w-12 h-12 text-muted mx-auto mb-3" />
-        <p class="text-muted">{{ t('workspace.noWorkspaces') }}</p>
-        <p class="text-sm text-dimmed mt-1">{{ t('workspace.createToGetStarted') }}</p>
-      </div>
+      <EmptyState
+        v-else-if="workspaces.length === 0 && !error"
+        icon="i-lucide-folder-open"
+        :title="t('workspace.noWorkspaces')"
+        :description="t('workspace.createToGetStarted')"
+      >
+        <UButton icon="i-lucide-plus" @click="showCreateModal = true">
+          {{ t('workspace.newWorkspace') }}
+        </UButton>
+      </EmptyState>
 
       <div v-else class="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
         <NuxtLink
           v-for="ws in workspaces"
           :key="ws.id"
           :to="`/workspaces/${ws.id}`"
-          class="block rounded-lg border border-default p-4 hover:border-primary/50 transition-colors bg-default"
+          class="block rounded-xl border border-default p-4 hover:border-primary/50 transition-colors bg-default"
         >
           <div class="flex items-start justify-between mb-2">
             <UIcon name="i-lucide-folder" class="w-6 h-6 text-primary" />

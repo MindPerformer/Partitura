@@ -12,7 +12,7 @@ definePageMeta({
 })
 
 const { t } = useI18n()
-const { isSystemAdmin } = useAuth()
+const { isSystemAdmin, currentUser } = useAuth()
 const { systemRoleLabel } = useEnumLabels()
 
 const users = ref<AdminUser[]>([])
@@ -22,6 +22,15 @@ const offset = ref(0)
 const loading = ref(false)
 const error = ref<string | null>(null)
 
+// 服务端筛选：后端 /admin/users 支持 system_role + q 查询参数
+const searchQuery = ref('')
+const roleFilter = ref('')
+
+function applyFilters() {
+  offset.value = 0
+  loadUsers()
+}
+
 const editingUser = ref<AdminUser | null>(null)
 const isEditModalOpen = computed({
   get: () => editingUser.value !== null,
@@ -30,6 +39,14 @@ const isEditModalOpen = computed({
 const editForm = reactive({ system_role: '', workspace_create_perm: false })
 const editLoading = ref(false)
 const editError = ref<string | null>(null)
+
+/**
+ * 角色变更确认：自我降级（自己把 system_admin 降级）或提权为 system_admin 都属于危险操作，
+ * 在保存前通过 UModal 二次确认，防止误操作导致失管或越权。
+ */
+const roleConfirmOpen = ref(false)
+const roleConfirmCopy = ref({ title: '', body: '' })
+const roleConfirmLoading = ref(false)
 
 // --- 创建用户状态 ---
 const isCreateModalOpen = ref(false)
@@ -99,7 +116,12 @@ async function loadUsers() {
   error.value = null
   try {
     const api = useAdminApi()
-    const res = await api.listUsers({ limit: limit.value, offset: offset.value })
+    const res = await api.listUsers({
+      limit: limit.value,
+      offset: offset.value,
+      system_role: roleFilter.value || undefined,
+      q: searchQuery.value.trim() || undefined
+    })
     users.value = res.users
     total.value = res.total
   } catch (err) {
@@ -124,7 +146,69 @@ function openEdit(user: AdminUser) {
   editError.value = null
 }
 
-async function handleSaveEdit() {
+// ---- 键盘导航：j/k 上下移动选中行，Enter/o 打开编辑，Escape 清除选中 ----
+const selectedIndex = ref(-1)
+const tableEl = ref<HTMLElement | null>(null)
+
+// 数据变化时清选中，避免指向已不存在的行。
+watch(users, () => { selectedIndex.value = -1 })
+
+function moveSelection(delta: number) {
+  if (users.value.length === 0) return
+  const next = selectedIndex.value < 0
+    ? (delta > 0 ? 0 : users.value.length - 1)
+    : Math.min(Math.max(selectedIndex.value + delta, 0), users.value.length - 1)
+  selectedIndex.value = next
+  tableEl.value?.querySelectorAll('tbody tr')[next]?.scrollIntoView({ block: 'nearest' })
+}
+
+function openSelected() {
+  const user = users.value[selectedIndex.value]
+  if (user) openEdit(user)
+}
+
+function clearSelection() {
+  selectedIndex.value = -1
+}
+
+useHotkey('j', () => moveSelection(1))
+useHotkey('k', () => moveSelection(-1))
+useHotkey('enter', openSelected)
+useHotkey('o', openSelected)
+useHotkey('escape', clearSelection)
+
+/**
+ * 提交编辑前的角色变更风险检查。
+ * 返回 true 表示需要二次确认（此时已打开确认弹窗）；false 表示可直接提交。
+ */
+function requestSaveWithRoleCheck(): void {
+  const user = editingUser.value
+  if (!user) return
+  const isSelf = currentUser.value?.id === user.id
+  const demotingSelf = isSelf && user.system_role === 'system_admin' && editForm.system_role !== 'system_admin'
+  const promotingToAdmin = user.system_role !== 'system_admin' && editForm.system_role === 'system_admin'
+
+  if (demotingSelf) {
+    roleConfirmCopy.value = { title: t('admin.systemRole'), body: t('admin.demoteSelfConfirm') }
+    roleConfirmOpen.value = true
+    return
+  }
+  if (promotingToAdmin) {
+    roleConfirmCopy.value = { title: t('admin.systemRole'), body: t('admin.promoteToAdminConfirm', { username: user.username }) }
+    roleConfirmOpen.value = true
+    return
+  }
+  // 无角色风险：直接提交
+  void doSaveEdit()
+}
+
+/** 确认弹窗确认后执行真实保存。 */
+async function confirmRoleChange() {
+  roleConfirmOpen.value = false
+  await doSaveEdit()
+}
+
+async function doSaveEdit() {
   if (!editingUser.value) return
   editLoading.value = true
   editError.value = null
@@ -150,19 +234,25 @@ const roleOptions = computed<SelectItem[]>(() => [
   { label: t('admin.roleSystemAdmin'), value: 'system_admin' }
 ])
 
+const roleFilterOptions = computed<SelectItem[]>(() => [
+  { label: t('admin.all'), value: '' },
+  { label: t('admin.roleUser'), value: 'user' },
+  { label: t('admin.roleSystemAdmin'), value: 'system_admin' }
+])
+
 useHead({ title: () => t('admin.adminUsers') + ' · ' + t('common.appName') })
 </script>
 
 <template>
   <div>
-    <AppHeader />
+    <!-- 顶栏由 layouts/default.vue 统一注入 -->
+    <div class="max-w-6xl mx-auto px-4 py-8">
 
-    <div class="max-w-4xl mx-auto px-4 py-8">
-
-      <div v-if="!isSystemAdmin" class="text-center py-12">
-        <UIcon name="i-lucide-lock" class="w-12 h-12 text-muted mx-auto mb-3" />
-        <p class="text-muted">{{ t('admin.systemAdminRequired') }}</p>
-      </div>
+      <EmptyState
+        v-if="!isSystemAdmin"
+        icon="i-lucide-lock"
+        :title="t('admin.systemAdminRequired')"
+      />
 
       <template v-else>
         <div class="flex items-center justify-between mb-4">
@@ -172,34 +262,70 @@ useHead({ title: () => t('admin.adminUsers') + ' · ' + t('common.appName') })
 
         <ErrorDisplay v-if="error" :message="error" />
 
-        <div v-if="loading" class="flex justify-center py-8">
-          <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
+        <div class="flex gap-2 mb-4">
+          <UInput
+            v-model="searchQuery"
+            :placeholder="t('admin.searchUsersPlaceholder')"
+            icon="i-lucide-search"
+            class="w-64"
+            @keyup.enter="applyFilters"
+          />
+          <USelect
+            v-model="roleFilter"
+            :items="roleFilterOptions"
+            value-key="value"
+            label-key="label"
+            class="w-40"
+            :aria-label="t('admin.filterByRole')"
+            @update:model-value="applyFilters"
+          />
+          <UButton size="sm" variant="outline" icon="i-lucide-search" @click="applyFilters">{{ t('common.search') }}</UButton>
         </div>
 
-        <UCard v-else-if="users.length > 0">
-          <div class="space-y-2">
-            <div
-              v-for="user in users"
-              :key="user.id"
-              class="flex items-center justify-between border border-default rounded-lg p-3"
-            >
-              <div class="flex items-center gap-3">
-                <UAvatar :alt="user.username.charAt(0).toUpperCase()" size="sm" />
-                <div>
-                  <p class="text-sm font-medium text-highlighted">{{ user.username }}</p>
-                  <p class="text-xs text-muted">{{ user.email }}</p>
-                </div>
-              </div>
-              <div class="flex items-center gap-2">
-                <UBadge :color="user.system_role === 'system_admin' ? 'error' : 'neutral'" variant="subtle" size="sm">{{ systemRoleLabel(user.system_role) }}</UBadge>
-                <UBadge v-if="user.workspace_create_perm" color="success" variant="subtle" size="sm">{{ t('admin.workspaceCreateEnabled') }}</UBadge>
-                <UButton size="xs" variant="ghost" icon="i-lucide-pencil" @click="openEdit(user)" />
-              </div>
-            </div>
-          </div>
+        <div v-if="loading" class="flex justify-center py-8" role="status">
+          <UIcon name="i-lucide-loader-circle" aria-hidden="true" class="w-8 h-8 animate-spin text-muted" />
+          <span class="sr-only">{{ t('common.loading') }}</span>
+        </div>
+
+        <UCard v-else-if="users.length > 0" class="overflow-x-auto">
+          <table class="w-full text-sm" ref="tableEl">
+            <thead>
+              <tr class="text-left text-muted border-b border-default">
+                <th class="py-2 pr-3 font-medium">{{ t('auth.username') }}</th>
+                <th class="py-2 pr-3 font-medium">{{ t('admin.systemRole') }}</th>
+                <th class="py-2 pr-3 font-medium sr-only">{{ t('common.edit') }}</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="(user, idx) in users"
+                :key="user.id"
+                class="border-b border-default last:border-0 transition-colors"
+                :class="idx === selectedIndex ? 'bg-elevated' : ''"
+                :aria-selected="idx === selectedIndex"
+              >
+                <td class="py-2 pr-3">
+                  <div class="flex items-center gap-3">
+                    <UAvatar :alt="user.username.charAt(0).toUpperCase()" size="sm" />
+                    <div>
+                      <p class="text-sm font-medium text-highlighted">{{ user.username }}</p>
+                      <p class="text-xs text-muted">{{ user.email }}</p>
+                    </div>
+                  </div>
+                </td>
+                <td class="py-2 pr-3">
+                  <UBadge :color="user.system_role === 'system_admin' ? 'error' : 'neutral'" variant="subtle" size="sm">{{ systemRoleLabel(user.system_role) }}</UBadge>
+                  <UBadge v-if="user.workspace_create_perm" color="success" variant="subtle" size="sm" class="ml-1">{{ t('admin.workspaceCreateEnabled') }}</UBadge>
+                </td>
+                <td class="py-2">
+                  <UButton size="xs" variant="ghost" icon="i-lucide-pencil" :aria-label="t('common.edit')" @click="openEdit(user)" />
+                </td>
+              </tr>
+            </tbody>
+          </table>
         </UCard>
 
-        <p v-else class="text-center text-muted py-8">{{ t('admin.noUsers') }}</p>
+        <EmptyState v-else icon="i-lucide-users" :title="t('admin.noUsers')" />
 
         <Pagination
           v-if="total > limit"
@@ -216,7 +342,7 @@ useHead({ title: () => t('admin.adminUsers') + ' · ' + t('common.appName') })
       <template #content>
         <div class="p-6">
           <h3 class="text-lg font-semibold mb-4">{{ t('admin.editUser', { username: editingUser?.username }) }}</h3>
-          <form @submit.prevent="handleSaveEdit" class="space-y-4">
+          <form @submit.prevent="requestSaveWithRoleCheck" class="space-y-4">
             <UFormField :label="t('admin.systemRole')" name="system_role">
               <USelect
                 v-model="editForm.system_role"
@@ -279,6 +405,20 @@ useHead({ title: () => t('admin.adminUsers') + ' · ' + t('common.appName') })
               <UButton type="submit" :loading="createLoading" icon="i-lucide-user-plus">{{ t('common.create') }}</UButton>
             </div>
           </form>
+        </div>
+      </template>
+    </UModal>
+
+    <!-- 角色变更确认弹窗（自我降级 / 提权为 system_admin） -->
+    <UModal v-model:open="roleConfirmOpen">
+      <template #content>
+        <div class="p-6">
+          <h3 class="text-lg font-semibold mb-2">{{ roleConfirmCopy.title }}</h3>
+          <p class="text-sm text-muted mb-4">{{ roleConfirmCopy.body }}</p>
+          <div class="flex justify-end gap-2">
+            <UButton color="neutral" variant="ghost" @click="roleConfirmOpen = false">{{ t('common.cancel') }}</UButton>
+            <UButton color="warning" :loading="roleConfirmLoading" @click="confirmRoleChange">{{ t('common.confirm') }}</UButton>
+          </div>
         </div>
       </template>
     </UModal>

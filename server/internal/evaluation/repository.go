@@ -14,6 +14,17 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
+// 数据集状态常量。
+// 引入动机：evaluation_datasets.status 受 CHECK (status IN ('active','archived'))
+// 约束（migrations/M004），handler 与 mock 需要以常量引用合法取值，避免散落字面量。
+const (
+	// DatasetStatusActive 表示数据集可用于添加条目与运行评测。
+	DatasetStatusActive = "active"
+	// DatasetStatusArchived 表示数据集已归档：条目与历史评测结果保留，
+	// 但不再允许新增条目或运行评测（归档即 API 层终态，不提供恢复端点）。
+	DatasetStatusArchived = "archived"
+)
+
 // Dataset 是评测数据集记录。
 type Dataset struct {
 	ID          string `json:"id"`
@@ -59,6 +70,19 @@ type Repository interface {
 	// ListAllItems 查询指定数据集的全部条目（不分页）。
 	// 引入动机：evaluate_profile job 需要读取全部评测条目执行评测，分页不适用。
 	ListAllItems(ctx context.Context, datasetID string) ([]Item, error)
+
+	// DeleteItem 删除指定数据集中的指定条目。
+	// 引入动机：admin 需要管理评测条目，删除必须限定 dataset_id 防止
+	// 仅凭条目 ID 就越权删除其它数据集的条目。
+	// 目标行不存在（或 dataset_id 与条目不属于同一数据集）时返回 sql.ErrNoRows。
+	DeleteItem(ctx context.Context, datasetID, itemID string) error
+
+	// ArchiveDataset 将指定数据集软删为 archived。
+	// 引入动机：evaluation_items.dataset_id 与 evaluation_results.dataset_id
+	// 均为 ON DELETE CASCADE（见 migrations/M004），物理 DELETE 会连带、不可恢复地
+	// 删除历史评测结果；归档只翻转 status 字段，条目与评测历史全部保留。
+	// 数据集不存在时返回 sql.ErrNoRows。
+	ArchiveDataset(ctx context.Context, datasetID string) error
 }
 
 // PGRepository 是 Repository 的 PostgreSQL 实现。
@@ -242,6 +266,50 @@ func (r *PGRepository) ListAllItems(ctx context.Context, datasetID string) ([]It
 	}
 
 	return items, nil
+}
+
+// DeleteItem 删除指定数据集中的指定条目。
+// WHERE 同时限定 id 与 dataset_id：仅知道条目 ID 不足以删除，
+// 防止跨数据集越权删除。影响 0 行时返回 sql.ErrNoRows，由 handler 映射为 404。
+func (r *PGRepository) DeleteItem(ctx context.Context, datasetID, itemID string) error {
+	result, err := r.db.ExecContext(ctx,
+		`DELETE FROM evaluation_items WHERE id = $1 AND dataset_id = $2`,
+		itemID, datasetID,
+	)
+	if err != nil {
+		return mapEvalDBError(err, "删除评测条目")
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("获取删除评测条目影响行数: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// ArchiveDataset 将指定数据集软删为 archived（保留 items 与 evaluation_results 历史）。
+// 引入动机：物理 DELETE 会经 ON DELETE CASCADE 连带、不可恢复地删除历史评测结果；
+// 软删仅 UPDATE status 字段，数据保留、可审计。
+// 幂等：对已 archived 的数据集重复调用仍返回成功（影响 1 行）。
+// 影响 0 行时返回 sql.ErrNoRows，由 handler 映射为 404。
+func (r *PGRepository) ArchiveDataset(ctx context.Context, datasetID string) error {
+	result, err := r.db.ExecContext(ctx,
+		`UPDATE evaluation_datasets SET status = 'archived', updated_at = now() WHERE id = $1`,
+		datasetID,
+	)
+	if err != nil {
+		return mapEvalDBError(err, "归档评测数据集")
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("获取归档评测数据集影响行数: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // mapEvalDBError 将 database/sql 错误映射为带上下文的错误信息。

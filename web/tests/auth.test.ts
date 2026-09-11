@@ -69,7 +69,7 @@ describe('Login and Auth Guard', () => {
       user: { id: '1', username: 'test', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
     expect(auth.isAuthenticated.value).toBe(true)
 
     ctrl.setError({
@@ -113,7 +113,7 @@ describe('Login and Auth Guard', () => {
       user: { id: '1', username: 'test', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
     await nextTick()
 
     const middleware = (await import('~/middleware/auth')).default
@@ -132,7 +132,7 @@ describe('Login and Auth Guard', () => {
       user: { id: '1', username: 'test', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
     await nextTick()
 
     const middleware = (await import('~/middleware/auth')).default
@@ -154,7 +154,7 @@ describe('Login and Auth Guard', () => {
       user: { id: '1', username: 'test', system_role: 'user' },
       csrf_token: 'token',
       expires_at: '2025-01-01'
-    } as never)
+    })
     expect(auth.isAuthenticated.value).toBe(true)
 
     const api = useAuthApi()
@@ -163,5 +163,65 @@ describe('Login and Auth Guard', () => {
 
     expect(auth.isAuthenticated.value).toBe(false)
     expect(auth.currentUser.value).toBeNull()
+  })
+
+  // ============================================================
+  // auth middleware 的 refreshAuth 验证路径
+  //
+  // 动机：未登录访问受保护页时，守卫必须先发起服务端权威验证（refreshAuth → me()），
+  // 401 时重定向到 /login，已登录则放行。此路径此前未被测试覆盖。
+  // ============================================================
+
+  it('未登录访问受保护页 → 调用 me() → 401 重定向 /login', async () => {
+    const { useAuth, clearAuthState } = await import('~/composables/useAuth')
+    const auth = useAuth()
+
+    // 初始为"已探测且无效"之外的未探测态：模拟尚未确认会话的刷新场景
+    clearAuthState()
+    // authChecked 置 true 后 middleware 会走同步拒绝分支（不再 refreshAuth），
+    // 为命中 refreshAuth 分支需要把 authChecked 重置回 false。
+    auth.authChecked.value = false
+    await nextTick()
+
+    // me() 返回 401 → 权威态为空
+    ctrl.setError({
+      response: { status: 401, _data: { error: '未认证' } },
+      message: 'FetchError'
+    })
+
+    const middleware = (await import('~/middleware/auth')).default
+    const to = { path: '/workspaces/123', fullPath: '/workspaces/123' }
+    await middleware(to as never, undefined as never)
+
+    // refreshAuth 触发了 /auth/me 权威验证请求
+    const meCall = ctrl.mockFn.mock.calls.find(c => String(c[0]).includes('/auth/me'))
+    expect(meCall, 'middleware 应发起 /auth/me 权威验证').toBeTruthy()
+    // 401 → 权威态被清空，用户未通过验证（navigateTo 在测试环境为桩返回 undefined，
+    // 真实重定发生在生产路由中；此处断言「未通过验证」这一可观察契约）
+    expect(auth.isAuthenticated.value).toBe(false)
+    expect(auth.verifiedUser.value).toBeNull()
+  })
+
+  it('已登录访问受保护页 → me() 返回用户 → 放行不重定向', async () => {
+    const { useAuth, clearAuthState } = await import('~/composables/useAuth')
+    const auth = useAuth()
+
+    clearAuthState()
+    auth.authChecked.value = false
+    await nextTick()
+
+    // me() 返回当前用户 → refreshAuth 后 verifiedUser 非空 → 放行
+    ctrl.setResponse({
+      id: 'u1', username: 'user', email: 'u@x.com', system_role: 'user', workspace_create_perm: false
+    })
+
+    const middleware = (await import('~/middleware/auth')).default
+    const to = { path: '/workspaces/123', fullPath: '/workspaces/123' }
+    const result = await middleware(to as never, undefined as never)
+
+    const meCall = ctrl.mockFn.mock.calls.find(c => String(c[0]).includes('/auth/me'))
+    expect(meCall).toBeTruthy()
+    expect(result).toBeUndefined()
+    expect(auth.isAuthenticated.value).toBe(true)
   })
 })

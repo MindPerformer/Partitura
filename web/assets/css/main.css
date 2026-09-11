@@ -1,2 +1,36 @@
 @import "tailwindcss";
 @import "@nuxt/ui";
+
+/*
+ * 全局内容宽度规范（设计常量，供后续页面接入）。
+ * 三档约定（对应 Tailwind max-w-* 工具类）：
+ *   --content-w-reading : max-w-3xl  ~48rem  阅读型内容（约 65-75 字符/行）
+ *   --content-w-form    : max-w-4xl  ~56rem  表单 / 详情页
+ *   --content-w-admin   : max-w-6xl  ~72rem  管理列表 / dashboard
+ * 页面接入时直接使用对应 Tailwind 类（如 `max-w-4xl mx-auto`）。
+ */
+:root {
+  --content-w-reading: 48rem; /* max-w-3xl */
+  --content-w-form: 56rem;    /* max-w-4xl */
+  --content-w-admin: 72rem;   /* max-w-6xl */
+}
+
+/* 全局键盘可达性：使用 Nuxt UI v4 主题变量 --ui-primary。
+   仅聚焦可见（键盘）时出现轮廓，鼠标点击不触发。 */
+:focus-visible {
+  outline: 2px solid var(--ui-primary);
+  outline-offset: 2px;
+}
+
+/* WebKit/Chromium 兜底：:-webkit-focus-ring 与 :focus-visible 同源，
+   确保旧内核/特定控件下焦点环仍可见；暗色模式下 primary 变量已随主题切换。 */
+:-webkit-focus-ring {
+  outline: 2px solid var(--ui-primary);
+  outline-offset: 2px;
+}
+
+/* skip-link 目标（#main-content）被聚焦时不显示轮廓，但保持可编程聚焦。
+   main 设 tabindex=-1 仅为锚点跳转目标，不应常驻焦点环。 */
+#main-content:focus {
+  outline: none;
+}

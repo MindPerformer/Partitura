@@ -4,13 +4,13 @@
 // login 和 bootstrap 页面不需要认证，其他所有页面需要认证。
 //
 // 行为：
-// - 检查 useAuth().isAuthenticated
 // - /login 和 /bootstrap 是公开页面，不需要认证
-// - 未认证时重定向到 /login，携带 redirect 参数
+// - 其他页面：若 verifiedUser 为空则先 await refreshAuth() 做服务端权威验证；
+//   仍未通过则重定向 /login?redirect=<fullPath>（encodeURIComponent）
 // - 已认证但访问 /login 时重定向到首页
 
 export default defineNuxtRouteMiddleware((to) => {
-  const { isAuthenticated } = useAuth()
+  const { verifiedUser, authChecked, isAuthenticated, refreshAuth } = useAuth()
 
   // login 和 bootstrap 页面是公开的
   // 引入动机：bootstrap 仅在空数据库时可用，创建首个管理员后自动转入登录流程。
@@ -22,11 +22,22 @@ export default defineNuxtRouteMiddleware((to) => {
     return
   }
 
-  // 其他页面需要认证
-  if (!isAuthenticated.value) {
-    return navigateTo({
-      path: '/login',
-      query: { redirect: to.fullPath }
-    })
+  // 同步快路径：服务端权威态已确认，直接放行（保持返回值非 Promise 语义）。
+  if (verifiedUser.value) {
+    return
   }
+
+  // me() 已完成且权威态为空：服务端已判定会话无效/不存在，直接拒绝，
+  // 避免每次导航都重复打 /auth/me。
+  if (authChecked.value) {
+    return navigateTo(`/login?redirect=${encodeURIComponent(to.fullPath)}`)
+  }
+
+  // 尚未探测：发起服务端验证，成功后放行，否则重定向登录页。
+  return (async () => {
+    await refreshAuth()
+    if (!verifiedUser.value) {
+      return navigateTo(`/login?redirect=${encodeURIComponent(to.fullPath)}`)
+    }
+  })()
 })

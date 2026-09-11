@@ -24,19 +24,32 @@ const { t } = useI18n()
 const { documentStatusLabel, documentTypeLabel, sourceTypeLabel } = useEnumLabels()
 const { formatDate } = useFormatDate()
 const rightTab = ref<'toc' | 'meta' | 'sources'>('toc')
+const tabs = [
+  { id: 'toc' as const, label: 'document.tableOfContents' },
+  { id: 'meta' as const, label: 'document.info' },
+  { id: 'sources' as const, label: 'document.sources' }
+]
 </script>
 
 <template>
   <div class="flex h-full min-h-0 flex-col bg-default">
     <div class="shrink-0 border-b border-default px-3 py-2">
-      <div class="grid grid-cols-3 gap-1">
-        <UButton size="xs" :variant="rightTab === 'toc' ? 'solid' : 'ghost'" @click="rightTab = 'toc'">{{ t('document.tableOfContents') }}</UButton>
-        <UButton size="xs" :variant="rightTab === 'meta' ? 'solid' : 'ghost'" @click="rightTab = 'meta'">{{ t('document.info') }}</UButton>
-        <UButton size="xs" :variant="rightTab === 'sources' ? 'solid' : 'ghost'" @click="rightTab = 'sources'">{{ t('document.sources') }}</UButton>
+      <div class="grid grid-cols-3 gap-1" role="tablist" :aria-label="t('document.panelTabs')">
+        <UButton
+          v-for="tab in tabs"
+          :key="tab.id"
+          size="xs"
+          role="tab"
+          :variant="rightTab === tab.id ? 'solid' : 'ghost'"
+          :aria-selected="rightTab === tab.id"
+          :aria-controls="`panel-${tab.id}`"
+          :id="`tab-${tab.id}`"
+          @click="rightTab = tab.id"
+        >{{ t(tab.label) }}</UButton>
       </div>
     </div>
 
-    <div v-if="rightTab === 'toc'" class="min-h-0 flex-1 overflow-y-auto p-3">
+    <div v-if="rightTab === 'toc'" id="panel-toc" role="tabpanel" aria-labelledby="tab-toc" class="min-h-0 flex-1 overflow-y-auto p-3">
       <ul v-if="props.headings.length > 0" class="space-y-1 text-sm">
         <li
           v-for="heading in props.headings"
@@ -55,7 +68,7 @@ const rightTab = ref<'toc' | 'meta' | 'sources'>('toc')
       <p v-else class="text-xs text-muted">{{ t('document.noHeadings') }}</p>
     </div>
 
-    <div v-if="rightTab === 'meta'" class="min-h-0 flex-1 space-y-3 overflow-y-auto p-3 text-sm">
+    <div v-if="rightTab === 'meta'" id="panel-meta" role="tabpanel" aria-labelledby="tab-meta" class="min-h-0 flex-1 space-y-3 overflow-y-auto p-3 text-sm">
       <div>
         <p class="text-xs uppercase text-muted">{{ t('document.path') }}</p>
         <p class="break-all text-default">{{ props.doc.path }}</p>
@@ -74,19 +87,27 @@ const rightTab = ref<'toc' | 'meta' | 'sources'>('toc')
       </div>
       <div>
         <p class="text-xs uppercase text-muted">{{ t('document.hash') }}</p>
-        <p class="break-all font-mono text-xs text-default">{{ props.doc.content_hash.substring(0, 16) }}...</p>
+        <p class="break-all font-mono text-xs text-default" :title="props.doc.content_hash">{{ props.doc.content_hash.substring(0, 16) }}...</p>
       </div>
       <div>
         <p class="text-xs uppercase text-muted">{{ t('document.created') }}</p>
         <p class="text-default">{{ formatDate(props.doc.created_at) }}</p>
       </div>
       <div>
+        <p class="text-xs uppercase text-muted">{{ t('document.createdBy') }}</p>
+        <p class="text-default" :title="props.doc.created_by_username || props.doc.created_by">{{ props.doc.created_by_username || props.doc.created_by.substring(0, 8) + '...' }}</p>
+      </div>
+      <div>
         <p class="text-xs uppercase text-muted">{{ t('document.updated') }}</p>
         <p class="text-default">{{ formatDate(props.doc.updated_at) }}</p>
       </div>
+      <div v-if="props.doc.updated_by_username">
+        <p class="text-xs uppercase text-muted">{{ t('document.updatedBy') }}</p>
+        <p class="text-default" :title="props.doc.updated_by_username || props.doc.updated_by">{{ props.doc.updated_by_username || props.doc.updated_by.substring(0, 8) + '...' }}</p>
+      </div>
     </div>
 
-    <div v-if="rightTab === 'sources'" class="min-h-0 flex-1 overflow-y-auto p-3">
+    <div v-if="rightTab === 'sources'" id="panel-sources" role="tabpanel" aria-labelledby="tab-sources" class="min-h-0 flex-1 overflow-y-auto p-3">
       <div v-if="props.sources.length > 0" class="space-y-2">
         <div
           v-for="src in props.sources"

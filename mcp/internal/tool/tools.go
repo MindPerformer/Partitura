@@ -6,7 +6,7 @@
 //
 // 工具清单：
 //   - workspace_list, workspace_current, switch_workspace, workspace_bootstrap
-//   - document_list, document_outline, document_read, document_read_section, document_read_lines
+//   - document_list, document_outline, document_read
 //   - document_create, document_patch, document_replace, upload_document_file,
 //     document_move, document_archive, document_history, document_revision
 //   - knowledge_search, source_attach
@@ -81,8 +81,6 @@ func (r *Registry) RegisterAll(server *protocol.Server) {
 	server.RegisterTool(r.documentListTool(), r.handleDocumentList)
 	server.RegisterTool(r.documentOutlineTool(), r.handleDocumentOutline)
 	server.RegisterTool(r.documentReadTool(), r.handleDocumentRead)
-	server.RegisterTool(r.documentReadSectionTool(), r.handleDocumentReadSection)
-	server.RegisterTool(r.documentReadLinesTool(), r.handleDocumentReadLines)
 	server.RegisterTool(r.documentHistoryTool(), r.handleDocumentHistory)
 	server.RegisterTool(r.documentRevisionTool(), r.handleDocumentRevision)
 
@@ -105,25 +103,23 @@ func (r *Registry) RegisterAll(server *protocol.Server) {
 // 引入动机：测试需要直接调用工具 handler 而不经过 MCP 协议层。
 func (r *Registry) callToolForTest(name string, args json.RawMessage) (*protocol.ToolResult, error) {
 	handlers := map[string]func(json.RawMessage) (*protocol.ToolResult, error){
-		"workspace_list":        r.handleWorkspaceList,
-		"workspace_current":     r.handleWorkspaceCurrent,
-		"switch_workspace":      r.handleSwitchWorkspace,
-		"workspace_bootstrap":   r.handleWorkspaceBootstrap,
-		"document_list":         r.handleDocumentList,
-		"document_outline":      r.handleDocumentOutline,
-		"document_read":         r.handleDocumentRead,
-		"document_read_section": r.handleDocumentReadSection,
-		"document_read_lines":   r.handleDocumentReadLines,
-		"document_history":      r.handleDocumentHistory,
-		"document_revision":     r.handleDocumentRevision,
-		"document_create":       r.handleDocumentCreate,
-		"document_patch":        r.handleDocumentPatch,
-		"document_replace":      r.handleDocumentReplace,
-		"upload_document_file":  r.handleUploadDocumentFile,
-		"document_move":         r.handleDocumentMove,
-		"document_archive":      r.handleDocumentArchive,
-		"knowledge_search":      r.handleKnowledgeSearch,
-		"source_attach":         r.handleSourceAttach,
+		"workspace_list":       r.handleWorkspaceList,
+		"workspace_current":    r.handleWorkspaceCurrent,
+		"switch_workspace":     r.handleSwitchWorkspace,
+		"workspace_bootstrap":  r.handleWorkspaceBootstrap,
+		"document_list":        r.handleDocumentList,
+		"document_outline":     r.handleDocumentOutline,
+		"document_read":        r.handleDocumentRead,
+		"document_history":     r.handleDocumentHistory,
+		"document_revision":    r.handleDocumentRevision,
+		"document_create":      r.handleDocumentCreate,
+		"document_patch":       r.handleDocumentPatch,
+		"document_replace":     r.handleDocumentReplace,
+		"upload_document_file": r.handleUploadDocumentFile,
+		"document_move":        r.handleDocumentMove,
+		"document_archive":     r.handleDocumentArchive,
+		"knowledge_search":     r.handleKnowledgeSearch,
+		"source_attach":        r.handleSourceAttach,
 	}
 	handler, ok := handlers[name]
 	if !ok {
@@ -155,7 +151,7 @@ func errorResult(msg string) *protocol.ToolResult {
 
 // jsonResult 创建 JSON 文本工具结果。
 func jsonResult(data interface{}) (*protocol.ToolResult, error) {
-	jsonBytes, err := json.MarshalIndent(data, "", "  ")
+	jsonBytes, err := json.Marshal(data)
 	if err != nil {
 		return nil, fmt.Errorf("failed to serialize result: %w", err)
 	}
@@ -236,7 +232,6 @@ func (r *Registry) handleWorkspaceList(args json.RawMessage) (*protocol.ToolResu
 			ID          string `json:"id"`
 			Name        string `json:"name"`
 			DisplayName string `json:"display_name"`
-			Description string `json:"description"`
 			Status      string `json:"status"`
 		} `json:"workspaces"`
 		Total  int `json:"total"`
@@ -337,7 +332,6 @@ func (r *Registry) handleSwitchWorkspace(args json.RawMessage) (*protocol.ToolRe
 		"workspace_name": ws.DisplayName,
 		"project_md":     map[string]bool{"exists": projectExists},
 		"agents_md":      map[string]bool{"exists": agentsExists},
-		"next_step":      "Use workspace_bootstrap for a project overview, or knowledge_search to look up existing knowledge.",
 	}
 
 	return jsonResult(result)
@@ -379,7 +373,7 @@ func (r *Registry) handleWorkspaceBootstrap(args json.RawMessage) (*protocol.Too
 		if content, ok := projectDoc["content_markdown"].(string); ok {
 			lines := strings.Split(content, "\n")
 			if len(lines) > 100 {
-				projectContent = strings.Join(lines[:100], "\n") + "\n... (truncated; use document_read_section for more)"
+				projectContent = strings.Join(lines[:100], "\n") + "\n... (truncated; use document_read for more)"
 			} else {
 				projectContent = content
 			}
@@ -394,7 +388,7 @@ func (r *Registry) handleWorkspaceBootstrap(args json.RawMessage) (*protocol.Too
 		if content, ok := agentsDoc["content_markdown"].(string); ok {
 			lines := strings.Split(content, "\n")
 			if len(lines) > 100 {
-				agentsContent = strings.Join(lines[:100], "\n") + "\n... (truncated; use document_read_section for more)"
+				agentsContent = strings.Join(lines[:100], "\n") + "\n... (truncated; use document_read for more)"
 			} else {
 				agentsContent = content
 			}
@@ -564,58 +558,7 @@ func (r *Registry) handleDocumentOutline(args json.RawMessage) (*protocol.ToolRe
 func (r *Registry) documentReadTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_read",
-		Description: "Read the full content of a document, including revision_number and content_hash. For long documents, use document_outline first.",
-		InputSchema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"path": map[string]interface{}{
-					"type":        "string",
-					"description": "Document path",
-				},
-			},
-			"required": []string{"path"},
-		},
-	}
-}
-
-func (r *Registry) handleDocumentRead(args json.RawMessage) (*protocol.ToolResult, error) {
-	if err := r.wsState.RequireActive(); err != nil {
-		return errorResult(err.Error()), nil
-	}
-
-	var params struct {
-		Path string `json:"path"`
-	}
-	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
-	}
-	if params.Path == "" {
-		return errorResult("path is required"), nil
-	}
-
-	// 检查缓存
-	cacheKey := cacheKey(r.wsState.ID(), "read:"+params.Path)
-	if cached, ok := r.cache.Get(cacheKey); ok {
-		return jsonResult(cached)
-	}
-
-	url := fmt.Sprintf("/api/workspaces/%s/documents/read?path=%s", r.wsState.ID(), params.Path)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	var result interface{}
-	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("failed to read document: %v", err)), nil
-	}
-
-	r.cache.Set(cacheKey, result)
-	return jsonResult(result)
-}
-
-func (r *Registry) documentReadSectionTool() *protocol.Tool {
-	return &protocol.Tool{
-		Name:        "document_read_section",
-		Description: "Read one section's Markdown content by section_path. section_path is a structured array that disambiguates duplicate headings.",
+		Description: "Read a document. With no extra params returns metadata+full content; pass section_path OR start_line+end_line to read only a slice. For long documents call document_outline first to get section_path/line ranges.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -626,15 +569,26 @@ func (r *Registry) documentReadSectionTool() *protocol.Tool {
 				"section_path": map[string]interface{}{
 					"type":        "array",
 					"items":       map[string]interface{}{"type": "string"},
-					"description": "Section path array (e.g. [\"Architecture\", \"Components\"])",
+					"description": "Section path array from document_outline (e.g. [\"Architecture\", \"Components\"])",
+				},
+				"start_line": map[string]interface{}{
+					"type":        "integer",
+					"description": "Start line (1-based, inclusive); must be given with end_line",
+				},
+				"end_line": map[string]interface{}{
+					"type":        "integer",
+					"description": "End line (inclusive); max 500 lines per call",
 				},
 			},
-			"required": []string{"path", "section_path"},
+			"required": []string{"path"},
 		},
 	}
 }
 
-func (r *Registry) handleDocumentReadSection(args json.RawMessage) (*protocol.ToolResult, error) {
+// handleDocumentRead 合并全文/段读/行读三种模式。
+// 引入动机：三个读工具合并为一个 document_read，减少 tools/list 体积和 Agent 选工具的步骤。
+// 参数互斥规则 fail-fast：section_path 与 start_line/end_line 不可同时给出；start/end 必须成对出现。
+func (r *Registry) handleDocumentRead(args json.RawMessage) (*protocol.ToolResult, error) {
 	if err := r.wsState.RequireActive(); err != nil {
 		return errorResult(err.Error()), nil
 	}
@@ -642,6 +596,8 @@ func (r *Registry) handleDocumentReadSection(args json.RawMessage) (*protocol.To
 	var params struct {
 		Path        string   `json:"path"`
 		SectionPath []string `json:"section_path"`
+		StartLine   *int     `json:"start_line"`
+		EndLine     *int     `json:"end_line"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -649,89 +605,74 @@ func (r *Registry) handleDocumentReadSection(args json.RawMessage) (*protocol.To
 	if params.Path == "" {
 		return errorResult("path is required"), nil
 	}
-	if len(params.SectionPath) == 0 {
-		return errorResult("section_path is required"), nil
-	}
 
-	// 构建 section_path 查询参数（JSON 数组格式）
-	sectionPathJSON, _ := json.Marshal(params.SectionPath)
-	url := fmt.Sprintf("/api/workspaces/%s/documents/section?path=%s&section_path=%s",
-		r.wsState.ID(), params.Path, string(sectionPathJSON))
+	hasSection := len(params.SectionPath) > 0
+	hasStart := params.StartLine != nil
+	hasEnd := params.EndLine != nil
+
+	if hasSection && (hasStart || hasEnd) {
+		return errorResult("provide either section_path or start_line/end_line, not both"), nil
+	}
+	if hasStart != hasEnd {
+		return errorResult("start_line and end_line must be provided together"), nil
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
-	var result interface{}
-	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("failed to read section: %v", err)), nil
-	}
+	switch {
+	case hasSection:
+		// 段读：不缓存
+		// 构建 section_path 查询参数（JSON 数组格式）
+		sectionPathJSON, _ := json.Marshal(params.SectionPath)
+		url := fmt.Sprintf("/api/workspaces/%s/documents/section?path=%s&section_path=%s",
+			r.wsState.ID(), params.Path, string(sectionPathJSON))
 
-	return jsonResult(result)
-}
+		var result interface{}
+		if err := r.cli.Get(ctx, url, &result); err != nil {
+			return errorResult(fmt.Sprintf("failed to read section: %v", err)), nil
+		}
+		return jsonResult(result)
 
-func (r *Registry) documentReadLinesTool() *protocol.Tool {
-	return &protocol.Tool{
-		Name:        "document_read_lines",
-		Description: "Read a line range from a document. At most 500 lines per call.",
-		InputSchema: map[string]interface{}{
-			"type": "object",
-			"properties": map[string]interface{}{
-				"path": map[string]interface{}{
-					"type":        "string",
-					"description": "Document path",
-				},
-				"start_line": map[string]interface{}{
-					"type":        "integer",
-					"description": "Start line (1-based, inclusive)",
-				},
-				"end_line": map[string]interface{}{
-					"type":        "integer",
-					"description": "End line (inclusive)",
-				},
-			},
-			"required": []string{"path", "start_line", "end_line"},
-		},
-	}
-}
+	case hasStart:
+		start, end := *params.StartLine, *params.EndLine
+		if start < 1 {
+			return errorResult("start_line must be at least 1"), nil
+		}
+		if end < start {
+			return errorResult("end_line must not be less than start_line"), nil
+		}
+		if end-start+1 > 500 {
+			return errorResult("requested line range exceeds the 500-line limit"), nil
+		}
 
-func (r *Registry) handleDocumentReadLines(args json.RawMessage) (*protocol.ToolResult, error) {
-	if err := r.wsState.RequireActive(); err != nil {
-		return errorResult(err.Error()), nil
-	}
+		// 行读：不缓存
+		url := fmt.Sprintf("/api/workspaces/%s/documents/lines?path=%s&start=%d&end=%d",
+			r.wsState.ID(), params.Path, start, end)
 
-	var params struct {
-		Path      string `json:"path"`
-		StartLine int    `json:"start_line"`
-		EndLine   int    `json:"end_line"`
-	}
-	if err := parseArgs(args, &params); err != nil {
-		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
-	}
-	if params.Path == "" {
-		return errorResult("path is required"), nil
-	}
-	if params.StartLine < 1 {
-		return errorResult("start_line must be at least 1"), nil
-	}
-	if params.EndLine < params.StartLine {
-		return errorResult("end_line must not be less than start_line"), nil
-	}
-	if params.EndLine-params.StartLine+1 > 500 {
-		return errorResult("requested line range exceeds the 500-line limit"), nil
-	}
+		var result interface{}
+		if err := r.cli.Get(ctx, url, &result); err != nil {
+			return errorResult(fmt.Sprintf("failed to read line range: %v", err)), nil
+		}
+		return jsonResult(result)
 
-	url := fmt.Sprintf("/api/workspaces/%s/documents/lines?path=%s&start=%d&end=%d",
-		r.wsState.ID(), params.Path, params.StartLine, params.EndLine)
+	default:
+		// 全文读：走 read 缓存
+		cacheKey := cacheKey(r.wsState.ID(), "read:"+params.Path)
+		if cached, ok := r.cache.Get(cacheKey); ok {
+			return jsonResult(cached)
+		}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+		url := fmt.Sprintf("/api/workspaces/%s/documents/read?path=%s", r.wsState.ID(), params.Path)
 
-	var result interface{}
-	if err := r.cli.Get(ctx, url, &result); err != nil {
-		return errorResult(fmt.Sprintf("failed to read line range: %v", err)), nil
+		var result interface{}
+		if err := r.cli.Get(ctx, url, &result); err != nil {
+			return errorResult(fmt.Sprintf("failed to read document: %v", err)), nil
+		}
+
+		r.cache.Set(cacheKey, result)
+		return jsonResult(result)
 	}
-
-	return jsonResult(result)
 }
 
 func (r *Registry) documentHistoryTool() *protocol.Tool {
@@ -876,7 +817,7 @@ func (r *Registry) documentCreateTool() *protocol.Tool {
 				},
 				"verbose": map[string]interface{}{
 					"type":        "boolean",
-					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+					"description": "Return full content_markdown in response; default false returns metadata only.",
 				},
 			},
 			"required": []string{"path", "title", "content_markdown"},
@@ -955,15 +896,15 @@ func (r *Registry) documentReplaceTool() *protocol.Tool {
 				},
 				"expected_revision": map[string]interface{}{
 					"type":        "integer",
-					"description": "Expected current revision number (optimistic concurrency control)",
+					"description": "Optimistic concurrency token: the document's current revision_number from your last read.",
 				},
 				"expected_hash": map[string]interface{}{
 					"type":        "string",
-					"description": "Expected current content hash (optimistic concurrency control)",
+					"description": "Optimistic concurrency token: the document's current content_hash from your last read.",
 				},
 				"verbose": map[string]interface{}{
 					"type":        "boolean",
-					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+					"description": "Return full content_markdown in response; default false returns metadata only.",
 				},
 			},
 			"required": []string{"path", "title", "content_markdown", "expected_revision", "expected_hash"},
@@ -1039,7 +980,7 @@ func (r *Registry) uploadDocumentFileTool() *protocol.Tool {
 				},
 				"file_path": map[string]interface{}{
 					"type":        "string",
-					"description": "Absolute local file path on the machine running MCP; use the native path format of that operating system",
+					"description": "Absolute local file path on the machine running MCP; use the native path format",
 				},
 				"overwrite": map[string]interface{}{
 					"type":        "boolean",
@@ -1055,7 +996,7 @@ func (r *Registry) uploadDocumentFileTool() *protocol.Tool {
 				},
 				"verbose": map[string]interface{}{
 					"type":        "boolean",
-					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+					"description": "Return full content_markdown in response; default false returns metadata only.",
 				},
 			},
 			"required": []string{"path", "file_path"},
@@ -1198,15 +1139,15 @@ func (r *Registry) documentMoveTool() *protocol.Tool {
 				},
 				"expected_revision": map[string]interface{}{
 					"type":        "integer",
-					"description": "Expected current revision number",
+					"description": "Optimistic concurrency token: the document's current revision_number from your last read.",
 				},
 				"expected_hash": map[string]interface{}{
 					"type":        "string",
-					"description": "Expected current content hash",
+					"description": "Optimistic concurrency token: the document's current content_hash from your last read.",
 				},
 				"verbose": map[string]interface{}{
 					"type":        "boolean",
-					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+					"description": "Return full content_markdown in response; default false returns metadata only.",
 				},
 			},
 			"required": []string{"path", "new_path", "expected_revision", "expected_hash"},
@@ -1274,19 +1215,19 @@ func (r *Registry) documentArchiveTool() *protocol.Tool {
 				},
 				"expected_revision": map[string]interface{}{
 					"type":        "integer",
-					"description": "Expected current revision number; required unless delete is true",
+					"description": "Optimistic concurrency token: the document's current revision_number from your last read; required unless delete is true.",
 				},
 				"expected_hash": map[string]interface{}{
 					"type":        "string",
-					"description": "Expected current content hash; required unless delete is true",
+					"description": "Optimistic concurrency token: the document's current content_hash from your last read; required unless delete is true.",
 				},
 				"delete": map[string]interface{}{
 					"type":        "boolean",
-					"description": "When true, permanently delete the document instead of archiving it; requires owner permission and ignores expected_revision/expected_hash",
+					"description": "Permanently delete instead of archiving (requires owner permission); ignores expected_revision/expected_hash.",
 				},
 				"verbose": map[string]interface{}{
 					"type":        "boolean",
-					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+					"description": "Return full content_markdown in response; default false returns metadata only.",
 				},
 			},
 			"required": []string{"path"},
@@ -1369,7 +1310,7 @@ func (r *Registry) handleDocumentArchive(args json.RawMessage) (*protocol.ToolRe
 func (r *Registry) documentPatchTool() *protocol.Tool {
 	return &protocol.Tool{
 		Name:        "document_patch",
-		Description: "Patch a document locally: fetch the base revision/content, verify old_text matches exactly once, build the candidate content, compute its hash, then upload. On 409, one safe rebase is attempted.",
+		Description: "Patch a document locally: verify old_text matches exactly once, build candidate content+hash, then upload. On 409, one safe rebase is attempted.",
 		InputSchema: map[string]interface{}{
 			"type": "object",
 			"properties": map[string]interface{}{
@@ -1387,7 +1328,7 @@ func (r *Registry) documentPatchTool() *protocol.Tool {
 				},
 				"verbose": map[string]interface{}{
 					"type":        "boolean",
-					"description": "When true, include the full content_markdown in the response; defaults to false to keep the response small",
+					"description": "Return full content_markdown in response; default false returns metadata only.",
 				},
 			},
 			"required": []string{"path", "old_text", "new_text"},
@@ -1621,6 +1562,10 @@ func (r *Registry) knowledgeSearchTool() *protocol.Tool {
 					"type":        "integer",
 					"description": "Pagination offset",
 				},
+				"max_snippet_chars": map[string]interface{}{
+					"type":        "integer",
+					"description": "Maximum characters per result snippet; server generates ~200-char snippets, this truncates further client-side.",
+				},
 			},
 			"required": []string{"query"},
 		},
@@ -1633,10 +1578,11 @@ func (r *Registry) handleKnowledgeSearch(args json.RawMessage) (*protocol.ToolRe
 	}
 
 	var params struct {
-		Query  string `json:"query"`
-		Mode   string `json:"mode"`
-		Limit  int    `json:"limit"`
-		Offset int    `json:"offset"`
+		Query           string `json:"query"`
+		Mode            string `json:"mode"`
+		Limit           int    `json:"limit"`
+		Offset          int    `json:"offset"`
+		MaxSnippetChars int    `json:"max_snippet_chars"`
 	}
 	if err := parseArgs(args, &params); err != nil {
 		return errorResult(fmt.Sprintf("failed to parse arguments: %v", err)), nil
@@ -1674,7 +1620,42 @@ func (r *Registry) handleKnowledgeSearch(args json.RawMessage) (*protocol.ToolRe
 		return errorResult(fmt.Sprintf("search failed: %v", err)), nil
 	}
 
+	// max_snippet_chars>0 时对每个 result.snippet 按 rune 截断（客户端二次瘦身，属锦上添花）。
+	// 结果不是可解析对象或不含 results 数组时原样返回，不视为错误。
+	if params.MaxSnippetChars > 0 {
+		truncateSearchSnippets(result, params.MaxSnippetChars)
+	}
+
 	return jsonResult(result)
+}
+
+// truncateSearchSnippets 对 search 结果的 results[].snippet 按 rune 截断到 max 并追加 "..."。
+// 引入动机：server 生成 ~200 字符 snippet，Agent 可进一步压缩以省上下文；snippet 可能含 UTF-8 中文，
+// 故按 rune 而非字节截断，避免产生乱码。
+// 解析失败或结构不符时静默返回原值——截断是锦上添花，不应 fail。
+func truncateSearchSnippets(result interface{}, max int) {
+	obj, ok := result.(map[string]interface{})
+	if !ok {
+		return
+	}
+	results, ok := obj["results"].([]interface{})
+	if !ok {
+		return
+	}
+	for _, item := range results {
+		entry, ok := item.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		snippet, ok := entry["snippet"].(string)
+		if !ok {
+			continue
+		}
+		runes := []rune(snippet)
+		if len(runes) > max {
+			entry["snippet"] = string(runes[:max]) + "..."
+		}
+	}
 }
 
 // --- Source 工具 ---

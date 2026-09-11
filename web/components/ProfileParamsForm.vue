@@ -31,20 +31,20 @@ const form = defineModel<CreateProfileRequest>({ required: true })
     <section class="space-y-3">
       <h4 class="text-sm font-semibold text-highlighted">{{ t('admin.groupEmbedding') }}</h4>
       <div class="grid grid-cols-2 gap-3">
-        <UFormField :label="t('admin.embeddingProvider')">
+        <UFormField :label="t('admin.embeddingProvider')" name="embedding_provider">
           <UInput v-model="form.embedding_provider" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.embeddingModel')">
+        <UFormField :label="t('admin.embeddingModel')" name="embedding_model">
           <UInput v-model="form.embedding_model" class="w-full" />
         </UFormField>
       </div>
-      <UFormField :label="t('admin.dimensions')">
+      <UFormField :label="t('admin.dimensions')" name="embedding_dimensions">
         <UInput v-model.number="form.embedding_dimensions" type="number" class="w-full" />
       </UFormField>
-      <UFormField :label="t('admin.embeddingQueryInstruction')">
+      <UFormField :label="t('admin.embeddingQueryInstruction')" name="embedding_query_instruction">
         <UTextarea v-model="form.embedding_query_instruction" :rows="2" class="w-full" />
       </UFormField>
-      <UFormField :label="t('admin.embeddingDocumentInstruction')">
+      <UFormField :label="t('admin.embeddingDocumentInstruction')" name="embedding_document_instruction">
         <UTextarea v-model="form.embedding_document_instruction" :rows="2" class="w-full" />
       </UFormField>
     </section>
@@ -53,10 +53,10 @@ const form = defineModel<CreateProfileRequest>({ required: true })
     <section class="space-y-3">
       <h4 class="text-sm font-semibold text-highlighted">{{ t('admin.groupChunk') }}</h4>
       <div class="grid grid-cols-2 gap-3">
-        <UFormField :label="t('admin.chunkTargetSize')">
+        <UFormField :label="t('admin.chunkTargetSize')" name="chunk_target_size">
           <UInput v-model.number="form.chunk_target_size" type="number" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.chunkOverlap')">
+        <UFormField :label="t('admin.chunkOverlap')" name="chunk_overlap">
           <UInput v-model.number="form.chunk_overlap" type="number" class="w-full" />
         </UFormField>
       </div>
@@ -66,25 +66,25 @@ const form = defineModel<CreateProfileRequest>({ required: true })
     <section class="space-y-3">
       <h4 class="text-sm font-semibold text-highlighted">{{ t('admin.groupLexicalBoosts') }}</h4>
       <div class="grid grid-cols-3 gap-3">
-        <UFormField :label="t('admin.titleBoost')">
+        <UFormField :label="t('admin.titleBoost')" name="title_boost">
           <UInput v-model.number="form.title_boost" type="number" step="0.1" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.headingBoost')">
+        <UFormField :label="t('admin.headingBoost')" name="heading_boost">
           <UInput v-model.number="form.heading_boost" type="number" step="0.1" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.pathBoost')">
+        <UFormField :label="t('admin.pathBoost')" name="path_boost">
           <UInput v-model.number="form.path_boost" type="number" step="0.1" class="w-full" />
         </UFormField>
       </div>
       <div class="grid grid-cols-3 gap-3">
-        <UFormField :label="t('admin.tagsBoost')">
+        <UFormField :label="t('admin.tagsBoost')" name="tags_boost">
           <UInput v-model.number="form.tags_boost" type="number" step="0.1" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.bodyBoost')">
+        <UFormField :label="t('admin.bodyBoost')" name="body_boost">
           <UInput v-model.number="form.body_boost" type="number" step="0.1" class="w-full" />
         </UFormField>
         <!-- 分词器名为 Elasticsearch analyzer 标识（后端不做白名单校验），因此用自由文本而非固定下拉 -->
-        <UFormField :label="t('admin.analyzer')">
+        <UFormField :label="t('admin.analyzer')" name="analyzer">
           <UInput v-model="form.analyzer" placeholder="standard" class="w-full" />
         </UFormField>
       </div>
@@ -94,13 +94,13 @@ const form = defineModel<CreateProfileRequest>({ required: true })
     <section class="space-y-3">
       <h4 class="text-sm font-semibold text-highlighted">{{ t('admin.groupRetrieval') }}</h4>
       <div class="grid grid-cols-3 gap-3">
-        <UFormField :label="t('admin.lexicalTopK')">
+        <UFormField :label="t('admin.lexicalTopK')" name="lexical_top_k">
           <UInput v-model.number="form.lexical_top_k" type="number" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.vectorTopK')">
+        <UFormField :label="t('admin.vectorTopK')" name="vector_top_k">
           <UInput v-model.number="form.vector_top_k" type="number" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.rrfK')">
+        <UFormField :label="t('admin.rrfK')" name="rrf_k">
           <UInput v-model.number="form.rrf_k" type="number" class="w-full" />
         </UFormField>
       </div>
@@ -110,18 +110,18 @@ const form = defineModel<CreateProfileRequest>({ required: true })
     <section class="space-y-3">
       <h4 class="text-sm font-semibold text-highlighted">{{ t('admin.groupReranker') }}</h4>
       <div class="grid grid-cols-2 gap-3">
-        <UFormField :label="t('admin.rerankerProvider')">
+        <UFormField :label="t('admin.rerankerProvider')" name="reranker_provider">
           <UInput v-model="form.reranker_provider" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.rerankerModel')">
+        <UFormField :label="t('admin.rerankerModel')" name="reranker_model">
           <UInput v-model="form.reranker_model" class="w-full" />
         </UFormField>
       </div>
       <div class="grid grid-cols-2 gap-3">
-        <UFormField :label="t('admin.rerankerCandidateCount')">
+        <UFormField :label="t('admin.rerankerCandidateCount')" name="reranker_candidate_count">
           <UInput v-model.number="form.reranker_candidate_count" type="number" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.rerankerFinalCount')">
+        <UFormField :label="t('admin.rerankerFinalCount')" name="reranker_final_count">
           <UInput v-model.number="form.reranker_final_count" type="number" class="w-full" />
         </UFormField>
       </div>
@@ -131,10 +131,10 @@ const form = defineModel<CreateProfileRequest>({ required: true })
     <section class="space-y-3">
       <h4 class="text-sm font-semibold text-highlighted">{{ t('admin.groupDiversification') }}</h4>
       <div class="grid grid-cols-2 gap-3">
-        <UFormField :label="t('admin.maxChunksPerDocument')">
+        <UFormField :label="t('admin.maxChunksPerDocument')" name="max_chunks_per_document">
           <UInput v-model.number="form.max_chunks_per_document" type="number" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.mergeAdjacentChunks')">
+        <UFormField :label="t('admin.mergeAdjacentChunks')" name="merge_adjacent_chunks">
           <USwitch v-model="form.merge_adjacent_chunks" />
         </UFormField>
       </div>
@@ -144,10 +144,10 @@ const form = defineModel<CreateProfileRequest>({ required: true })
     <section class="space-y-3">
       <h4 class="text-sm font-semibold text-highlighted">{{ t('admin.groupBudget') }}</h4>
       <div class="grid grid-cols-2 gap-3">
-        <UFormField :label="t('admin.maxP95LatencyMs')">
+        <UFormField :label="t('admin.maxP95LatencyMs')" name="max_p95_latency_ms">
           <UInput v-model.number="form.max_p95_latency_ms" type="number" class="w-full" />
         </UFormField>
-        <UFormField :label="t('admin.maxRerankerCostPerQuery')">
+        <UFormField :label="t('admin.maxRerankerCostPerQuery')" name="max_reranker_cost_per_query">
           <UInput v-model.number="form.max_reranker_cost_per_query" type="number" step="0.001" class="w-full" />
         </UFormField>
       </div>

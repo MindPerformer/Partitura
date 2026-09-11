@@ -2,7 +2,10 @@
 //
 // 引入动机：design/04-WEB-API.md §Concurrency 要求 409 显示明确冲突界面/操作，
 // 不得 silent overwrite。
-// 当编辑保存返回 409 时，显示冲突对话框，提供"重新加载"和"强制覆盖"选项。
+// 当编辑保存返回 409 时，显示冲突对话框，提供三种处理路径：
+//   1. 重新加载 —— 拉取最新版本覆盖本地，明确警告将丢弃未保存修改；
+//   2. 强制覆盖 —— 以本地内容为基准，先重新 read 获取最新 revision/hash 后再 replace；
+//   3. 取消 —— 保留本地草稿，关闭对话框由用户自行决定后续。
 -->
 <script setup lang="ts">
 const props = defineProps<{
@@ -12,6 +15,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   reload: []
+  force: []
   cancel: []
   'update:open': [value: boolean]
 }>()
@@ -26,6 +30,10 @@ const isOpen = computed({
 
 function handleReload() {
   emit('reload')
+}
+
+function handleForce() {
+  emit('force')
 }
 
 function handleCancel() {
@@ -46,10 +54,14 @@ function handleCancel() {
             </p>
           </div>
         </div>
-        <div class="flex justify-end gap-2 mt-6">
-          <UButton color="neutral" variant="ghost" @click="handleCancel">{{ t('common.cancel') }}</UButton>
-          <UButton color="primary" @click="handleReload">{{ t('errors.reloadLatest') }}</UButton>
+        <div class="flex flex-col sm:flex-row justify-end gap-2 mt-6">
+          <UButton color="neutral" variant="ghost" @click="handleCancel">{{ t('errors.conflictCancel') }}</UButton>
+          <UButton color="error" variant="outline" @click="handleForce">{{ t('errors.conflictForce') }}</UButton>
+          <UButton color="primary" @click="handleReload">{{ t('errors.conflictReload') }}</UButton>
         </div>
+        <p class="mt-3 text-xs text-muted">
+          {{ t('errors.conflictHint') }}
+        </p>
       </div>
     </template>
   </UModal>

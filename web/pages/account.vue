@@ -116,9 +116,9 @@ useHead({ title: () => t('account.title') + ' · ' + t('common.appName') })
 </script>
 
 <template>
+  <!-- 顶栏与 <main id="main-content"> 地标由 layouts/default.vue 统一提供 -->
   <div class="min-h-screen bg-default">
-    <AppHeader />
-    <main class="mx-auto max-w-3xl px-4 py-8 sm:px-6">
+    <div class="mx-auto max-w-4xl px-4 py-8 sm:px-6">
       <h1 class="mb-6 text-2xl font-bold text-highlighted">{{ t('account.title') }}</h1>
 
       <div v-if="loading" class="flex justify-center py-12">
@@ -187,6 +187,6 @@ useHead({ title: () => t('account.title') + ' · ' + t('common.appName') })
           </form>
         </UCard>
       </template>
-    </main>
+    </div>
   </div>
 </template>

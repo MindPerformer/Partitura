@@ -31,6 +31,7 @@ definePageMeta({
 
 const { t } = useI18n()
 const { isSystemAdmin } = useAuth()
+const { formatDate } = useFormatDate()
 
 // 加载状态
 const loading = ref(false)
@@ -71,6 +72,70 @@ const rrSaveError = ref<string | null>(null)
 const rrSaveSuccess = ref<string | null>(null)
 const rrTestResult = ref<TestProviderResponse | null>(null)
 
+// ============================================================
+// 字段级校验
+//
+// 引入动机：保存/测试前在客户端做类型化校验，非法值给字段级错误、不发出请求。
+// 字段错误以 Record<fieldName, message> 挂在各自表单下，绑定到 UFormField 的 error prop。
+// ============================================================
+
+/** 判断 base_url 是否为合法的 http(s) URL（非空、可解析、协议合法） */
+function isValidBaseUrl(value: string): boolean {
+  if (!value || !value.trim()) return false
+  try {
+    const u = new URL(value)
+    return u.protocol === 'http:' || u.protocol === 'https:'
+  } catch {
+    return false
+  }
+}
+
+function isPositiveInt(n: unknown): boolean {
+  return typeof n === 'number' && Number.isInteger(n) && n > 0
+}
+
+/** 校验 Embedding 表单，返回字段级错误 map；空 map 表示通过。 */
+function validateEmbedding(): Record<string, string> {
+  const errs: Record<string, string> = {}
+  if (!isValidBaseUrl(embConfig.value.base_url)) {
+    errs.base_url = t('admin.providerBaseUrlRequired')
+  }
+  if (!embConfig.value.model || !embConfig.value.model.trim()) {
+    errs.model = t('admin.providerModelRequired')
+  }
+  if (!isPositiveInt(embConfig.value.dimensions)) {
+    errs.dimensions = t('admin.providerDimensionsRequired')
+  }
+  if (!isPositiveInt(embConfig.value.timeout_seconds)) {
+    errs.timeout_seconds = t('admin.providerTimeoutRequired')
+  }
+  if (!isPositiveInt(embConfig.value.batch_size)) {
+    errs.batch_size = t('admin.providerBatchSizeRequired')
+  }
+  return errs
+}
+
+/** 校验 Reranker 表单，返回字段级错误 map；空 map 表示通过。 */
+function validateReranker(): Record<string, string> {
+  const errs: Record<string, string> = {}
+  if (!isValidBaseUrl(rrConfig.value.base_url)) {
+    errs.base_url = t('admin.providerBaseUrlRequired')
+  }
+  if (!rrConfig.value.model || !rrConfig.value.model.trim()) {
+    errs.model = t('admin.providerModelRequired')
+  }
+  if (!isPositiveInt(rrConfig.value.timeout_seconds)) {
+    errs.timeout_seconds = t('admin.providerTimeoutRequired')
+  }
+  if (!isPositiveInt(rrConfig.value.max_candidates)) {
+    errs.max_candidates = t('admin.providerMaxCandidatesRequired')
+  }
+  return errs
+}
+
+const embFieldErrors = ref<Record<string, string>>({})
+const rrFieldErrors = ref<Record<string, string>>({})
+
 useHead({ title: () => t('admin.providers') + ' · ' + t('common.appName') })
 
 async function loadProviders() {
@@ -108,6 +173,12 @@ async function saveEmbedding() {
   embSaveError.value = null
   embSaveSuccess.value = null
 
+  const errs = validateEmbedding()
+  embFieldErrors.value = errs
+  if (Object.keys(errs).length > 0) {
+    embSaveError.value = t('admin.providerConfigRequired')
+    return
+  }
   if (!embApiKey.value) {
     embSaveError.value = t('admin.providerApiKeyRequired')
     return
@@ -142,6 +213,12 @@ async function testEmbedding() {
   embSaveError.value = null
   embSaveSuccess.value = null
 
+  const errs = validateEmbedding()
+  embFieldErrors.value = errs
+  if (Object.keys(errs).length > 0) {
+    embSaveError.value = t('admin.providerConfigRequired')
+    return
+  }
   if (!embApiKey.value) {
     embSaveError.value = t('admin.providerApiKeyRequired')
     return
@@ -171,6 +248,12 @@ async function saveReranker() {
   rrSaveError.value = null
   rrSaveSuccess.value = null
 
+  const errs = validateReranker()
+  rrFieldErrors.value = errs
+  if (Object.keys(errs).length > 0) {
+    rrSaveError.value = t('admin.providerConfigRequired')
+    return
+  }
   if (!rrApiKey.value) {
     rrSaveError.value = t('admin.providerApiKeyRequired')
     return
@@ -204,6 +287,12 @@ async function testReranker() {
   rrSaveError.value = null
   rrSaveSuccess.value = null
 
+  const errs = validateReranker()
+  rrFieldErrors.value = errs
+  if (Object.keys(errs).length > 0) {
+    rrSaveError.value = t('admin.providerConfigRequired')
+    return
+  }
   if (!rrApiKey.value) {
     rrSaveError.value = t('admin.providerApiKeyRequired')
     return
@@ -231,16 +320,25 @@ async function testReranker() {
 </script>
 
 <template>
-  <div class="max-w-4xl mx-auto px-4 py-8">
+  <div>
+    <!-- 顶栏由 layouts/default.vue 统一注入 -->
+    <div class="max-w-6xl mx-auto px-4 py-8">
     <div class="mb-6">
       <h1 class="text-2xl font-bold text-highlighted">{{ t('admin.providers') }}</h1>
       <p class="text-sm text-muted mt-1">{{ t('admin.providersDesc') }}</p>
     </div>
 
+    <EmptyState
+      v-if="!isSystemAdmin"
+      icon="i-lucide-lock"
+      :title="t('admin.systemAdminRequired')"
+    />
+
     <!-- 加载中 -->
-    <div v-if="loading" class="flex items-center justify-center py-12">
-      <UIcon name="i-lucide-loader-2" class="w-6 h-6 animate-spin text-primary" />
+    <div v-else-if="loading" class="flex items-center justify-center py-12" role="status">
+      <UIcon name="i-lucide-loader-2" aria-hidden="true" class="w-6 h-6 animate-spin text-primary" />
       <span class="ml-2 text-muted">{{ t('common.loading') }}</span>
+      <span class="sr-only">{{ t('common.loading') }}</span>
     </div>
 
     <!-- 加载错误 -->
@@ -295,7 +393,7 @@ async function testReranker() {
         </template>
 
         <form @submit.prevent="saveEmbedding" class="space-y-4">
-          <UFormField :label="t('admin.apiKey')" :hint="t('admin.apiKeyHint')">
+          <UFormField :label="t('admin.apiKey')" :hint="t('admin.apiKeyHint')" name="emb_api_key">
             <UInput
               v-model="embApiKey"
               :placeholder="t('admin.apiKeyPlaceholder')"
@@ -305,7 +403,7 @@ async function testReranker() {
             />
           </UFormField>
 
-          <UFormField :label="t('admin.baseUrl')">
+          <UFormField :label="t('admin.baseUrl')" name="emb_base_url" :error="embFieldErrors.base_url">
             <UInput
               v-model="embConfig.base_url"
               :placeholder="t('admin.baseUrlPlaceholder')"
@@ -314,7 +412,7 @@ async function testReranker() {
           </UFormField>
 
           <div class="grid grid-cols-2 gap-4">
-            <UFormField :label="t('admin.model')">
+            <UFormField :label="t('admin.model')" name="emb_model" :error="embFieldErrors.model">
               <UInput
                 v-model="embConfig.model"
                 :placeholder="t('admin.modelPlaceholder')"
@@ -322,7 +420,7 @@ async function testReranker() {
               />
             </UFormField>
 
-            <UFormField :label="t('admin.dimensions')">
+            <UFormField :label="t('admin.dimensions')" name="emb_dimensions" :error="embFieldErrors.dimensions">
               <UInput
                 v-model.number="embConfig.dimensions"
                 type="number"
@@ -333,7 +431,7 @@ async function testReranker() {
           </div>
 
           <div class="grid grid-cols-3 gap-4">
-            <UFormField :label="t('admin.timeoutSeconds')">
+            <UFormField :label="t('admin.timeoutSeconds')" name="emb_timeout_seconds" :error="embFieldErrors.timeout_seconds">
               <UInput
                 v-model.number="embConfig.timeout_seconds"
                 type="number"
@@ -342,7 +440,7 @@ async function testReranker() {
               />
             </UFormField>
 
-            <UFormField :label="t('admin.batchSize')">
+            <UFormField :label="t('admin.batchSize')" name="emb_batch_size" :error="embFieldErrors.batch_size">
               <UInput
                 v-model.number="embConfig.batch_size"
                 type="number"
@@ -351,27 +449,25 @@ async function testReranker() {
               />
             </UFormField>
 
-            <UFormField :label="t('admin.lastUpdated')">
+            <UFormField :label="t('admin.lastUpdated')" name="emb_last_updated">
               <div v-if="embeddingStatus?.updated_at" class="text-sm text-muted py-2">
-                {{ embeddingStatus.updated_at }}
+                {{ formatDate(embeddingStatus.updated_at) }}
               </div>
               <div v-else class="text-sm text-muted py-2">—</div>
             </UFormField>
           </div>
 
           <div class="grid grid-cols-2 gap-4">
-            <UFormField :label="t('admin.queryInstruction')">
+            <UFormField :label="t('admin.queryInstruction')" :hint="t('common.optional')" name="emb_query_instruction">
               <UInput
                 v-model="embConfig.query_instruction"
-                :placeholder="'（可选）'"
                 class="w-full"
               />
             </UFormField>
 
-            <UFormField :label="t('admin.documentInstruction')">
+            <UFormField :label="t('admin.documentInstruction')" :hint="t('common.optional')" name="emb_document_instruction">
               <UInput
                 v-model="embConfig.document_instruction"
-                :placeholder="'（可选）'"
                 class="w-full"
               />
             </UFormField>
@@ -396,7 +492,7 @@ async function testReranker() {
             v-if="embTestResult"
             :color="embTestResult.status === 'ok' ? 'success' : embTestResult.status === 'unavailable' ? 'warning' : 'error'"
             variant="soft"
-            :title="embTestResult.message || (embTestResult.status === 'ok' ? t('admin.testSuccess') : t('admin.testFailed'))"
+            :title="embTestResult.message || (embTestResult.status === 'ok' ? t('admin.testSuccess') : embTestResult.status === 'unavailable' ? t('admin.testUnavailable') : t('admin.testFailed'))"
             :icon="embTestResult.status === 'ok' ? 'i-lucide-check-circle' : 'i-lucide-alert-circle'"
           />
 
@@ -463,7 +559,7 @@ async function testReranker() {
         </template>
 
         <form @submit.prevent="saveReranker" class="space-y-4">
-          <UFormField :label="t('admin.apiKey')" :hint="t('admin.apiKeyHint')">
+          <UFormField :label="t('admin.apiKey')" :hint="t('admin.apiKeyHint')" name="rr_api_key">
             <UInput
               v-model="rrApiKey"
               :placeholder="t('admin.apiKeyPlaceholder')"
@@ -473,7 +569,7 @@ async function testReranker() {
             />
           </UFormField>
 
-          <UFormField :label="t('admin.baseUrl')">
+          <UFormField :label="t('admin.baseUrl')" name="rr_base_url" :error="rrFieldErrors.base_url">
             <UInput
               v-model="rrConfig.base_url"
               :placeholder="t('admin.baseUrlPlaceholder')"
@@ -482,7 +578,7 @@ async function testReranker() {
           </UFormField>
 
           <div class="grid grid-cols-2 gap-4">
-            <UFormField :label="t('admin.model')">
+            <UFormField :label="t('admin.model')" name="rr_model" :error="rrFieldErrors.model">
               <UInput
                 v-model="rrConfig.model"
                 :placeholder="t('admin.modelPlaceholder')"
@@ -490,16 +586,16 @@ async function testReranker() {
               />
             </UFormField>
 
-            <UFormField :label="t('admin.lastUpdated')">
+            <UFormField :label="t('admin.lastUpdated')" name="rr_last_updated">
               <div v-if="rerankerStatus?.updated_at" class="text-sm text-muted py-2">
-                {{ rerankerStatus.updated_at }}
+                {{ formatDate(rerankerStatus.updated_at) }}
               </div>
               <div v-else class="text-sm text-muted py-2">—</div>
             </UFormField>
           </div>
 
           <div class="grid grid-cols-2 gap-4">
-            <UFormField :label="t('admin.timeoutSeconds')">
+            <UFormField :label="t('admin.timeoutSeconds')" name="rr_timeout_seconds" :error="rrFieldErrors.timeout_seconds">
               <UInput
                 v-model.number="rrConfig.timeout_seconds"
                 type="number"
@@ -508,7 +604,7 @@ async function testReranker() {
               />
             </UFormField>
 
-            <UFormField :label="t('admin.maxCandidates')">
+            <UFormField :label="t('admin.maxCandidates')" name="rr_max_candidates" :error="rrFieldErrors.max_candidates">
               <UInput
                 v-model.number="rrConfig.max_candidates"
                 type="number"
@@ -537,7 +633,7 @@ async function testReranker() {
             v-if="rrTestResult"
             :color="rrTestResult.status === 'ok' ? 'success' : rrTestResult.status === 'unavailable' ? 'warning' : 'error'"
             variant="soft"
-            :title="rrTestResult.message || (rrTestResult.status === 'ok' ? t('admin.testSuccess') : t('admin.testFailed'))"
+            :title="rrTestResult.message || (rrTestResult.status === 'ok' ? t('admin.testSuccess') : rrTestResult.status === 'unavailable' ? t('admin.testUnavailable') : t('admin.testFailed'))"
             :icon="rrTestResult.status === 'ok' ? 'i-lucide-check-circle' : 'i-lucide-alert-circle'"
           />
 
@@ -561,6 +657,7 @@ async function testReranker() {
           </div>
         </form>
       </UCard>
+    </div>
     </div>
   </div>
 </template>

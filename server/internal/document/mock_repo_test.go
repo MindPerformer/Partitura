@@ -106,6 +106,9 @@ func (m *MockRepository) CreateDocument(ctx context.Context, workspaceID, path, 
 		IsSpecial:       isSpecial,
 		CreatedBy:       createdBy,
 		UpdatedBy:       createdBy,
+		// mock 语义：测试用户 ID 即 username，使 handler 断言新字段非空且等于操作者。
+		CreatedByUsername: createdBy,
+		UpdatedByUsername: createdBy,
 		CreatedAt:       "2025-01-01T00:00:00+00:00",
 		UpdatedAt:       "2025-01-01T00:00:00+00:00",
 	}
@@ -124,6 +127,7 @@ func (m *MockRepository) CreateDocument(ctx context.Context, workspaceID, path, 
 		ContentHash:     contentHash,
 		Status:          StatusActive,
 		CreatedBy:       createdBy,
+		CreatedByUsername: createdBy,
 		CreatedAt:       "2025-01-01T00:00:00+00:00",
 	}
 	m.revisions[revKey(workspaceID, docID)] = append(m.revisions[revKey(workspaceID, docID)], rev)
@@ -217,6 +221,7 @@ func (m *MockRepository) ReplaceDocumentFull(ctx context.Context, workspaceID, p
 	doc.Type = newType
 	doc.RevisionNumber = newRevision
 	doc.UpdatedBy = updatedBy
+	doc.UpdatedByUsername = updatedBy
 
 	// 写入恰好一条 revision
 	m.revisionCounter++
@@ -231,6 +236,7 @@ func (m *MockRepository) ReplaceDocumentFull(ctx context.Context, workspaceID, p
 		ContentHash:     newHash,
 		Status:          doc.Status,
 		CreatedBy:       updatedBy,
+		CreatedByUsername: updatedBy,
 		CreatedAt:       "2025-01-01T00:00:00+00:00",
 	}
 	m.revisions[revKey(workspaceID, doc.ID)] = append(m.revisions[revKey(workspaceID, doc.ID)], rev)
@@ -257,6 +263,7 @@ func (m *MockRepository) UpdateDocumentContent(ctx context.Context, workspaceID,
 	doc.ContentHash = newHash
 	doc.RevisionNumber = newRevision
 	doc.UpdatedBy = updatedBy
+	doc.UpdatedByUsername = updatedBy
 
 	m.revisionCounter++
 	rev := Revision{
@@ -270,6 +277,7 @@ func (m *MockRepository) UpdateDocumentContent(ctx context.Context, workspaceID,
 		ContentHash:     newHash,
 		Status:          doc.Status,
 		CreatedBy:       updatedBy,
+		CreatedByUsername: updatedBy,
 		CreatedAt:       "2025-01-01T00:00:00+00:00",
 	}
 	m.revisions[revKey(workspaceID, doc.ID)] = append(m.revisions[revKey(workspaceID, doc.ID)], rev)
@@ -296,6 +304,7 @@ func (m *MockRepository) UpdateDocumentMetadata(ctx context.Context, workspaceID
 	doc.Type = newType
 	doc.RevisionNumber = newRevision
 	doc.UpdatedBy = updatedBy
+	doc.UpdatedByUsername = updatedBy
 
 	m.revisionCounter++
 	rev := Revision{
@@ -309,6 +318,7 @@ func (m *MockRepository) UpdateDocumentMetadata(ctx context.Context, workspaceID
 		ContentHash:     doc.ContentHash,
 		Status:          doc.Status,
 		CreatedBy:       updatedBy,
+		CreatedByUsername: updatedBy,
 		CreatedAt:       "2025-01-01T00:00:00+00:00",
 	}
 	m.revisions[revKey(workspaceID, doc.ID)] = append(m.revisions[revKey(workspaceID, doc.ID)], rev)
@@ -341,6 +351,7 @@ func (m *MockRepository) MoveDocument(ctx context.Context, workspaceID, oldPath,
 	doc.Path = newPath
 	doc.RevisionNumber = newRevision
 	doc.UpdatedBy = updatedBy
+	doc.UpdatedByUsername = updatedBy
 	m.docs[newK] = doc
 
 	m.revisionCounter++
@@ -355,6 +366,7 @@ func (m *MockRepository) MoveDocument(ctx context.Context, workspaceID, oldPath,
 		ContentHash:     doc.ContentHash,
 		Status:          doc.Status,
 		CreatedBy:       updatedBy,
+		CreatedByUsername: updatedBy,
 		CreatedAt:       "2025-01-01T00:00:00+00:00",
 	}
 	m.revisions[revKey(workspaceID, doc.ID)] = append(m.revisions[revKey(workspaceID, doc.ID)], rev)
@@ -397,6 +409,7 @@ func (m *MockRepository) mockChangeStatus(ctx context.Context, workspaceID, path
 	doc.Status = newStatus
 	doc.RevisionNumber = newRevision
 	doc.UpdatedBy = updatedBy
+	doc.UpdatedByUsername = updatedBy
 
 	m.revisionCounter++
 	rev := Revision{
@@ -410,6 +423,7 @@ func (m *MockRepository) mockChangeStatus(ctx context.Context, workspaceID, path
 		ContentHash:     doc.ContentHash,
 		Status:          newStatus,
 		CreatedBy:       updatedBy,
+		CreatedByUsername: updatedBy,
 		CreatedAt:       "2025-01-01T00:00:00+00:00",
 	}
 	m.revisions[revKey(workspaceID, doc.ID)] = append(m.revisions[revKey(workspaceID, doc.ID)], rev)
@@ -489,6 +503,7 @@ func (m *MockRepository) AddSource(ctx context.Context, workspaceID, documentID,
 		RefreshIntervalDays: refreshIntervalDays,
 		SourceDocumentID:    sourceDocumentID,
 		CreatedBy:           createdBy,
+		CreatedByUsername:   createdBy,
 		CreatedAt:           "2025-01-01T00:00:00+00:00",
 	}
 	m.sources[srcKey(workspaceID, documentID)] = append(m.sources[srcKey(workspaceID, documentID)], src)

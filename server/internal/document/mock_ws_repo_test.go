@@ -10,6 +10,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 
 	"partitura/server/internal/workspace"
@@ -294,11 +295,22 @@ func (m *LocalWSMockRepository) ListMemberCandidates(ctx context.Context, worksp
 }
 
 // ListAllWorkspaces 查询全部 workspace。
-func (m *LocalWSMockRepository) ListAllWorkspaces(ctx context.Context, limit, offset int) (*workspace.ListWorkspacesResult, error) {
+// 引入动机：接口签名含可选筛选条件，mock 复现同一过滤语义以适配签名。
+func (m *LocalWSMockRepository) ListAllWorkspaces(ctx context.Context, filter workspace.AdminWorkspaceFilter, limit, offset int) (*workspace.ListWorkspacesResult, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	var all []workspace.Workspace
 	for _, ws := range m.workspaces {
+		if filter.Status != "" && ws.Status != filter.Status {
+			continue
+		}
+		if filter.Query != "" {
+			lower := strings.ToLower(filter.Query)
+			if !strings.Contains(strings.ToLower(ws.Name), lower) &&
+				!strings.Contains(strings.ToLower(ws.DisplayName), lower) {
+				continue
+			}
+		}
 		all = append(all, *ws)
 	}
 	total := len(all)
@@ -318,7 +330,8 @@ func (m *LocalWSMockRepository) ListAllUsers(ctx context.Context, limit, offset 
 }
 
 // ListAllUsersWithSystemInfo 查询全部用户（含系统信息）。
-func (m *LocalWSMockRepository) ListAllUsersWithSystemInfo(ctx context.Context, limit, offset int) (*workspace.ListAdminUsersResult, error) {
+// 引入动机：接口签名含可选筛选条件，本 mock 返回空集，仅需适配签名。
+func (m *LocalWSMockRepository) ListAllUsersWithSystemInfo(ctx context.Context, filter workspace.AdminUserFilter, limit, offset int) (*workspace.ListAdminUsersResult, error) {
 	return &workspace.ListAdminUsersResult{Total: 0}, nil
 }
 

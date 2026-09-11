@@ -150,6 +150,9 @@ func resetDB(ctx context.Context, conn *sql.Conn) {
 		_, _ = conn.ExecContext(ctx, fmt.Sprintf("DROP TABLE IF EXISTS %s CASCADE", table))
 	}
 	_, _ = conn.ExecContext(ctx, `DROP EXTENSION IF EXISTS "pgcrypto"`)
+	// pg_trgm 由 M011 引入：reset 时表已先 DROP（索引随表删除），
+	// 此处不带 CASCADE 的 DROP EXTENSION 可安全清理扩展本身，保证干净起始状态。
+	_, _ = conn.ExecContext(ctx, `DROP EXTENSION IF EXISTS pg_trgm`)
 }
 
 // releaseLockAndCloseConn 在专用连接上释放 advisory lock，然后关闭连接和连接池。

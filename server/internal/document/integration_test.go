@@ -766,7 +766,7 @@ func TestIntegration_AuditLog(t *testing.T) {
 	}
 
 	// 查询审计日志
-	result, err := auditRepo.List(ctx, 100, 0)
+	result, err := auditRepo.List(ctx, audit.ListFilter{}, 100, 0)
 	if err != nil {
 		t.Fatalf("List 失败: %v", err)
 	}

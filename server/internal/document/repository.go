@@ -214,15 +214,23 @@ func (r *PGRepository) CreateDocument(ctx context.Context, workspaceID, path, ti
 
 	var doc Document
 	err = tx.QueryRowContext(ctx,
-		`INSERT INTO documents (workspace_id, path, title, type, content_markdown, content_hash, revision_number, is_special, created_by, updated_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $8)
-		 RETURNING id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		`WITH ins AS (
+			INSERT INTO documents (workspace_id, path, title, type, content_markdown, content_hash, revision_number, is_special, created_by, updated_by)
+			VALUES ($1, $2, $3, $4, $5, $6, 1, $7, $8, $8)
+			RETURNING *
+		)
+		SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		       COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		       to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM ins d
+		LEFT JOIN users cu ON cu.id = d.created_by
+		LEFT JOIN users uu ON uu.id = d.updated_by`,
 		workspaceID, path, title, docTypeVal, contentMarkdown, contentHash, isSpecial, createdBy,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "创建文档")
@@ -256,14 +264,19 @@ func (r *PGRepository) CreateDocument(ctx context.Context, workspaceID, path, ti
 func (r *PGRepository) GetDocumentByPath(ctx context.Context, workspaceID, path string) (*Document, error) {
 	var doc Document
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE workspace_id = $1 AND path = $2`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE d.workspace_id = $1 AND d.path = $2`,
 		workspaceID, path,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "根据路径查询文档")
@@ -275,14 +288,19 @@ func (r *PGRepository) GetDocumentByPath(ctx context.Context, workspaceID, path 
 func (r *PGRepository) GetDocumentByID(ctx context.Context, workspaceID, documentID string) (*Document, error) {
 	var doc Document
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE workspace_id = $1 AND id = $2`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE d.workspace_id = $1 AND d.id = $2`,
 		workspaceID, documentID,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "根据 ID 查询文档")
@@ -292,21 +310,21 @@ func (r *PGRepository) GetDocumentByID(ctx context.Context, workspaceID, documen
 
 // ListDocuments 查询指定 workspace 的文档列表（分页），可按 status/type 过滤。
 func (r *PGRepository) ListDocuments(ctx context.Context, workspaceID, statusFilter, typeFilter string, includeArchived bool, limit, offset int) (*ListDocumentsResult, error) {
-	// 构建动态 WHERE 条件
-	conditions := []string{"workspace_id = $1"}
+	// 构建动态 WHERE 条件（列限定到 documents 别名 d，与下方 JOIN users 兼容）
+	conditions := []string{"d.workspace_id = $1"}
 	args := []interface{}{workspaceID}
 	argIdx := 2
 
 	if !includeArchived {
-		conditions = append(conditions, "status != 'archived'")
+		conditions = append(conditions, "d.status != 'archived'")
 	}
 	if statusFilter != "" {
-		conditions = append(conditions, fmt.Sprintf("status = $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf("d.status = $%d", argIdx))
 		args = append(args, statusFilter)
 		argIdx++
 	}
 	if typeFilter != "" {
-		conditions = append(conditions, fmt.Sprintf("type = $%d", argIdx))
+		conditions = append(conditions, fmt.Sprintf("d.type = $%d", argIdx))
 		args = append(args, typeFilter)
 		argIdx++
 	}
@@ -314,7 +332,7 @@ func (r *PGRepository) ListDocuments(ctx context.Context, workspaceID, statusFil
 	whereClause := strings.Join(conditions, " AND ")
 
 	// 查询总数
-	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM documents WHERE %s", whereClause)
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM documents d WHERE %s", whereClause)
 	var total int
 	err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
 	if err != nil {
@@ -324,10 +342,16 @@ func (r *PGRepository) ListDocuments(ctx context.Context, workspaceID, statusFil
 	// 查询分页数据
 	// 引入动机：list API 不返回全文，减少响应体积和数据库 I/O。
 	// 不 SELECT content_markdown 列，避免加载大字段。
+	// LEFT JOIN users 解析 created_by/updated_by → username：LEFT JOIN 不改变行数，
+	// created_by/updated_by 为 NULL 或 users 行已删时 username 为空串。
 	listQuery := fmt.Sprintf(
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE %s ORDER BY path ASC LIMIT $%d OFFSET $%d`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE %s ORDER BY d.path ASC LIMIT $%d OFFSET $%d`,
 		whereClause, argIdx, argIdx+1,
 	)
 	args = append(args, limit, offset)
@@ -344,7 +368,8 @@ func (r *PGRepository) ListDocuments(ctx context.Context, workspaceID, statusFil
 		if err := rows.Scan(
 			&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 			&doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-			&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+			&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+			&doc.CreatedAt, &doc.UpdatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描文档行: %w", err)
 		}
@@ -374,17 +399,24 @@ func (r *PGRepository) ReplaceDocumentFull(ctx context.Context, workspaceID, pat
 		}
 	}()
 
-	// 锁定文档行并校验并发版本
+	// 锁定文档行并校验并发版本。
+	// FOR UPDATE OF d：只锁 documents 行，不锁 LEFT JOIN 的 users 行
+	//（PostgreSQL 不允许对外连接的可空侧加锁）。
 	var doc Document
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE workspace_id = $1 AND path = $2 FOR UPDATE`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE d.workspace_id = $1 AND d.path = $2 FOR UPDATE OF d`,
 		workspaceID, path,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "查询待替换文档")
@@ -411,18 +443,26 @@ func (r *PGRepository) ReplaceDocumentFull(ctx context.Context, workspaceID, pat
 	}
 
 	err = tx.QueryRowContext(ctx,
-		`UPDATE documents
-		 SET content_markdown = $1, content_hash = $2, title = $3, type = $4,
-		     revision_number = $5, updated_by = $6, updated_at = now()
-		 WHERE workspace_id = $7 AND path = $8 AND revision_number = $9 AND content_hash = $10
-		 RETURNING id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		`WITH upd AS (
+			UPDATE documents
+			SET content_markdown = $1, content_hash = $2, title = $3, type = $4,
+			    revision_number = $5, updated_by = $6, updated_at = now()
+			WHERE workspace_id = $7 AND path = $8 AND revision_number = $9 AND content_hash = $10
+			RETURNING *
+		)
+		SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		       COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		       to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM upd d
+		LEFT JOIN users cu ON cu.id = d.created_by
+		LEFT JOIN users uu ON uu.id = d.updated_by`,
 		newContent, newHash, newTitle, docTypeVal, newRevision, updatedBy,
 		workspaceID, path, expectedRevision, expectedHash,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -470,14 +510,19 @@ func (r *PGRepository) UpdateDocumentContent(ctx context.Context, workspaceID, p
 	// 乐观并发：先查询当前文档，验证 revision + hash
 	var doc Document
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE workspace_id = $1 AND path = $2 FOR UPDATE`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE d.workspace_id = $1 AND d.path = $2 FOR UPDATE OF d`,
 		workspaceID, path,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "查询待更新文档")
@@ -491,15 +536,23 @@ func (r *PGRepository) UpdateDocumentContent(ctx context.Context, workspaceID, p
 	newRevision := doc.RevisionNumber + 1
 
 	err = tx.QueryRowContext(ctx,
-		`UPDATE documents SET content_markdown = $1, content_hash = $2, revision_number = $3, updated_by = $4, updated_at = now()
-		 WHERE workspace_id = $5 AND path = $6 AND revision_number = $7 AND content_hash = $8
-		 RETURNING id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		`WITH upd AS (
+			UPDATE documents SET content_markdown = $1, content_hash = $2, revision_number = $3, updated_by = $4, updated_at = now()
+			WHERE workspace_id = $5 AND path = $6 AND revision_number = $7 AND content_hash = $8
+			RETURNING *
+		)
+		SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		       COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		       to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM upd d
+		LEFT JOIN users cu ON cu.id = d.created_by
+		LEFT JOIN users uu ON uu.id = d.updated_by`,
 		newContent, newHash, newRevision, updatedBy, workspaceID, path, expectedRevision, expectedHash,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -546,14 +599,19 @@ func (r *PGRepository) UpdateDocumentMetadata(ctx context.Context, workspaceID, 
 
 	var doc Document
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE workspace_id = $1 AND path = $2 FOR UPDATE`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE d.workspace_id = $1 AND d.path = $2 FOR UPDATE OF d`,
 		workspaceID, path,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "查询待更新文档")
@@ -572,15 +630,23 @@ func (r *PGRepository) UpdateDocumentMetadata(ctx context.Context, workspaceID, 
 	}
 
 	err = tx.QueryRowContext(ctx,
-		`UPDATE documents SET title = $1, type = $2, revision_number = $3, updated_by = $4, updated_at = now()
-		 WHERE workspace_id = $5 AND path = $6 AND revision_number = $7 AND content_hash = $8
-		 RETURNING id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		`WITH upd AS (
+			UPDATE documents SET title = $1, type = $2, revision_number = $3, updated_by = $4, updated_at = now()
+			WHERE workspace_id = $5 AND path = $6 AND revision_number = $7 AND content_hash = $8
+			RETURNING *
+		)
+		SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		       COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		       to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM upd d
+		LEFT JOIN users cu ON cu.id = d.created_by
+		LEFT JOIN users uu ON uu.id = d.updated_by`,
 		newTitle, docTypeVal, newRevision, updatedBy, workspaceID, path, expectedRevision, expectedHash,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -627,14 +693,19 @@ func (r *PGRepository) MoveDocument(ctx context.Context, workspaceID, oldPath, n
 
 	var doc Document
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE workspace_id = $1 AND path = $2 FOR UPDATE`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE d.workspace_id = $1 AND d.path = $2 FOR UPDATE OF d`,
 		workspaceID, oldPath,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "查询待移动文档")
@@ -648,15 +719,23 @@ func (r *PGRepository) MoveDocument(ctx context.Context, workspaceID, oldPath, n
 	newRevision := doc.RevisionNumber + 1
 
 	err = tx.QueryRowContext(ctx,
-		`UPDATE documents SET path = $1, revision_number = $2, updated_by = $3, updated_at = now()
-		 WHERE workspace_id = $4 AND path = $5 AND revision_number = $6 AND content_hash = $7
-		 RETURNING id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		`WITH upd AS (
+			UPDATE documents SET path = $1, revision_number = $2, updated_by = $3, updated_at = now()
+			WHERE workspace_id = $4 AND path = $5 AND revision_number = $6 AND content_hash = $7
+			RETURNING *
+		)
+		SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		       COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		       to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM upd d
+		LEFT JOIN users cu ON cu.id = d.created_by
+		LEFT JOIN users uu ON uu.id = d.updated_by`,
 		newPath, newRevision, updatedBy, workspaceID, oldPath, expectedRevision, expectedHash,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -719,14 +798,19 @@ func (r *PGRepository) changeDocumentStatus(ctx context.Context, workspaceID, pa
 
 	var doc Document
 	err = tx.QueryRowContext(ctx,
-		`SELECT id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM documents WHERE workspace_id = $1 AND path = $2 FOR UPDATE`,
+		`SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		        COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		        to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM documents d
+		 LEFT JOIN users cu ON cu.id = d.created_by
+		 LEFT JOIN users uu ON uu.id = d.updated_by
+		 WHERE d.workspace_id = $1 AND d.path = $2 FOR UPDATE OF d`,
 		workspaceID, path,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "查询待变更状态文档")
@@ -754,15 +838,23 @@ func (r *PGRepository) changeDocumentStatus(ctx context.Context, workspaceID, pa
 	newRevision := doc.RevisionNumber + 1
 
 	err = tx.QueryRowContext(ctx,
-		`UPDATE documents SET status = $1, revision_number = $2, updated_by = $3, updated_at = now()
-		 WHERE workspace_id = $4 AND path = $5 AND revision_number = $6 AND content_hash = $7
-		 RETURNING id, workspace_id, path, title, COALESCE(type, ''), status, content_markdown, content_hash, revision_number, is_special, created_by, updated_by,
-		           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		`WITH upd AS (
+			UPDATE documents SET status = $1, revision_number = $2, updated_by = $3, updated_at = now()
+			WHERE workspace_id = $4 AND path = $5 AND revision_number = $6 AND content_hash = $7
+			RETURNING *
+		)
+		SELECT d.id, d.workspace_id, d.path, d.title, COALESCE(d.type, ''), d.status, d.content_markdown, d.content_hash, d.revision_number, d.is_special, d.created_by, d.updated_by,
+		       COALESCE(cu.username, ''), COALESCE(uu.username, ''),
+		       to_char(d.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), to_char(d.updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM upd d
+		LEFT JOIN users cu ON cu.id = d.created_by
+		LEFT JOIN users uu ON uu.id = d.updated_by`,
 		newStatus, newRevision, updatedBy, workspaceID, path, expectedRevision, expectedHash,
 	).Scan(
 		&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.Type, &doc.Status,
 		&doc.ContentMarkdown, &doc.ContentHash, &doc.RevisionNumber, &doc.IsSpecial,
-		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedAt, &doc.UpdatedAt,
+		&doc.CreatedBy, &doc.UpdatedBy, &doc.CreatedByUsername, &doc.UpdatedByUsername,
+		&doc.CreatedAt, &doc.UpdatedAt,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -826,10 +918,13 @@ func (r *PGRepository) ListRevisions(ctx context.Context, workspaceID, documentI
 	}
 
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, document_id, workspace_id, revision_number, path, title, content_markdown, content_hash, status, created_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM revisions WHERE workspace_id = $1 AND document_id = $2
-		 ORDER BY revision_number DESC LIMIT $3 OFFSET $4`,
+		`SELECT rev.id, rev.document_id, rev.workspace_id, rev.revision_number, rev.path, rev.title, rev.content_markdown, rev.content_hash, rev.status, rev.created_by,
+		        COALESCE(cu.username, ''),
+		        to_char(rev.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM revisions rev
+		 LEFT JOIN users cu ON cu.id = rev.created_by
+		 WHERE rev.workspace_id = $1 AND rev.document_id = $2
+		 ORDER BY rev.revision_number DESC LIMIT $3 OFFSET $4`,
 		workspaceID, documentID, limit, offset,
 	)
 	if err != nil {
@@ -843,7 +938,7 @@ func (r *PGRepository) ListRevisions(ctx context.Context, workspaceID, documentI
 		if err := rows.Scan(
 			&rev.ID, &rev.DocumentID, &rev.WorkspaceID, &rev.RevisionNumber,
 			&rev.Path, &rev.Title, &rev.ContentMarkdown, &rev.ContentHash,
-			&rev.Status, &rev.CreatedBy, &rev.CreatedAt,
+			&rev.Status, &rev.CreatedBy, &rev.CreatedByUsername, &rev.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描版本行: %w", err)
 		}
@@ -860,14 +955,17 @@ func (r *PGRepository) ListRevisions(ctx context.Context, workspaceID, documentI
 func (r *PGRepository) GetRevision(ctx context.Context, workspaceID, documentID string, revisionNumber int) (*Revision, error) {
 	var rev Revision
 	err := r.db.QueryRowContext(ctx,
-		`SELECT id, document_id, workspace_id, revision_number, path, title, content_markdown, content_hash, status, created_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM revisions WHERE workspace_id = $1 AND document_id = $2 AND revision_number = $3`,
+		`SELECT rev.id, rev.document_id, rev.workspace_id, rev.revision_number, rev.path, rev.title, rev.content_markdown, rev.content_hash, rev.status, rev.created_by,
+		        COALESCE(cu.username, ''),
+		        to_char(rev.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM revisions rev
+		 LEFT JOIN users cu ON cu.id = rev.created_by
+		 WHERE rev.workspace_id = $1 AND rev.document_id = $2 AND rev.revision_number = $3`,
 		workspaceID, documentID, revisionNumber,
 	).Scan(
 		&rev.ID, &rev.DocumentID, &rev.WorkspaceID, &rev.RevisionNumber,
 		&rev.Path, &rev.Title, &rev.ContentMarkdown, &rev.ContentHash,
-		&rev.Status, &rev.CreatedBy, &rev.CreatedAt,
+		&rev.Status, &rev.CreatedBy, &rev.CreatedByUsername, &rev.CreatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "查询指定版本")
@@ -896,20 +994,26 @@ func (r *PGRepository) AddSource(ctx context.Context, workspaceID, documentID, s
 	}
 
 	err := r.db.QueryRowContext(ctx,
-		`INSERT INTO sources (document_id, workspace_id, source_type, value, title, retrieved_at, content_hash, refresh_interval_days, source_document_id, created_by)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-		 RETURNING id, document_id, workspace_id, source_type, value, title,
-		           COALESCE(to_char(retrieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-		           COALESCE(content_hash, ''),
-		           COALESCE(refresh_interval_days, 0),
-		           COALESCE(source_document_id::text, ''),
-		           created_by,
-		           to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')`,
+		`WITH ins AS (
+			INSERT INTO sources (document_id, workspace_id, source_type, value, title, retrieved_at, content_hash, refresh_interval_days, source_document_id, created_by)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			RETURNING *
+		)
+		SELECT s.id, s.document_id, s.workspace_id, s.source_type, s.value, s.title,
+		       COALESCE(to_char(s.retrieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+		       COALESCE(s.content_hash, ''),
+		       COALESCE(s.refresh_interval_days, 0),
+		       COALESCE(s.source_document_id::text, ''),
+		       s.created_by,
+		       COALESCE(cu.username, ''),
+		       to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		FROM ins s
+		LEFT JOIN users cu ON cu.id = s.created_by`,
 		documentID, workspaceID, sourceType, value, title, retrievedAtVal, contentHashVal, refreshVal, srcDocIDVal, createdBy,
 	).Scan(
 		&src.ID, &src.DocumentID, &src.WorkspaceID, &src.SourceType, &src.Value, &src.Title,
 		&src.RetrievedAt, &src.ContentHash, &src.RefreshIntervalDays, &src.SourceDocumentID,
-		&src.CreatedBy, &src.CreatedAt,
+		&src.CreatedBy, &src.CreatedByUsername, &src.CreatedAt,
 	)
 	if err != nil {
 		return nil, mapDBError(err, "添加来源")
@@ -929,15 +1033,18 @@ func (r *PGRepository) ListSources(ctx context.Context, workspaceID, documentID 
 	}
 
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, document_id, workspace_id, source_type, value, title,
-		        COALESCE(to_char(retrieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-		        COALESCE(content_hash, ''),
-		        COALESCE(refresh_interval_days, 0),
-		        COALESCE(source_document_id::text, ''),
-		        created_by,
-		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM sources WHERE workspace_id = $1 AND document_id = $2
-		 ORDER BY created_at ASC LIMIT $3 OFFSET $4`,
+		`SELECT s.id, s.document_id, s.workspace_id, s.source_type, s.value, s.title,
+		        COALESCE(to_char(s.retrieved_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+		        COALESCE(s.content_hash, ''),
+		        COALESCE(s.refresh_interval_days, 0),
+		        COALESCE(s.source_document_id::text, ''),
+		        s.created_by,
+		        COALESCE(cu.username, ''),
+		        to_char(s.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
+		 FROM sources s
+		 LEFT JOIN users cu ON cu.id = s.created_by
+		 WHERE s.workspace_id = $1 AND s.document_id = $2
+		 ORDER BY s.created_at ASC LIMIT $3 OFFSET $4`,
 		workspaceID, documentID, limit, offset,
 	)
 	if err != nil {
@@ -951,7 +1058,7 @@ func (r *PGRepository) ListSources(ctx context.Context, workspaceID, documentID 
 		if err := rows.Scan(
 			&src.ID, &src.DocumentID, &src.WorkspaceID, &src.SourceType, &src.Value, &src.Title,
 			&src.RetrievedAt, &src.ContentHash, &src.RefreshIntervalDays, &src.SourceDocumentID,
-			&src.CreatedBy, &src.CreatedAt,
+			&src.CreatedBy, &src.CreatedByUsername, &src.CreatedAt,
 		); err != nil {
 			return nil, fmt.Errorf("扫描来源行: %w", err)
 		}

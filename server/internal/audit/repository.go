@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
@@ -44,6 +45,25 @@ type ListResult struct {
 	Total   int
 }
 
+// ListFilter 是审计日志列表的可选筛选条件。
+// 引入动机：前端审计发现 audit 日志缺少筛选能力——管理员需要按操作者、动作、
+// 资源类型、workspace 或时间范围收窄结果，而不是只能全量翻页。
+// 所有字段均为可选：零值表示该维度不参与过滤。
+type ListFilter struct {
+	// UserID 按操作者 UUID 精确匹配（audit_logs.user_id）。
+	UserID string
+	// Action 按动作标识精确匹配（如 "admin.user.create"）。
+	Action string
+	// ResourceType 按资源类型精确匹配（如 "workspace"）。
+	ResourceType string
+	// WorkspaceID 按关联 workspace UUID 精确匹配。
+	WorkspaceID string
+	// From 只返回 created_at >= From 的记录（RFC3339 解析后的时间）。
+	From *time.Time
+	// To 只返回 created_at <= To 的记录。
+	To *time.Time
+}
+
 // Repository 定义审计日志的数据访问接口。
 // 引入动机：领域逻辑和 HTTP handler 依赖此接口而非具体 PG 实现，
 // 便于测试时注入 mock。
@@ -62,9 +82,10 @@ type Repository interface {
 	//   - requestID：请求追踪 ID
 	Record(ctx context.Context, userID, workspaceID, action, resourceType, resourceID string, detail json.RawMessage, requestID string) error
 
-	// List 查询审计日志列表（分页），按创建时间降序。
-	// 引入动机：audit API 供 system_admin 查看审计日志。
-	List(ctx context.Context, limit, offset int) (*ListResult, error)
+	// List 查询审计日志列表（分页），按创建时间降序，可按 filter 收窄。
+	// 引入动机：audit API 供 system_admin 查看审计日志；
+	// filter 中零值字段不参与过滤，nil filter 等价于无筛选。
+	List(ctx context.Context, filter ListFilter, limit, offset int) (*ListResult, error)
 }
 
 // PGRepository 是 Repository 接口的 PostgreSQL 实现。
@@ -109,22 +130,66 @@ func (r *PGRepository) Record(ctx context.Context, userID, workspaceID, action, 
 	return nil
 }
 
-// List 查询审计日志列表（分页），按创建时间降序。
-func (r *PGRepository) List(ctx context.Context, limit, offset int) (*ListResult, error) {
+// List 查询审计日志列表（分页），按创建时间降序，可按 filter 收窄。
+//
+// WHERE 条件通过参数化占位符拼接（参照 evaluation 包的 conditions 模式），
+// 所有用户可控值都走 $N 参数，杜绝 SQL 注入。COUNT 与 SELECT 使用同一组
+// 条件与参数，保证 total 与当前页数据来自同一筛选口径。
+func (r *PGRepository) List(ctx context.Context, filter ListFilter, limit, offset int) (*ListResult, error) {
+	conditions := []string{"1=1"}
+	args := []interface{}{}
+	argIdx := 1
+
+	if filter.UserID != "" {
+		conditions = append(conditions, fmt.Sprintf("user_id = $%d", argIdx))
+		args = append(args, filter.UserID)
+		argIdx++
+	}
+	if filter.Action != "" {
+		conditions = append(conditions, fmt.Sprintf("action = $%d", argIdx))
+		args = append(args, filter.Action)
+		argIdx++
+	}
+	if filter.ResourceType != "" {
+		conditions = append(conditions, fmt.Sprintf("resource_type = $%d", argIdx))
+		args = append(args, filter.ResourceType)
+		argIdx++
+	}
+	if filter.WorkspaceID != "" {
+		conditions = append(conditions, fmt.Sprintf("workspace_id = $%d", argIdx))
+		args = append(args, filter.WorkspaceID)
+		argIdx++
+	}
+	if filter.From != nil {
+		conditions = append(conditions, fmt.Sprintf("created_at >= $%d", argIdx))
+		args = append(args, *filter.From)
+		argIdx++
+	}
+	if filter.To != nil {
+		conditions = append(conditions, fmt.Sprintf("created_at <= $%d", argIdx))
+		args = append(args, *filter.To)
+		argIdx++
+	}
+
+	whereClause := joinConditions(conditions)
+
 	var total int
-	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM audit_logs`).Scan(&total)
-	if err != nil {
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM audit_logs WHERE %s", whereClause)
+	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, mapDBError(err, "查询审计日志总数")
 	}
 
-	rows, err := r.db.QueryContext(ctx,
+	listQuery := fmt.Sprintf(
 		`SELECT id, COALESCE(user_id::text, ''), COALESCE(workspace_id::text, ''),
 		        action, COALESCE(resource_type, ''), COALESCE(resource_id::text, ''),
 		        COALESCE(detail::text, 'null'), COALESCE(request_id, ''),
 		        to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"')
-		 FROM audit_logs ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-		limit, offset,
+		 FROM audit_logs WHERE %s ORDER BY created_at DESC LIMIT $%d OFFSET $%d`,
+		whereClause, argIdx, argIdx+1,
 	)
+	args = append(args, limit, offset)
+
+	rows, err := r.db.QueryContext(ctx, listQuery, args...)
 	if err != nil {
 		return nil, mapDBError(err, "查询审计日志列表")
 	}
@@ -148,6 +213,19 @@ func (r *PGRepository) List(ctx context.Context, limit, offset int) (*ListResult
 	}
 
 	return &ListResult{Entries: entries, Total: total}, nil
+}
+
+// joinConditions 用 AND 连接 WHERE 条件。
+// 引入动机：参数化拼接筛选条件时统一连接符，避免在每个分支重复处理 " AND "。
+func joinConditions(conditions []string) string {
+	result := ""
+	for i, c := range conditions {
+		if i > 0 {
+			result += " AND "
+		}
+		result += c
+	}
+	return result
 }
 
 // mapDBError 将 database/sql 错误映射为带上下文的错误信息。

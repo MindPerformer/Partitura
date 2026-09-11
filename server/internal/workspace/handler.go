@@ -68,6 +68,9 @@ type workspaceResponse struct {
 	RevisionMaxCount      int    `json:"revision_max_count"`
 	MaxDocumentSizeBytes  int    `json:"max_document_size_bytes"`
 	CreatedBy             string `json:"created_by"`
+	// CreatedByUsername 是创建者用户名，由 LEFT JOIN users 填充。
+	// 仅 admin ListAllWorkspaces 返回；其他接口此字段为空串。
+	CreatedByUsername     string `json:"created_by_username"`
 }
 
 // memberResponse 是返回给客户端的成员 JSON 结构。
@@ -142,6 +145,7 @@ func toWorkspaceResponse(ws *Workspace) workspaceResponse {
 		RevisionMaxCount:      ws.RevisionMaxCount,
 		MaxDocumentSizeBytes:  ws.MaxDocumentSizeBytes,
 		CreatedBy:             ws.CreatedBy,
+		CreatedByUsername:     ws.CreatedByUsername,
 	}
 }
 

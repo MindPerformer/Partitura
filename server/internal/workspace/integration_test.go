@@ -204,7 +204,7 @@ func TestIntegration_AuditLog(t *testing.T) {
 	}
 
 	// 查询审计日志
-	result, err := auditRepo.List(ctx, 100, 0)
+	result, err := auditRepo.List(ctx, audit.ListFilter{}, 100, 0)
 	if err != nil {
 		t.Fatalf("List 失败: %v", err)
 	}
@@ -351,7 +351,7 @@ func TestIntegration_ListAllWorkspaces(t *testing.T) {
 	repo.CreateWorkspace(ctx, fmt.Sprintf("intlistws1_%d", time.Now().UnixNano()), "WS1", "", user1)
 	repo.CreateWorkspace(ctx, fmt.Sprintf("intlistws2_%d", time.Now().UnixNano()), "WS2", "", user2)
 
-	result, err := repo.ListAllWorkspaces(ctx, 100, 0)
+	result, err := repo.ListAllWorkspaces(ctx, AdminWorkspaceFilter{}, 100, 0)
 	if err != nil {
 		t.Fatalf("ListAllWorkspaces 失败: %v", err)
 	}

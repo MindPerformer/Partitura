@@ -24,6 +24,17 @@ const {
   statsError
 } = useWorkspaceHome(workspaceId)
 
+// ============================ 页面级快捷键 ============================
+// c / n：新建文档（仅 canEdit）。输入框聚焦时自动抑制（useHotkey 内置规则）。
+useHotkey('c', () => {
+  if (!canEdit.value) return
+  navigateTo(`/workspaces/${workspaceId.value}/documents/edit`)
+})
+useHotkey('n', () => {
+  if (!canEdit.value) return
+  navigateTo(`/workspaces/${workspaceId.value}/documents/edit`)
+})
+
 useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) + ' · ' + t('common.appName') })
 </script>
 
@@ -38,7 +49,7 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
 
       <div v-else-if="workspace" class="mx-auto w-full max-w-5xl px-4 py-6 sm:px-6 sm:py-8">
         <!-- Workspace header -->
-        <section class="mb-6 rounded-2xl border border-default bg-elevated/30 p-5 sm:p-6">
+        <section class="mb-6 rounded-xl border border-default bg-elevated/30 p-5 sm:p-6">
           <div class="flex flex-col gap-4 sm:flex-row sm:items-start sm:justify-between">
             <div class="min-w-0">
               <p class="mb-2 text-xs font-semibold uppercase tracking-[0.18em] text-primary">{{ t('workspace.home') }}</p>
@@ -65,27 +76,27 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
           <div v-else-if="stats" class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
             <div class="rounded-xl border border-default bg-default p-4 shadow-sm">
               <UIcon name="i-lucide-files" class="mb-4 h-5 w-5 text-primary" />
-              <p class="text-2xl font-bold text-primary sm:text-3xl">{{ stats.total_documents }}</p>
+              <p class="text-2xl font-bold text-default sm:text-3xl">{{ stats.total_documents }}</p>
               <p class="mt-1 text-xs text-muted">{{ t('workspace.totalDocuments') }}</p>
             </div>
             <div class="rounded-xl border border-default bg-default p-4 shadow-sm">
               <UIcon name="i-lucide-file-check-2" class="mb-4 h-5 w-5 text-success" />
-              <p class="text-2xl font-bold text-success sm:text-3xl">{{ stats.active_documents }}</p>
+              <p class="text-2xl font-bold text-default sm:text-3xl">{{ stats.active_documents }}</p>
               <p class="mt-1 text-xs text-muted">{{ t('workspace.activeDocuments') }}</p>
             </div>
             <div class="rounded-xl border border-default bg-default p-4 shadow-sm">
               <UIcon name="i-lucide-file-pen-line" class="mb-4 h-5 w-5 text-warning" />
-              <p class="text-2xl font-bold text-warning sm:text-3xl">{{ stats.draft_documents }}</p>
+              <p class="text-2xl font-bold text-default sm:text-3xl">{{ stats.draft_documents }}</p>
               <p class="mt-1 text-xs text-muted">{{ t('workspace.draftDocuments') }}</p>
             </div>
             <div class="rounded-xl border border-default bg-default p-4 shadow-sm">
               <UIcon name="i-lucide-archive" class="mb-4 h-5 w-5 text-error" />
-              <p class="text-2xl font-bold text-error sm:text-3xl">{{ stats.archived_documents }}</p>
+              <p class="text-2xl font-bold text-default sm:text-3xl">{{ stats.archived_documents }}</p>
               <p class="mt-1 text-xs text-muted">{{ t('workspace.archivedDocuments') }}</p>
             </div>
             <div class="rounded-xl border border-default bg-default p-4 shadow-sm">
               <UIcon name="i-lucide-users" class="mb-4 h-5 w-5 text-info" />
-              <p class="text-2xl font-bold text-info sm:text-3xl">{{ stats.member_count }}</p>
+              <p class="text-2xl font-bold text-default sm:text-3xl">{{ stats.member_count }}</p>
               <p class="mt-1 text-xs text-muted">{{ t('workspace.memberCount') }}</p>
             </div>
           </div>
@@ -147,7 +158,7 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
                 v-for="rev in stats.recent_revisions"
                 :key="`${rev.path}-${rev.revision_number}`"
                 :to="`/workspaces/${workspaceId}/documents/read?path=${encodeURIComponent(rev.path)}`"
-                class="block rounded-lg border border-default p-3 transition-colors hover:border-primary/50 hover:bg-elevated/50"
+                class="block rounded-xl border border-default p-3 transition-colors hover:border-primary/50 hover:bg-elevated/50"
               >
                 <div class="flex min-w-0 items-center justify-between gap-2">
                   <span class="truncate text-sm font-medium text-highlighted">{{ rev.title || rev.path }}</span>
@@ -160,8 +171,14 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
           </UCard>
 
           <div class="min-w-0 lg:col-span-2">
-            <div v-if="projectLoading" class="flex min-h-48 items-center justify-center rounded-xl border border-default bg-default">
-              <UIcon name="i-lucide-loader-circle" class="h-6 w-6 animate-spin text-muted" />
+            <!-- 与 stats 骨架屏统一：项目文档加载用占位骨架而非 spinner -->
+            <div v-if="projectLoading" class="min-h-48 animate-pulse rounded-xl border border-default bg-elevated/40 p-5">
+              <div class="mb-3 h-5 w-32 rounded bg-default" />
+              <div class="space-y-2">
+                <div class="h-3 w-full rounded bg-default" />
+                <div class="h-3 w-5/6 rounded bg-default" />
+                <div class="h-3 w-2/3 rounded bg-default" />
+              </div>
             </div>
             <UCard v-else-if="projectDoc" class="min-w-0 overflow-hidden">
               <template #header>
@@ -183,7 +200,10 @@ useHead({ title: () => (workspace.value?.display_name || t('workspace.title')) +
               <MarkdownRenderer :content="projectDoc.content_markdown" />
             </UCard>
             <UCard v-else>
-              <p class="py-6 text-center text-sm text-muted">{{ t('workspace.projectMdNotAvailable') }}</p>
+              <EmptyState
+                icon="i-lucide-file-text"
+                :title="t('workspace.projectMdNotAvailable')"
+              />
             </UCard>
           </div>
         </div>

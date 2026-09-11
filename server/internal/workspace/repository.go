@@ -127,13 +127,15 @@ type Repository interface {
 	ListMemberCandidates(ctx context.Context, workspaceID, query string, limit int) ([]Member, error)
 
 	// ListAllWorkspaces 查询全部 workspace 列表（分页），供 system_admin 使用。
-	ListAllWorkspaces(ctx context.Context, limit, offset int) (*ListWorkspacesResult, error)
+	// filter 中零值字段不参与过滤，便于管理员按 status/name 收窄结果。
+	ListAllWorkspaces(ctx context.Context, filter AdminWorkspaceFilter, limit, offset int) (*ListWorkspacesResult, error)
 
 	// ListAllUsers 查询全部用户列表（分页），供 system_admin 使用。
 	ListAllUsers(ctx context.Context, limit, offset int) (*ListMembersResult, error)
 
 	// ListAllUsersWithSystemInfo 查询全部用户列表（含系统角色和 workspace:create 权限）。
-	ListAllUsersWithSystemInfo(ctx context.Context, limit, offset int) (*ListAdminUsersResult, error)
+	// filter 中零值字段不参与过滤，便于管理员按 system_role/username 收窄结果。
+	ListAllUsersWithSystemInfo(ctx context.Context, filter AdminUserFilter, limit, offset int) (*ListAdminUsersResult, error)
 
 	// UpdateUserSystemRole 更新用户的系统角色。
 	UpdateUserSystemRole(ctx context.Context, userID, systemRole string) error
@@ -583,18 +585,44 @@ func (r *PGRepository) ListMemberCandidates(ctx context.Context, workspaceID, qu
 }
 
 // ListAllWorkspaces 查询全部 workspace 列表（分页），供 system_admin 使用。
-func (r *PGRepository) ListAllWorkspaces(ctx context.Context, limit, offset int) (*ListWorkspacesResult, error) {
+// filter 中零值字段不参与过滤；Status 精确匹配，Query 对 name/display_name 做 ILIKE 模糊匹配。
+// WHERE 条件参数化拼接，COUNT 与 SELECT 共用同一组条件保证 total 与分页口径一致。
+func (r *PGRepository) ListAllWorkspaces(ctx context.Context, filter AdminWorkspaceFilter, limit, offset int) (*ListWorkspacesResult, error) {
+	conditions := []string{"1=1"}
+	args := []interface{}{}
+	argIdx := 1
+
+	if filter.Status != "" {
+		conditions = append(conditions, fmt.Sprintf("workspaces.status = $%d", argIdx))
+		args = append(args, filter.Status)
+		argIdx++
+	}
+	if filter.Query != "" {
+		conditions = append(conditions, fmt.Sprintf("(workspaces.name ILIKE $%d OR workspaces.display_name ILIKE $%d)", argIdx, argIdx))
+		args = append(args, "%"+filter.Query+"%")
+		argIdx++
+	}
+
+	whereClause := joinConditions(conditions)
+
 	var total int
-	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM workspaces`).Scan(&total)
-	if err != nil {
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM workspaces WHERE %s", whereClause)
+	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, mapDBError(err, "查询 workspace 总数")
 	}
 
-	rows, err := r.db.QueryContext(ctx,
-		`SELECT id, name, display_name, description, status, revision_retention_days, revision_max_count, max_document_size_bytes, created_by
-		 FROM workspaces ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-		limit, offset,
+	// LEFT JOIN users 取创建者用户名，供 admin 列表直接显示可读名称；
+	// 使用 LEFT JOIN 保证 created_by 指向已删除用户时 workspace 行不会丢失。
+	listQuery := fmt.Sprintf(
+		`SELECT workspaces.id, workspaces.name, workspaces.display_name, workspaces.description, workspaces.status, workspaces.revision_retention_days, workspaces.revision_max_count, workspaces.max_document_size_bytes, workspaces.created_by, COALESCE(u.username, '') AS created_by_username
+		 FROM workspaces
+		 LEFT JOIN users u ON u.id = workspaces.created_by
+		 WHERE %s ORDER BY workspaces.created_at DESC LIMIT $%d OFFSET $%d`,
+		whereClause, argIdx, argIdx+1,
 	)
+	args = append(args, limit, offset)
+
+	rows, err := r.db.QueryContext(ctx, listQuery, args...)
 	if err != nil {
 		return nil, mapDBError(err, "查询全部 workspace 列表")
 	}
@@ -606,6 +634,7 @@ func (r *PGRepository) ListAllWorkspaces(ctx context.Context, limit, offset int)
 		if err := rows.Scan(
 			&ws.ID, &ws.Name, &ws.DisplayName, &ws.Description,
 			&ws.Status, &ws.RevisionRetentionDays, &ws.RevisionMaxCount, &ws.MaxDocumentSizeBytes, &ws.CreatedBy,
+			&ws.CreatedByUsername,
 		); err != nil {
 			return nil, fmt.Errorf("扫描 workspace 行: %w", err)
 		}
@@ -653,18 +682,39 @@ func (r *PGRepository) ListAllUsers(ctx context.Context, limit, offset int) (*Li
 // ListAllUsersWithSystemInfo 查询全部用户列表（含系统角色和 workspace:create 权限），单条参数化 SQL。
 // 引入动机：admin ListUsers API 需要返回用户基础信息和系统角色/权限，
 // 逐用户查询系统信息造成 N+1，改为单条 SQL 一次性返回所有字段。
-func (r *PGRepository) ListAllUsersWithSystemInfo(ctx context.Context, limit, offset int) (*ListAdminUsersResult, error) {
+// filter 中零值字段不参与过滤；SystemRole 精确匹配，Query 对 username/email 做 ILIKE 模糊匹配。
+func (r *PGRepository) ListAllUsersWithSystemInfo(ctx context.Context, filter AdminUserFilter, limit, offset int) (*ListAdminUsersResult, error) {
+	conditions := []string{"1=1"}
+	args := []interface{}{}
+	argIdx := 1
+
+	if filter.SystemRole != "" {
+		conditions = append(conditions, fmt.Sprintf("system_role = $%d", argIdx))
+		args = append(args, filter.SystemRole)
+		argIdx++
+	}
+	if filter.Query != "" {
+		conditions = append(conditions, fmt.Sprintf("(username ILIKE $%d OR email ILIKE $%d)", argIdx, argIdx))
+		args = append(args, "%"+filter.Query+"%")
+		argIdx++
+	}
+
+	whereClause := joinConditions(conditions)
+
 	var total int
-	err := r.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM users`).Scan(&total)
-	if err != nil {
+	countQuery := fmt.Sprintf("SELECT COUNT(*) FROM users WHERE %s", whereClause)
+	if err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total); err != nil {
 		return nil, mapDBError(err, "查询用户总数")
 	}
 
-	rows, err := r.db.QueryContext(ctx,
+	listQuery := fmt.Sprintf(
 		`SELECT id, username, email, system_role, workspace_create_perm
-		 FROM users ORDER BY created_at DESC LIMIT $1 OFFSET $2`,
-		limit, offset,
+		 FROM users WHERE %s ORDER BY created_at DESC LIMIT $%d OFFSET $%d`,
+		whereClause, argIdx, argIdx+1,
 	)
+	args = append(args, limit, offset)
+
+	rows, err := r.db.QueryContext(ctx, listQuery, args...)
 	if err != nil {
 		return nil, mapDBError(err, "查询全部用户列表（含系统信息）")
 	}
@@ -800,4 +850,17 @@ func mapDBError(err error, context string) error {
 		return fmt.Errorf("%s: PostgreSQL 错误 %s: %w", context, pgErr.Code, err)
 	}
 	return fmt.Errorf("%s: %w", context, err)
+}
+
+// joinConditions 用 AND 连接 WHERE 条件。
+// 引入动机：参数化拼接可选筛选条件时统一连接符，避免在每个分支重复处理 " AND "。
+func joinConditions(conditions []string) string {
+	result := ""
+	for i, c := range conditions {
+		if i > 0 {
+			result += " AND "
+		}
+		result += c
+	}
+	return result
 }

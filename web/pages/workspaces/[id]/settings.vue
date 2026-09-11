@@ -16,6 +16,7 @@ const workspaceId = computed(() => route.params.id as string)
 
 const { workspace, canSettings, isOwner, reload } = useWorkspaceContext(workspaceId)
 const { workspaceStatusLabel } = useEnumLabels()
+const toast = useToast()
 
 const form = reactive({
   display_name: '',
@@ -29,6 +30,12 @@ const loading = ref(false)
 const saving = ref(false)
 const error = ref<string | null>(null)
 const success = ref(false)
+let successTimer: ReturnType<typeof setTimeout> | undefined
+
+// 归档工作区确认（UModal + 输名二次确认，取代原生 confirm 的高危操作确认）
+const showArchiveModal = ref(false)
+const archiveConfirmName = ref('')
+const archiveLoading = ref(false)
 
 watch(workspace, (ws) => {
   if (ws) {
@@ -59,6 +66,10 @@ async function handleSave() {
       max_document_size_bytes: form.max_document_size_bytes
     })
     success.value = true
+    // 成功横幅自动消失，避免常驻占用视觉焦点。
+    if (successTimer) clearTimeout(successTimer)
+    successTimer = setTimeout(() => { success.value = false }, 4000)
+    toast.add({ title: t('workspace.settingsSaved'), color: 'success' })
     await reload()
   } catch (err) {
     const apiErr = err as ApiError
@@ -68,17 +79,36 @@ async function handleSave() {
   }
 }
 
-async function handleArchive() {
-  if (!confirm(t('workspace.archiveConfirm'))) return
+function promptArchive() {
+  archiveConfirmName.value = ''
+  showArchiveModal.value = true
+}
+
+// 高危操作：必须输入 workspace 显示名才能确认归档。
+const archiveNameMatches = computed(() =>
+  !!workspace.value && archiveConfirmName.value.trim() === workspace.value.display_name
+)
+
+async function confirmArchive() {
+  if (!archiveNameMatches.value) return
+  archiveLoading.value = true
   try {
     const api = useWorkspaceApi()
     await api.archive(workspaceId.value)
+    showArchiveModal.value = false
+    toast.add({ title: t('workspace.workspaceArchived'), color: 'success' })
     navigateTo('/')
   } catch (err) {
     const apiErr = err as ApiError
     error.value = apiErr.error || t('workspace.archiveFailed')
+  } finally {
+    archiveLoading.value = false
   }
 }
+
+onBeforeUnmount(() => {
+  if (successTimer) clearTimeout(successTimer)
+})
 
 useHead({ title: () => t('workspace.workspaceSettings') + ' · ' + t('common.appName') })
 </script>
@@ -142,10 +172,37 @@ useHead({ title: () => t('workspace.workspaceSettings') + ' · ' + t('common.app
               <p class="text-sm font-medium">{{ t('workspace.archiveWorkspace') }}</p>
               <p class="text-xs text-muted">{{ t('workspace.archiveWorkspaceDesc') }}</p>
             </div>
-            <UButton color="error" variant="outline" @click="handleArchive">{{ t('common.archive') }}</UButton>
+            <UButton color="error" variant="outline" @click="promptArchive">{{ t('common.archive') }}</UButton>
           </div>
         </UCard>
       </div>
     </div>
+
+    <!-- 归档工作区确认（需输入 workspace 名） -->
+    <UModal v-model:open="showArchiveModal" :dismissible="!archiveLoading">
+      <template #content>
+        <div class="p-6">
+          <div class="flex items-start gap-3 mb-4">
+            <UIcon name="i-lucide-triangle-alert" class="w-6 h-6 text-error flex-shrink-0" />
+            <div>
+              <h3 class="text-lg font-semibold text-highlighted">{{ t('workspace.archiveWorkspace') }}</h3>
+              <p class="text-sm text-muted mt-1">{{ t('workspace.archiveConfirm') }}</p>
+            </div>
+          </div>
+          <UFormField :label="t('workspace.archiveConfirmLabel', { name: workspace?.display_name ?? '' })" name="archive_name" class="mt-4">
+            <UInput
+              v-model="archiveConfirmName"
+              :placeholder="workspace?.display_name"
+              class="w-full"
+              autocomplete="off"
+            />
+          </UFormField>
+          <div class="flex justify-end gap-2 mt-6">
+            <UButton color="neutral" variant="ghost" @click="showArchiveModal = false">{{ t('common.cancel') }}</UButton>
+            <UButton color="error" :loading="archiveLoading" :disabled="!archiveNameMatches" @click="confirmArchive">{{ t('common.archive') }}</UButton>
+          </div>
+        </div>
+      </template>
+    </UModal>
   </WorkspaceLayout>
 </template>

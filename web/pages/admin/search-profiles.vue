@@ -215,45 +215,90 @@ async function handleCreateVersion() {
 }
 
 /**
- * 归档：二次确认后调用归档接口，成功后刷新列表。
- * 失败（例如并发下 profile 已被激活 → 409）时展示后端消息，缺失时回退到本地化提示。
+ * 危险操作统一确认（UModal）。
+ *
+ * 引入动机：archive / rollback / activate 都会改变线上检索行为，
+ * 原生 confirm() 不阻塞 JS 且样式不可控，统一换为 UModal 二次确认。
+ * 通过 pendingAction 复用一个确认弹窗，action 字段决定确认后执行的操作。
  */
-async function handleArchive(profile: SearchProfile) {
-  if (!confirm(t('admin.archiveProfileConfirm'))) return
-  archiveLoadingId.value = profile.id
+type PendingAction =
+  | { kind: 'archive'; profile: SearchProfile }
+  | { kind: 'rollback'; id: string }
+  | { kind: 'activate'; id: string }
+
+const pendingAction = ref<PendingAction | null>(null)
+const confirmOpen = ref(false)
+const confirmLoading = ref(false)
+/** 操作级错误（归档/回滚/激活失败），与列表加载错误 error 分离，渲染在确认弹窗内。 */
+const actionError = ref<string | null>(null)
+
+type ConfirmColor = 'primary' | 'warning' | 'error' | 'success'
+interface ConfirmCopy { title: string; body: string; confirmLabel: string; color: ConfirmColor }
+
+const confirmCopy = computed<ConfirmCopy>(() => {
+  const a = pendingAction.value
+  if (!a) return { title: '', body: '', confirmLabel: '', color: 'primary' }
+  if (a.kind === 'archive') {
+    return { title: t('admin.archiveProfile'), body: t('admin.archiveProfileConfirm'), confirmLabel: t('common.archive'), color: 'error' }
+  }
+  if (a.kind === 'rollback') {
+    return { title: t('admin.rollbackProfile'), body: t('admin.rollbackConfirm'), confirmLabel: t('common.rollback'), color: 'warning' }
+  }
+  // activate
+  return { title: t('admin.activateProfile'), body: t('admin.activateProfileConfirm'), confirmLabel: t('common.activate'), color: 'success' }
+})
+
+function requestArchive(profile: SearchProfile) {
+  pendingAction.value = { kind: 'archive', profile }
+  actionError.value = null
+  confirmOpen.value = true
+}
+function requestRollback(id: string) {
+  pendingAction.value = { kind: 'rollback', id }
+  actionError.value = null
+  confirmOpen.value = true
+}
+function requestActivate(id: string) {
+  pendingAction.value = { kind: 'activate', id }
+  actionError.value = null
+  confirmOpen.value = true
+}
+
+/**
+ * 确认执行：按 pendingAction.kind 分发到对应 API，成功后刷新列表。
+ * 失败时展示后端消息（归档的 409 冲突映射为本地化提示）。
+ */
+async function confirmPendingAction() {
+  const action = pendingAction.value
+  if (!action) return
+  confirmLoading.value = true
   try {
     const api = useSearchAdminApi()
-    await api.archiveProfile(profile.id)
+    if (action.kind === 'archive') {
+      archiveLoadingId.value = action.profile.id
+      await api.archiveProfile(action.profile.id)
+    } else if (action.kind === 'rollback') {
+      await api.rollbackProfile(action.id)
+    } else {
+      await api.activateProfile(action.id)
+    }
+    confirmOpen.value = false
+    pendingAction.value = null
     await loadProfiles()
   } catch (err) {
     const apiErr = err as ApiError
-    error.value = apiErr.error
-      || (apiErr.status === 409 ? t('admin.archiveActiveConflict') : t('admin.archiveProfileFailed'))
+    if (action.kind === 'archive') {
+      actionError.value = apiErr.error
+        || (apiErr.status === 409 ? t('admin.archiveActiveConflict') : t('admin.archiveProfileFailed'))
+    } else if (action.kind === 'rollback') {
+      actionError.value = apiErr.error || t('admin.rollbackFailed')
+    } else {
+      actionError.value = apiErr.error || t('admin.activateProfileFailed')
+    }
+    // 失败时保留弹窗，用户可重试或取消
   } finally {
+    confirmLoading.value = false
     archiveLoadingId.value = null
-  }
-}
-
-async function handleActivate(id: string) {
-  try {
-    const api = useSearchAdminApi()
-    await api.activateProfile(id)
-    await loadProfiles()
-  } catch (err) {
-    const apiErr = err as ApiError
-    error.value = apiErr.error || t('admin.activateProfileFailed')
-  }
-}
-
-async function handleRollback(id: string) {
-  if (!confirm(t('admin.rollbackConfirm'))) return
-  try {
-    const api = useSearchAdminApi()
-    await api.rollbackProfile(id)
-    await loadProfiles()
-  } catch (err) {
-    const apiErr = err as ApiError
-    error.value = apiErr.error || t('admin.rollbackFailed')
   }
 }
 
@@ -263,37 +308,71 @@ function profileStatusColor(status: string): 'primary' | 'secondary' | 'success'
   return 'info'
 }
 
+// ---- 键盘导航：j/k 上下移动选中行，Enter/o 打开"新建版本"弹窗（主操作），Escape 清除 ----
+const selectedIndex = ref(-1)
+const listEl = ref<HTMLElement | null>(null)
+
+// 数据变化时清选中，避免指向已不存在的行。
+watch(profiles, () => { selectedIndex.value = -1 })
+
+function moveSelection(delta: number) {
+  if (profiles.value.length === 0) return
+  const next = selectedIndex.value < 0
+    ? (delta > 0 ? 0 : profiles.value.length - 1)
+    : Math.min(Math.max(selectedIndex.value + delta, 0), profiles.value.length - 1)
+  selectedIndex.value = next
+  listEl.value?.querySelectorAll('li')[next]?.scrollIntoView({ block: 'nearest' })
+}
+
+function openSelected() {
+  const profile = profiles.value[selectedIndex.value]
+  if (profile) openVersionModal(profile)
+}
+
+function clearSelection() {
+  selectedIndex.value = -1
+}
+
+useHotkey('j', () => moveSelection(1))
+useHotkey('k', () => moveSelection(-1))
+useHotkey('enter', openSelected)
+useHotkey('o', openSelected)
+useHotkey('escape', clearSelection)
+
 useHead({ title: () => t('admin.searchProfiles') + ' · ' + t('common.appName') })
 </script>
 
 <template>
   <div>
-    <AppHeader />
-
-    <div class="max-w-4xl mx-auto px-4 py-8">
+    <!-- 顶栏由 layouts/default.vue 统一注入 -->
+    <div class="max-w-6xl mx-auto px-4 py-8">
       <div class="flex items-center justify-between mb-6">
         <h1 class="text-2xl font-bold text-highlighted">{{ t('admin.searchProfiles') }}</h1>
         <UButton v-if="isSystemAdmin" icon="i-lucide-plus" @click="showCreateModal = true">{{ t('admin.newProfile') }}</UButton>
       </div>
 
-      <div v-if="!isSystemAdmin" class="text-center py-12">
-        <UIcon name="i-lucide-lock" class="w-12 h-12 text-muted mx-auto mb-3" />
-        <p class="text-muted">{{ t('admin.systemAdminRequired') }}</p>
-      </div>
+      <EmptyState
+        v-if="!isSystemAdmin"
+        icon="i-lucide-lock"
+        :title="t('admin.systemAdminRequired')"
+      />
 
       <template v-else>
         <ErrorDisplay v-if="error" :message="error" />
-        <div v-if="versionNotice" class="rounded-lg border border-success/20 bg-success/10 p-3 mb-4 text-sm text-success">{{ versionNotice }}</div>
+        <div v-if="versionNotice" class="rounded-xl border border-success/20 bg-success/10 p-3 mb-4 text-sm text-success">{{ versionNotice }}</div>
 
-        <div v-if="loading" class="flex justify-center py-8">
-          <UIcon name="i-lucide-loader-circle" class="w-8 h-8 animate-spin text-muted" />
+        <div v-if="loading" class="flex justify-center py-8" role="status">
+          <UIcon name="i-lucide-loader-circle" aria-hidden="true" class="w-8 h-8 animate-spin text-muted" />
+          <span class="sr-only">{{ t('common.loading') }}</span>
         </div>
 
-        <div v-else-if="profiles.length > 0" class="space-y-3">
-          <div
-            v-for="profile in profiles"
+        <ul ref="listEl" v-else-if="profiles.length > 0" class="space-y-3" role="list">
+          <li
+            v-for="(profile, idx) in profiles"
             :key="profile.id"
-            class="border border-default rounded-lg p-4"
+            class="border border-default rounded-xl p-4 transition-colors"
+            :class="idx === selectedIndex ? 'ring-1 ring-primary/60 bg-elevated' : ''"
+            :aria-selected="idx === selectedIndex"
           >
             <div class="flex items-start justify-between mb-2">
               <div>
@@ -316,14 +395,14 @@ useHead({ title: () => t('admin.searchProfiles') + ' · ' + t('common.appName') 
                 size="xs"
                 color="success"
                 variant="outline"
-                @click="handleActivate(profile.id)"
+                @click="requestActivate(profile.id)"
               >{{ t('common.activate') }}</UButton>
               <UButton
                 v-if="profile.status === 'archived'"
                 size="xs"
                 color="warning"
                 variant="outline"
-                @click="handleRollback(profile.id)"
+                @click="requestRollback(profile.id)"
               >{{ t('common.rollback') }}</UButton>
               <UButton
                 size="xs"
@@ -337,13 +416,28 @@ useHead({ title: () => t('admin.searchProfiles') + ' · ' + t('common.appName') 
                 color="error"
                 variant="outline"
                 :loading="archiveLoadingId === profile.id"
-                @click="handleArchive(profile)"
+                @click="requestArchive(profile)"
               >{{ t('admin.archiveProfile') }}</UButton>
             </div>
-          </div>
-        </div>
+          </li>
+        </ul>
 
-        <p v-else class="text-center text-muted py-8">{{ t('admin.noProfiles') }}</p>
+        <EmptyState v-else icon="i-lucide-settings" :title="t('admin.noProfiles')" />
+
+        <!-- 危险操作统一确认弹窗 -->
+        <UModal v-model:open="confirmOpen">
+          <template #content>
+            <div class="p-6">
+              <h3 class="text-lg font-semibold mb-2">{{ confirmCopy.title }}</h3>
+              <p class="text-sm text-muted mb-4">{{ confirmCopy.body }}</p>
+              <ErrorDisplay v-if="actionError" :message="actionError" class="mb-4" />
+              <div class="flex justify-end gap-2">
+                <UButton color="neutral" variant="ghost" @click="confirmOpen = false; pendingAction = null">{{ t('common.cancel') }}</UButton>
+                <UButton :color="confirmCopy.color" :loading="confirmLoading" @click="confirmPendingAction">{{ confirmCopy.confirmLabel }}</UButton>
+              </div>
+            </div>
+          </template>
+        </UModal>
 
         <Pagination
           v-if="total > limit"

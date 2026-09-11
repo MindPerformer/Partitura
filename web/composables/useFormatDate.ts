@@ -9,7 +9,7 @@
 // 设计原则：
 // - 仅接受 RFC3339 格式字符串，非法值记录 console.error 并返回已翻译的 fallback
 // - 使用 Intl.DateTimeFormat 按浏览器 locale 和 timezone 格式化
-// - SSR 安全：服务端使用 en-US locale 格式化
+// - 本项目 ssr:false 纯 CSR：仅使用浏览器 locale（缺失回退 en-US）
 // - 不直接渲染 Invalid Date
 
 /**
@@ -39,12 +39,9 @@ export function useFormatDate() {
 
   /**
    * 获取当前环境的 locale。
-   * SSR 时使用 en-US，客户端使用浏览器 navigator.language。
+   * 本项目 ssr:false 纯 CSR：使用浏览器 navigator.language，缺失时回退 en-US。
    */
   function getLocale(): string {
-    if (import.meta.server) {
-      return 'en-US'
-    }
     if (typeof navigator !== 'undefined' && navigator.language) {
       return navigator.language
     }

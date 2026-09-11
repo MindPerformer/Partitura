@@ -106,11 +106,13 @@ export interface Workspace {
   name: string
   display_name: string
   description: string
-  status: string
+  status: WorkspaceStatus
   revision_retention_days: number
   revision_max_count: number
   max_document_size_bytes: number
   created_by: string
+  /** 创建者用户名（后端 LEFT JOIN users COALESCE，无值时为空串） */
+  created_by_username?: string
 }
 
 export interface ListWorkspacesResponse {
@@ -137,7 +139,7 @@ export interface UpdateWorkspaceRequest {
 /** GET /api/workspaces/{id}/me/membership 响应 */
 export interface MyMembershipResponse {
   workspace_id: string
-  role: string
+  role: WorkspaceRole
 }
 
 // ============================================================
@@ -149,7 +151,7 @@ export interface Member {
   user_id: string
   username: string
   email: string
-  role: string
+  role: WorkspaceRole
 }
 
 export interface ListMembersResponse {
@@ -161,6 +163,7 @@ export interface ListMembersResponse {
 
 export interface AddMemberRequest {
   username: string
+  /** 保持 string：成员表单为普通字符串控件，后端词汇见 WORKSPACE_ROLES */
   role: string
 }
 
@@ -170,6 +173,7 @@ export interface MemberCandidatesResponse {
 }
 
 export interface UpdateMemberRoleRequest {
+  /** 保持 string：成员表单为普通字符串控件，后端词汇见 WORKSPACE_ROLES */
   role: string
 }
 
@@ -182,14 +186,19 @@ export interface Document {
   workspace_id: string
   path: string
   title: string
-  type?: string
-  status: string
+  /** 文档类型词汇；空串表示后端未设置（"未分类"），与 DocumentListItem 一致 */
+  type?: DocumentType | ''
+  status: DocumentStatus
   content_markdown: string
   content_hash: string
   revision_number: number
   is_special: boolean
   created_by: string
   updated_by: string
+  /** 创建者用户名（后端 LEFT JOIN users COALESCE，无值时为空串） */
+  created_by_username?: string
+  /** 最后编辑者用户名（同上） */
+  updated_by_username?: string
   created_at: string
   updated_at: string
 }
@@ -198,12 +207,15 @@ export interface DocumentListItem {
   id: string
   path: string
   title: string
-  type?: string
-  status: string
+  /** 文档类型词汇；空串表示后端未设置（"未分类"） */
+  type?: DocumentType | ''
+  status: DocumentStatus
   content_hash: string
   revision_number: number
   is_special: boolean
   updated_by: string
+  /** 最后编辑者用户名（后端 LEFT JOIN users COALESCE，无值时为空串） */
+  updated_by_username?: string
   updated_at: string
 }
 
@@ -245,6 +257,7 @@ export interface LinesResponse {
 export interface CreateDocumentRequest {
   path: string
   title: string
+  /** 保持 string：编辑器表单为普通字符串，后端词汇见 DOCUMENT_TYPES */
   type: string
   content_markdown: string
 }
@@ -287,8 +300,10 @@ export interface Revision {
   title: string
   content_markdown: string
   content_hash: string
-  status: string
+  status: DocumentStatus
   created_by: string
+  /** 创建者用户名（后端 LEFT JOIN users COALESCE，无值时为空串） */
+  created_by_username?: string
   created_at: string
 }
 
@@ -306,7 +321,7 @@ export interface ListRevisionsResponse {
 export interface Source {
   id: string
   document_id: string
-  source_type: string
+  source_type: SourceType
   value: string
   title?: string
   retrieved_at?: string
@@ -314,6 +329,8 @@ export interface Source {
   refresh_interval_days?: number
   source_document_id?: string
   created_by: string
+  /** 创建者用户名（后端 LEFT JOIN users COALESCE，无值时为空串） */
+  created_by_username?: string
   created_at: string
 }
 
@@ -325,6 +342,7 @@ export interface ListSourcesResponse {
 }
 
 export interface AddSourceRequest {
+  /** 保持 string：来源表单为普通字符串控件，后端词汇见 SOURCE_TYPES */
   source_type: string
   value: string
   title: string
@@ -385,7 +403,7 @@ export interface AdminUser {
   id: string
   username: string
   email: string
-  system_role: string
+  system_role: SystemRole
   workspace_create_perm: boolean
 }
 
@@ -397,6 +415,7 @@ export interface ListUsersResponse {
 }
 
 export interface UpdateUserRequest {
+  /** 保持 string：管理端编辑表单使用普通字符串控件，后端返回时由 AdminUser.system_role 收窄 */
   system_role?: string
   workspace_create_perm?: boolean
 }
@@ -410,6 +429,7 @@ export interface CreateUserRequest {
   username: string
   email: string
   password: string
+  /** 保持 string：创建表单不暴露角色选择，后端默认 system_role=user */
   system_role?: string
   workspace_create_perm?: boolean
 }
@@ -445,7 +465,7 @@ export interface SearchProfile {
   id: string
   name: string
   version: number
-  status: string
+  status: ProfileStatus
   embedding_provider: string
   embedding_model: string
   embedding_dimensions: number
@@ -529,6 +549,8 @@ export interface EvaluationDataset {
   id: string
   name: string
   description: string
+  /** 数据集状态；归档后为只读终态，不可再评测或添加条目 */
+  status: 'active' | 'archived'
   created_by: string
   created_at: string
 }
@@ -564,6 +586,14 @@ export interface ListDatasetsResponse {
   offset: number
 }
 
+/** GET /api/admin/evaluation/datasets/{id}/items 响应。 */
+export interface ListItemsResponse {
+  items: EvaluationItem[]
+  total: number
+  limit: number
+  offset: number
+}
+
 export interface ListEvaluationResultsResponse {
   results: EvaluationResult[]
   total: number
@@ -594,8 +624,8 @@ export interface RunEvaluationRequest {
 
 export interface Job {
   id: string
-  type: string
-  status: string
+  type: JobType
+  status: JobStatus
   payload: unknown
   attempts: number
   max_attempts: number
@@ -776,6 +806,41 @@ export interface PaginationParams {
   [key: string]: unknown
 }
 
+/**
+ * GET /api/admin/audit 服务端筛选参数。
+ * 均为可选；from/to 为 RFC3339 时间字符串，非法值后端返回 400。
+ */
+export interface AdminAuditFilterParams extends PaginationParams {
+  user_id?: string
+  action?: string
+  resource_type?: string
+  workspace_id?: string
+  /** RFC3339 时间下界 */
+  from?: string
+  /** RFC3339 时间上界 */
+  to?: string
+}
+
+/**
+ * GET /api/admin/users 服务端筛选参数。
+ * system_role 后端仅接受 user / system_admin，非法值返回 400。
+ */
+export interface AdminUserFilterParams extends PaginationParams {
+  system_role?: string
+  /** username / email 模糊匹配 */
+  q?: string
+}
+
+/**
+ * GET /api/admin/workspaces 服务端筛选参数。
+ * status 后端仅接受 active / archived，非法值返回 400。
+ */
+export interface AdminWorkspaceFilterParams extends PaginationParams {
+  status?: string
+  /** name / display_name 模糊匹配 */
+  q?: string
+}
+
 // ============================================================
 // RBAC 角色常量
 // ============================================================
@@ -823,3 +888,44 @@ export const SOURCE_TYPES = [
 ] as const
 
 export const SEARCH_MODES = ['hybrid', 'lexical', 'semantic'] as const
+
+// ============================================================
+// 枚举联合类型（与 useEnumLabels 的键集一一对应）
+// ============================================================
+
+/** 系统角色（对应 admin.roleUser / admin.roleSystemAdmin） */
+export type SystemRole = (typeof SYSTEM_ROLES)[keyof typeof SYSTEM_ROLES]
+
+/** workspace 角色（对应 workspace.roleViewer/Editor/Admin/Owner） */
+export type WorkspaceRole = (typeof WORKSPACE_ROLES)[keyof typeof WORKSPACE_ROLES]
+
+/** workspace 状态（对应 workspace.statusActive / statusArchived） */
+export type WorkspaceStatus = 'active' | 'archived'
+
+/** 文档类型（对应 document.typeXxx） */
+export type DocumentType = (typeof DOCUMENT_TYPES)[number]
+
+/** 文档状态（对应 document.statusActive/statusArchived；draft 为后端词汇，列表/历史可出现） */
+export type DocumentStatus = (typeof DOCUMENT_STATUSES)[number]
+
+/** 来源类型（对应 document.sourceTypeXxx） */
+export type SourceType = (typeof SOURCE_TYPES)[number]
+
+/** 搜索模式（对应 search.modeXxx） */
+export type SearchMode = (typeof SEARCH_MODES)[number]
+
+/** 搜索配置状态（对应 admin.statusActive/Draft/Inactive/Archived） */
+export type ProfileStatus = 'active' | 'draft' | 'inactive' | 'archived'
+
+/** 后台任务状态（对应 admin.statusPending/Running/Completed/Failed/Dead） */
+export type JobStatus = 'pending' | 'running' | 'completed' | 'failed' | 'dead'
+
+/** 后台任务类型（对应 admin.jobTypeXxx） */
+export type JobType =
+  | 'index_document'
+  | 'rebuild_index'
+  | 'repair_index'
+  | 'evaluate_profile'
+  | 'optimize_profile'
+  | 'cleanup_old_indexes'
+  | 'cleanup_revisions'

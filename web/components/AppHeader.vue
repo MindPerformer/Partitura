@@ -83,7 +83,7 @@ watch(isAuthenticated, (authed) => {
 
 // 语言切换选项
 const localeItems = computed<DropdownMenuItem[][]>(() => {
-  const items: DropdownMenuItem[] = (locales.value as Array<{ code: string; name: string }>).map(l => ({
+  const items: DropdownMenuItem[] = ((locales.value ?? []) as Array<{ code: string; name: string }>).map(l => ({
     label: l.name,
     onSelect: () => switchLocale(l.code)
   }))
@@ -92,7 +92,7 @@ const localeItems = computed<DropdownMenuItem[][]>(() => {
 
 // 当前语言名称
 const currentLocaleName = computed(() => {
-  const current = (locales.value as Array<{ code: string; name: string }>).find(l => l.code === locale.value)
+  const current = ((locales.value ?? []) as Array<{ code: string; name: string }>).find(l => l.code === locale.value)
   return current?.name ?? locale.value
 })
 
@@ -131,6 +131,8 @@ const userItems = computed<DropdownMenuItem[][]>(() => {
     actions.push({ label: t('admin.searchProfiles'), icon: 'i-lucide-settings', to: '/admin/search-profiles' })
     actions.push({ label: t('admin.searchEvaluation'), icon: 'i-lucide-bar-chart-3', to: '/admin/search-evaluation' })
     actions.push({ label: t('admin.indexJobs'), icon: 'i-lucide-cog', to: '/admin/jobs' })
+    actions.push({ label: t('admin.providers'), icon: 'i-lucide-plug', to: '/admin/providers' })
+    actions.push({ label: t('admin.systemConfig'), icon: 'i-lucide-settings-2', to: '/admin/config' })
     actions.push({ label: t('admin.auditLog'), icon: 'i-lucide-file-text', to: '/admin/audit' })
   }
   const logoutRow: DropdownMenuItem[] = [

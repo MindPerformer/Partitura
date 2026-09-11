@@ -10,9 +10,9 @@ defineProps<{
 </script>
 
 <template>
-  <div class="rounded-lg border border-error/20 bg-error/10 p-4">
+  <div role="alert" class="rounded-lg border border-error/20 bg-error/10 p-4">
     <div class="flex items-start gap-3">
-      <UIcon name="i-lucide-triangle-alert" class="w-5 h-5 text-error flex-shrink-0 mt-0.5" />
+      <UIcon name="i-lucide-triangle-alert" aria-hidden="true" class="w-5 h-5 text-error flex-shrink-0 mt-0.5" />
       <div class="flex-1">
         <p v-if="title" class="font-medium text-error">{{ title }}</p>
         <p class="text-sm text-error">{{ message }}</p>

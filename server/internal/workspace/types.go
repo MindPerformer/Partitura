@@ -83,6 +83,10 @@ type Workspace struct {
 	RevisionMaxCount       int
 	MaxDocumentSizeBytes   int
 	CreatedBy              string
+	// CreatedByUsername 是创建者的用户名，仅在 ListAllWorkspaces 中通过
+	// LEFT JOIN users 填充，供 admin 列表展示可读的创建者名称。
+	// 其他查询路径不填充此字段，保持零值。
+	CreatedByUsername      string
 }
 
 // AdminUser 是 admin 用户列表返回的完整用户信息（含系统角色和 workspace:create 权限）。
@@ -102,6 +106,28 @@ type AdminUser struct {
 type ListAdminUsersResult struct {
 	Users []AdminUser
 	Total int
+}
+
+// AdminWorkspaceFilter 是 admin 查询全部 workspace 列表的可选筛选条件。
+// 引入动机：前端审计发现 admin workspaces 缺少筛选能力——管理员需要按
+// 状态或名称模糊搜索收窄结果，而不是只能全量翻页。
+// 所有字段均为可选：零值表示该维度不参与过滤。
+type AdminWorkspaceFilter struct {
+	// Status 按状态精确匹配（active / archived）。
+	Status string
+	// Query 按 name / display_name 做 ILIKE 模糊匹配。
+	Query string
+}
+
+// AdminUserFilter 是 admin 查询全部用户列表的可选筛选条件。
+// 引入动机：前端审计发现 admin users 缺少筛选能力——管理员需要按系统角色
+// 或用户名/邮箱模糊搜索收窄结果。
+// 所有字段均为可选：零值表示该维度不参与过滤。
+type AdminUserFilter struct {
+	// SystemRole 按系统角色精确匹配（user / system_admin）。
+	SystemRole string
+	// Query 按 username / email 做 ILIKE 模糊匹配。
+	Query string
 }
 
 // Member 是从数据库读取的 workspace_members 记录，关联用户基本信息。
