@@ -20,6 +20,7 @@ import (
 	"log/slog"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"partitura/server/internal/es"
@@ -150,6 +151,20 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 	output := &SearchOutput{
 		SearchID: searchID,
 	}
+	degradationReasons := make([]string, 0, 4)
+	addDegradationReason := func(reason string) {
+		if reason == "" {
+			return
+		}
+		for _, existing := range degradationReasons {
+			if existing == reason {
+				return
+			}
+		}
+		degradationReasons = append(degradationReasons, reason)
+		output.Degraded = true
+		output.DegradationReason = strings.Join(degradationReasons, ",")
+	}
 
 	if input.Limit <= 0 {
 		input.Limit = 10
@@ -158,17 +173,9 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 		input.Limit = 100
 	}
 
-	// 检查 ES 是否可用
+	// 搜索请求本身就是 ES 可用性的探测，避免热路径额外发起 Ping。
 	if p.esClient == nil {
-		output.Degraded = true
-		output.DegradationReason = "elasticsearch_unavailable"
-		return output, nil
-	}
-
-	if err := p.esClient.Ping(ctx); err != nil {
-		slog.Warn("ES 不可用，搜索降级", "error", err)
-		output.Degraded = true
-		output.DegradationReason = "elasticsearch_unavailable"
+		addDegradationReason("elasticsearch_unavailable")
 		return output, nil
 	}
 
@@ -221,73 +228,63 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 		mode = "hybrid"
 	}
 
-	// --- 阶段 1: BM25 multi-field 检索 ---
-	var bm25Results []types.CandidateResult
-	if mode == "hybrid" || mode == "lexical" {
-		var bm25Err error
-		bm25Results, bm25Err = p.searchBM25(ctx, indexName, input, workspaceFilter)
-		if bm25Err != nil {
-			slog.Warn("BM25 检索失败", "error", bm25Err)
-			bm25Results = nil
+	// --- 阶段 1/2: BM25 与 vector 检索并发 ---
+	var bm25Results, vectorResults []types.CandidateResult
+	var bm25Err, vectorErr error
+	var queryVectors [][]float32
+	if mode == "hybrid" || mode == "semantic" {
+		embProvider := p.currentEmbeddingProvider()
+		if embProvider == nil {
+			addDegradationReason("embedding_unavailable")
+		} else {
+			queryInput := chunking.BuildQueryEmbeddingInput(input.Query, input.Profile.EmbeddingQueryInstruction)
+			var embErr error
+			queryVectors, embErr = embProvider.Embed(ctx, []string{queryInput})
+			if embErr != nil || len(queryVectors) == 0 {
+				slog.Warn("embedding 不可用，降级为 lexical-only", "error", embErr)
+				addDegradationReason("embedding_unavailable")
+			}
 		}
 	}
+	var wg sync.WaitGroup
+	if mode == "hybrid" || mode == "lexical" {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			started := time.Now()
+			bm25Results, bm25Err = p.searchBM25(ctx, indexName, input, workspaceFilter)
+			slog.Info("搜索阶段完成", "stage", "bm25", "latency_ms", time.Since(started).Milliseconds(), "result_count", len(bm25Results), "error", bm25Err)
+		}()
+	}
+	if len(queryVectors) > 0 && (mode == "hybrid" || mode == "semantic") {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			started := time.Now()
+			vectorResults, vectorErr = p.searchVector(ctx, indexName, input, workspaceFilter, queryVectors[0])
+			slog.Info("搜索阶段完成", "stage", "vector", "latency_ms", time.Since(started).Milliseconds(), "result_count", len(vectorResults), "error", vectorErr)
+		}()
+	}
+	wg.Wait()
 
-	// --- 阶段 2: Dense vector 检索 ---
-	embProvider := p.currentEmbeddingProvider()
-	var vectorResults []types.CandidateResult
-	if mode == "hybrid" || mode == "semantic" {
-		if embProvider == nil {
-			// 未配置 embedding provider 时，保持 lexical-only 降级语义。
-			output.Degraded = true
-			output.DegradationReason = "embedding_unavailable"
-		} else {
-			// 直接调用 Embed。Available(ctx) 通常会发起一次健康检查请求，
-			// 再调用 Embed 会让同一次搜索重复访问模型 API；Embed 失败时统一降级。
-			queryInput := chunking.BuildQueryEmbeddingInput(input.Query, input.Profile.EmbeddingQueryInstruction)
-			queryVec, embErr := embProvider.Embed(ctx, []string{queryInput})
-			if embErr != nil || len(queryVec) == 0 {
-				slog.Warn("embedding 不可用，降级为 lexical-only", "error", embErr)
-				output.Degraded = true
-				output.DegradationReason = "embedding_unavailable"
-			} else {
-				// 修复说明：原实现忽略 searchVector 返回错误，ES knn 查询失败（如 400 参数错误）
-				// 时静默产生 0 命中且 degraded=false。现在记录错误：semantic 模式直接降级失败；
-				// hybrid 模式降级为 lexical-only 检索，避免无声空结果。
-				//
-				// 细分降级原因（线上事故修复说明）：原先所有 vector 失败都被统一归因为
-				// vector_search_failed，无法与"ES 抖动"区分；线上真实原因是索引 embedding 维度与
-				// 查询向量维度不一致（索引 dims=1024、查询向量 4096）。此处结合索引 mapping 的
-				// 真实维度做分类，分类只补充诊断信息，原始 vecErr 始终原样写入日志，
-				// 不被分类结果替换、掩盖或吞掉。
-				var vecErr error
-				vectorResults, vecErr = p.searchVector(ctx, indexName, input, workspaceFilter, queryVec[0])
-				if vecErr != nil {
-					queryDims := len(queryVec[0])
-					reason, indexDims, dimsErr := p.classifyVectorFailure(ctx, indexName, queryDims)
-					logArgs := []any{
-						"error", vecErr,
-						"mode", mode,
-						"index", indexName,
-						"index_dims", indexDims,
-						"query_dims", queryDims,
-						"reason", reason,
-					}
-					if dimsErr != nil {
-						// 维度读取自身失败也必须留痕：此时分类已退化为 vector_search_failed，
-						// 若再静默丢弃该错误，排查现场将无任何可用线索。
-						logArgs = append(logArgs, "index_dims_error", dimsErr)
-					}
-					slog.Warn("vector 检索失败", logArgs...)
-					output.Degraded = true
-					output.DegradationReason = reason
-					if mode == "semantic" {
-						// semantic 仅依赖向量检索，失败即无可返回结果
-						output.LatencyMs = int(time.Since(startTime).Milliseconds())
-						return output, nil
-					}
-					vectorResults = nil
-				}
-			}
+	if bm25Err != nil {
+		slog.Warn("BM25 检索失败", "error", bm25Err, "mode", mode)
+		addDegradationReason("bm25_search_failed")
+		bm25Results = nil
+	}
+	if vectorErr != nil {
+		queryDims := len(queryVectors[0])
+		reason, indexDims, dimsErr := p.classifyVectorFailure(ctx, indexName, queryDims)
+		logArgs := []any{"error", vectorErr, "mode", mode, "index", indexName, "index_dims", indexDims, "query_dims", queryDims, "reason", reason}
+		if dimsErr != nil {
+			logArgs = append(logArgs, "index_dims_error", dimsErr)
+		}
+		slog.Warn("vector 检索失败", logArgs...)
+		addDegradationReason(reason)
+		vectorResults = nil
+		if mode == "semantic" {
+			output.LatencyMs = int(time.Since(startTime).Milliseconds())
+			return output, nil
 		}
 	}
 
@@ -319,11 +316,13 @@ func (p *Pipeline) Search(ctx context.Context, input SearchInput) (*SearchOutput
 		reranked, err := rrProvider.Rerank(ctx, input.Query, rerankerCandidates)
 		if err != nil {
 			slog.Warn("reranker 不可用，降级为 RRF 结果", "error", err)
-			output.Degraded = true
-			if output.DegradationReason == "" {
-				output.DegradationReason = "reranker_unavailable"
-			}
+			addDegradationReason("reranker_unavailable")
 			// 直接使用 RRF 结果
+			finalResults = candidatesToResults(candidates)
+		} else if hasDuplicateRerankerIndex(reranked) {
+			// 重复 index 表示 reranker 响应异常；记录后安全回退到 RRF，避免重复结果或丢失候选。
+			slog.Warn("reranker 返回重复 index，降级为 RRF 结果", "result_count", len(reranked))
+			addDegradationReason("reranker_invalid_response")
 			finalResults = candidatesToResults(candidates)
 		} else {
 			output.RerankerUsed = true
@@ -417,7 +416,8 @@ func (p *Pipeline) searchBM25(ctx context.Context, indexName string, input Searc
 	profile := input.Profile
 
 	query := map[string]interface{}{
-		"size": profile.LexicalTopK,
+		"size":    profile.LexicalTopK,
+		"_source": []string{"document_id", "path", "title", "heading", "section_path", "content", "content_hash", "status", "start_line", "end_line", "chunk_index", "revision", "is_special"},
 		"query": map[string]interface{}{
 			"bool": map[string]interface{}{
 				"filter": []interface{}{workspaceFilter},
@@ -448,8 +448,8 @@ func (p *Pipeline) searchBM25(ctx context.Context, indexName string, input Searc
 				"heading": map[string]interface{}{"number_of_fragments": 1, "fragment_size": 80},
 				"content": map[string]interface{}{"number_of_fragments": 2, "fragment_size": 160, "order": "score"},
 			},
-			"pre_tags":             []string{"<em>"},
-			"post_tags":            []string{"</em>"},
+			"pre_tags":            []string{"<em>"},
+			"post_tags":           []string{"</em>"},
 			"require_field_match": false,
 		},
 	}
@@ -482,7 +482,8 @@ func (p *Pipeline) searchVector(ctx context.Context, indexName string, input Sea
 	// 修复说明：原实现误用 "embedding"/"vector" 作为参数名，ES 返回 400，错误被调用方忽略后
 	// 静默产生 0 命中且 degraded=false。修正为 knn query 规范字段名。
 	query := map[string]interface{}{
-		"size": profile.VectorTopK,
+		"size":    profile.VectorTopK,
+		"_source": []string{"document_id", "path", "title", "heading", "section_path", "content", "content_hash", "status", "start_line", "end_line", "chunk_index", "revision", "is_special"},
 		"query": map[string]interface{}{
 			"bool": map[string]interface{}{
 				"filter": []interface{}{workspaceFilter},
@@ -591,6 +592,18 @@ func candidatesToResults(candidates []types.CandidateResult) []types.SearchResul
 	return results
 }
 
+// hasDuplicateRerankerIndex 检查 reranker 响应是否包含重复候选索引。
+func hasDuplicateRerankerIndex(reranked []types.RerankerResult) bool {
+	seen := make(map[int]struct{}, len(reranked))
+	for _, rr := range reranked {
+		if _, exists := seen[rr.Index]; exists {
+			return true
+		}
+		seen[rr.Index] = struct{}{}
+	}
+	return false
+}
+
 // rerankedToResults 将 reranker 结果转换为搜索结果。
 //
 // 注意：reranked 中 Index 越界的条目会被跳过（不产生结果项）。
@@ -598,10 +611,17 @@ func candidatesToResults(candidates []types.CandidateResult) []types.SearchResul
 // 导致结果里混入全空条目；改为按 append 紧凑收集，保证每条都是有效结果。
 func rerankedToResults(candidates []types.CandidateResult, reranked []types.RerankerResult) []types.SearchResult {
 	results := make([]types.SearchResult, 0, len(reranked))
+	seen := make(map[int]struct{}, len(reranked))
 	for _, rr := range reranked {
 		if rr.Index < 0 || rr.Index >= len(candidates) {
+			slog.Warn("reranker 返回越界 index，跳过条目", "index", rr.Index, "candidate_count", len(candidates))
 			continue
 		}
+		if _, exists := seen[rr.Index]; exists {
+			slog.Warn("reranker 返回重复 index，去重条目", "index", rr.Index)
+			continue
+		}
+		seen[rr.Index] = struct{}{}
 		c := candidates[rr.Index]
 		results = append(results, types.SearchResult{
 			DocumentID:  c.Chunk.DocumentID,

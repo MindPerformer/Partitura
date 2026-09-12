@@ -310,11 +310,24 @@ func RepairIssue(ctx context.Context, db *sql.DB, esClient es.Client, indexName 
 //   - embProvider：可选的 embedding provider（nil 时跳过 embedding）
 //   - profileConfig：可选的 profile 配置（提供 chunk 参数和 embedding 指令）
 func reindexDocumentWithEmbedding(ctx context.Context, db *sql.DB, esClient es.Client, indexName, documentID string, embProvider embeddingProviderFunc, profileConfig *types.SearchProfileConfig) error {
-	// 从 PG 读取文档
+	// 在整个重索引期间锁定当前文档行，避免读取旧 revision 后文档更新，再由旧 job 覆盖新 revision。
+	// 该行锁是写入 ES 前的 revision/content_hash fencing：文档更新事务必须等本次索引完成，
+	// 因而不会在旧版本校验后、BulkIndex 前提交新版本。
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("开启文档 %s 重索引 fencing 事务: %w", documentID, err)
+	}
+	defer func() {
+		if rollbackErr := tx.Rollback(); rollbackErr != nil && rollbackErr != sql.ErrTxDone {
+			slog.Error("重索引 fencing 事务回滚失败", "doc_id", documentID, "error", rollbackErr)
+		}
+	}()
+
+	// 从 PG 读取并锁定文档，锁持有至 ES 写入和 refresh 完成。
 	var doc DocumentForIndex
-	err := db.QueryRowContext(ctx,
+	err = tx.QueryRowContext(ctx,
 		`SELECT id, workspace_id, path, title, content_markdown, content_hash, revision_number, status, is_special
-		 FROM documents WHERE id = $1`,
+		 FROM documents WHERE id = $1 FOR UPDATE`,
 		documentID,
 	).Scan(&doc.ID, &doc.WorkspaceID, &doc.Path, &doc.Title, &doc.ContentMarkdown,
 		&doc.ContentHash, &doc.RevisionNumber, &doc.Status, &doc.IsSpecial)
@@ -336,22 +349,20 @@ func reindexDocumentWithEmbedding(ctx context.Context, db *sql.DB, esClient es.C
 			},
 		}
 		if err := esClient.DeleteByQuery(ctx, indexName, delQuery); err != nil {
-			slog.Warn("删除 archived 文档旧 chunk 失败", "doc_id", documentID, "error", err)
+			slog.Error("删除 archived 文档旧 chunk 失败", "doc_id", documentID, "error", err)
+			return fmt.Errorf("删除 archived 文档旧 chunk: %w", err)
+		}
+		if err := esClient.Refresh(ctx, indexName); err != nil {
+			return fmt.Errorf("刷新 archived 文档索引: %w", err)
+		}
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("提交 archived 文档重索引 fencing 事务: %w", err)
 		}
 		return nil
 	}
 
-	// 删除旧 chunk
-	delQuery := map[string]interface{}{
-		"term": map[string]interface{}{
-			"document_id": documentID,
-		},
-	}
-	if err := esClient.DeleteByQuery(ctx, indexName, delQuery); err != nil {
-		return fmt.Errorf("删除旧 chunk: %w", err)
-	}
-
-	// 重新 chunking
+	// 重新 chunking。先构建并写入新 chunk，再清理缩减后遗留的旧 chunk，
+	// 避免 DeleteByQuery→Embed→BulkIndex 期间搜索读到空窗口。
 	targetSize := 0
 	overlap := 0
 	if profileConfig != nil {
@@ -386,27 +397,32 @@ func reindexDocumentWithEmbedding(ctx context.Context, db *sql.DB, esClient es.C
 
 	var embeddings [][]float32
 	if embProvider != nil && profileConfig != nil {
-		embInputs := make([]string, len(chunks))
-		for i, c := range chunks {
-			embInputs[i] = chunking.BuildEmbeddingInput(c, profileConfig.EmbeddingQueryInstruction, profileConfig.EmbeddingDocInstruction)
-		}
-		vectors, embErr := embProvider(ctx, embInputs)
-		if embErr != nil {
-			slog.Warn("embedding 生成失败，job 可重试；文档保存不受影响", "doc_id", documentID, "error", embErr)
-			return fmt.Errorf("embedding 生成失败: %w", embErr)
-		}
-		if len(vectors) != len(chunks) {
-			slog.Error("embedding 返回向量数量不匹配", "expected", len(chunks), "got", len(vectors), "doc_id", documentID)
-			return fmt.Errorf("embedding 返回向量数量不匹配: expected %d, got %d", len(chunks), len(vectors))
-		}
-		// 验证向量维度
-		if len(vectors) > 0 && profileConfig.EmbeddingDimensions > 0 {
-			if len(vectors[0]) != profileConfig.EmbeddingDimensions {
-				slog.Error("embedding 向量维度不匹配", "expected", profileConfig.EmbeddingDimensions, "got", len(vectors[0]), "doc_id", documentID)
-				return fmt.Errorf("embedding 向量维度不匹配: expected %d, got %d", profileConfig.EmbeddingDimensions, len(vectors[0]))
+		const embeddingBatchSize = 32
+		embeddings = make([][]float32, 0, len(chunks))
+		for start := 0; start < len(chunks); start += embeddingBatchSize {
+			end := start + embeddingBatchSize
+			if end > len(chunks) {
+				end = len(chunks)
 			}
+			embInputs := make([]string, end-start)
+			for i, c := range chunks[start:end] {
+				embInputs[i] = chunking.BuildEmbeddingInput(c, profileConfig.EmbeddingQueryInstruction, profileConfig.EmbeddingDocInstruction)
+			}
+			vectors, embErr := embProvider(ctx, embInputs)
+			if embErr != nil {
+				slog.Error("embedding 批处理失败", "doc_id", documentID, "batch_start", start, "batch_size", end-start, "error", embErr)
+				return fmt.Errorf("embedding 生成失败（batch=%d:%d）: %w", start, end, embErr)
+			}
+			if len(vectors) != end-start {
+				return fmt.Errorf("embedding 返回向量数量不匹配（batch=%d:%d）: expected %d, got %d", start, end, end-start, len(vectors))
+			}
+			for i, vector := range vectors {
+				if profileConfig.EmbeddingDimensions > 0 && len(vector) != profileConfig.EmbeddingDimensions {
+					return fmt.Errorf("embedding 向量维度不匹配（chunk=%d）: expected %d, got %d", start+i, profileConfig.EmbeddingDimensions, len(vector))
+				}
+			}
+			embeddings = append(embeddings, vectors...)
 		}
-		embeddings = vectors
 	}
 
 	// 写入 ES
@@ -438,10 +454,46 @@ func reindexDocumentWithEmbedding(ctx context.Context, db *sql.DB, esClient es.C
 		}
 	}
 
+	// 写入前再次读取 fencing 字段，显式确认本次构建仍对应锁定的 revision/content_hash。
+	// 若未来调用链调整为不持有行锁，该检查仍会在 ES 写入前拒绝陈旧数据。
+	var currentRevision int
+	var currentHash string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT revision_number, content_hash FROM documents WHERE id = $1 FOR UPDATE`, documentID,
+	).Scan(&currentRevision, &currentHash); err != nil {
+		return fmt.Errorf("写入 ES 前校验文档 %s fencing 字段: %w", documentID, err)
+	}
+	if currentRevision != doc.RevisionNumber || currentHash != doc.ContentHash {
+		return fmt.Errorf("文档 %s fencing 失败: revision/content_hash 已变化（expected revision=%d hash=%s, got revision=%d hash=%s）",
+			documentID, doc.RevisionNumber, doc.ContentHash, currentRevision, currentHash)
+	}
+
 	if err := esClient.BulkIndex(ctx, indexName, docs); err != nil {
 		return fmt.Errorf("写入 ES: %w", err)
 	}
+	// refresh 是成功条件：只有新 chunk 对搜索可见后，才允许清理缩减后遗留的旧 chunk。
+	if err := esClient.Refresh(ctx, indexName); err != nil {
+		return fmt.Errorf("刷新 ES 索引: %w", err)
+	}
+	// 新 chunk 已可见，清理 chunk 数缩减后遗留的尾部 chunk，不制造可见性空窗。
+	cleanupQuery := map[string]interface{}{
+		"bool": map[string]interface{}{
+			"must": []interface{}{
+				map[string]interface{}{"term": map[string]interface{}{"document_id": documentID}},
+				map[string]interface{}{"range": map[string]interface{}{"chunk_index": map[string]interface{}{"gte": len(chunks)}}},
+			},
+		},
+	}
+	if err := esClient.DeleteByQuery(ctx, indexName, cleanupQuery); err != nil {
+		return fmt.Errorf("清理旧 chunk: %w", err)
+	}
+	if err := esClient.Refresh(ctx, indexName); err != nil {
+		return fmt.Errorf("刷新 ES 索引（清理旧 chunk 后）: %w", err)
+	}
 
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("提交文档 %s 重索引 fencing 事务: %w", documentID, err)
+	}
 	slog.Info("文档重新索引完成", "doc_id", documentID, "chunks", len(chunks), "with_embedding", embeddings != nil)
 	return nil
 }
@@ -452,6 +504,41 @@ type embeddingProviderFunc func(ctx context.Context, texts []string) ([][]float3
 
 // readPGDocuments 从 PG 读取所有非特殊文件、非 archived 的 current documents。
 // 引入动机：C6 要求 archived 文档不被搜索，integrity check 也应排除 archived。
+func readPGDocumentsPage(ctx context.Context, db *sql.DB, workspaceID string, limit, offset int) ([]DocumentForIndex, error) {
+	if limit <= 0 || offset < 0 {
+		return nil, fmt.Errorf("无效分页参数 limit=%d offset=%d", limit, offset)
+	}
+	query := `SELECT id, workspace_id, path, title, content_markdown, content_hash, revision_number, status, is_special
+		 FROM documents WHERE is_special = FALSE AND status != 'archived'`
+	args := make([]interface{}, 0, 3)
+	if workspaceID != "" {
+		query += ` AND workspace_id = $1`
+		args = append(args, workspaceID)
+		query += ` ORDER BY id LIMIT $2 OFFSET $3`
+		args = append(args, limit, offset)
+	} else {
+		query += ` ORDER BY id LIMIT $1 OFFSET $2`
+		args = append(args, limit, offset)
+	}
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("查询 PG 文档分页: %w", err)
+	}
+	defer rows.Close()
+	var docs []DocumentForIndex
+	for rows.Next() {
+		var d DocumentForIndex
+		if err := rows.Scan(&d.ID, &d.WorkspaceID, &d.Path, &d.Title, &d.ContentMarkdown, &d.ContentHash, &d.RevisionNumber, &d.Status, &d.IsSpecial); err != nil {
+			return nil, fmt.Errorf("扫描文档分页行: %w", err)
+		}
+		docs = append(docs, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历文档分页结果集: %w", err)
+	}
+	return docs, nil
+}
+
 func readPGDocuments(ctx context.Context, db *sql.DB, workspaceID string) ([]DocumentForIndex, error) {
 	query := `SELECT id, workspace_id, path, title, content_markdown, content_hash, revision_number, status, is_special
 		 FROM documents WHERE is_special = FALSE AND status != 'archived'`
@@ -1183,11 +1270,10 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 		embFunc = h.embEmbed
 	}
 
-	// 从 PG 读取所有非特殊文件、非 archived 文档
-	docs, err := readPGDocuments(ctx, h.db, workspaceID)
-	if err != nil {
-		return recycleCreatedIndexOnFailure(fmt.Errorf("读取 PG 文档: %w", err))
-	}
+	// 分页从 PG 读取非特殊、非 archived 文档，避免一次性把全量正文载入内存。
+	const rebuildPageSize = 100
+	pageOffset := 0
+	totalDocs := 0
 
 	// 逐文档索引
 	//
@@ -1200,18 +1286,30 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 	// 但最终如果有任何失败，不切换 alias。
 	indexedCount := 0
 	failedCount := 0
-	for _, doc := range docs {
-		if err := reindexDocumentWithEmbedding(ctx, h.db, h.esClient, indexName, doc.ID, embFunc, profileConfig); err != nil {
-			slog.Error("重建索引时文档索引失败", "doc_id", doc.ID, "error", err)
-			if embFunc != nil {
-				// Provider 已配置但索引失败（含 embedding 失败），必须中止
-				return recycleCreatedIndexOnFailure(fmt.Errorf("重建索引时文档 %s 索引失败: %w", doc.ID, err))
-			}
-			// Provider 未配置时，仅 lexical 索引失败可跳过，但记录失败
-			failedCount++
-			continue
+	for {
+		docs, pageErr := readPGDocumentsPage(ctx, h.db, workspaceID, rebuildPageSize, pageOffset)
+		if pageErr != nil {
+			return recycleCreatedIndexOnFailure(fmt.Errorf("读取 PG 文档分页(offset=%d): %w", pageOffset, pageErr))
 		}
-		indexedCount++
+		if len(docs) == 0 {
+			break
+		}
+		totalDocs += len(docs)
+		for _, doc := range docs {
+			if err := reindexDocumentWithEmbedding(ctx, h.db, h.esClient, indexName, doc.ID, embFunc, profileConfig); err != nil {
+				slog.Error("重建索引时文档索引失败", "doc_id", doc.ID, "error", err)
+				if embFunc != nil {
+					return recycleCreatedIndexOnFailure(fmt.Errorf("重建索引时文档 %s 索引失败: %w", doc.ID, err))
+				}
+				failedCount++
+				continue
+			}
+			indexedCount++
+		}
+		pageOffset += len(docs)
+		if len(docs) < rebuildPageSize {
+			break
+		}
 	}
 
 	// 如果有任何文档索引失败（lexical-only 模式），不切换 alias
@@ -1223,9 +1321,10 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 		return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild 有 %d 个文档索引失败，不切换 alias（索引不完整）", failedCount))
 	}
 
-	// 刷新索引
+	// refresh 成功是 rebuild 切换 alias 与成功返回的必要条件。
 	if err := h.esClient.Refresh(ctx, indexName); err != nil {
-		slog.Warn("刷新索引失败", "index", indexName, "error", err)
+		slog.Error("rebuild 刷新索引失败，不切换 alias", "index", indexName, "error", err)
+		return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild 刷新索引: %w", err))
 	}
 
 	// integrity validation
@@ -1261,6 +1360,10 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 				"index", indexName, "total_issues", len(integrityResult.Issues), "repair_failed", repairFailed)
 			return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild 后 %d 个 integrity 问题修复失败，不切换 alias", repairFailed))
 		}
+		// repair 可能执行 DeleteByQuery/BulkIndex；再次 refresh，确保修复后的内容已对搜索可见。
+		if err := h.esClient.Refresh(ctx, indexName); err != nil {
+			return recycleCreatedIndexOnFailure(fmt.Errorf("rebuild integrity 修复后刷新索引: %w", err))
+		}
 	}
 
 	// alias 原子切换
@@ -1270,6 +1373,14 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 		slog.Error("alias 切换失败，保留旧 alias 和旧索引", "index", indexName, "error", err)
 		// alias 未切换成功，本次新建的索引没有被任何 alias 引用，必须回收（复用的索引不受影响）。
 		return recycleCreatedIndexOnFailure(fmt.Errorf("alias 切换失败: %w", err))
+	}
+	// UpdateAlias 成功后再读取 alias，确认 ES 实际已指向目标索引；读取失败或指向错误都必须 fail-fast。
+	aliasIndex, err := h.esClient.GetAliasIndex(ctx, es.AliasName)
+	if err != nil {
+		return recycleCreatedIndexOnFailure(fmt.Errorf("alias 切换后校验失败: %w", err))
+	}
+	if aliasIndex != indexName {
+		return recycleCreatedIndexOnFailure(fmt.Errorf("alias 切换后指向错误索引: expected=%s got=%s", indexName, aliasIndex))
 	}
 
 	// 回写 profile 的 es_index_name。
@@ -1291,7 +1402,7 @@ func (h *IndexJobHandler) handleRebuildIndex(ctx context.Context, job *Job) erro
 		}
 	}
 
-	slog.Info("全量重建索引完成", "index", indexName, "documents", len(docs), "indexed", indexedCount, "failed", failedCount, "profile_id", profileID)
+	slog.Info("全量重建索引完成", "index", indexName, "documents", totalDocs, "indexed", indexedCount, "failed", failedCount, "profile_id", profileID)
 	return nil
 }
 
@@ -1349,11 +1460,16 @@ func (h *IndexJobHandler) handleRepairIndex(ctx context.Context, job *Job) error
 		return fmt.Errorf("完整性检查未完成，ES 可能不可用")
 	}
 
-	// 修复每个问题，使用与索引相同的 embedding 配置
+	// 修复每个问题，使用与索引相同的 embedding 配置；累计失败，确保 job 可重试。
+	repairFailed := 0
 	for _, issue := range result.Issues {
 		if err := RepairIssue(ctx, h.db, h.esClient, indexName, issue, embFunc, profileConfig); err != nil {
+			repairFailed++
 			slog.Error("修复问题失败", "type", issue.Type, "doc_id", issue.DocumentID, "error", err)
 		}
+	}
+	if repairFailed > 0 {
+		return fmt.Errorf("索引修复失败: %d/%d 个问题修复失败", repairFailed, len(result.Issues))
 	}
 
 	slog.Info("索引修复完成", "index", indexName, "issues_found", len(result.Issues))

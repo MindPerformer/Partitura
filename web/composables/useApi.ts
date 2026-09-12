@@ -10,7 +10,7 @@
 // - 分页支持
 // - CSRF 自动注入
 
-import { clearAuthState } from '~/composables/useAuth'
+import { clearAuthState } from "~/composables/useAuth";
 import type {
   ApiError,
   PaginationParams,
@@ -87,16 +87,24 @@ import type {
   PutProviderRequest,
   PutProviderResponse,
   TestProviderRequest,
-  TestProviderResponse
-} from '~/types/api'
+  TestProviderResponse,
+  TuningScope,
+  TuningConfig,
+  UpdateTuningRequest,
+  ValidateTuningRequest,
+  PublishTuningRequest,
+  RollbackTuningRequest,
+  TuningValidationResponse,
+  TuningRecommendationsResponse,
+} from "~/types/api";
 
 /** CSRF cookie 名称 — 与 server config.CSRFCookieName 一致 */
-const CSRF_COOKIE_NAME = 'csrf'
+const CSRF_COOKIE_NAME = "csrf";
 /** CSRF header 名称 — 与 server config.CSRFHeaderName 一致 */
-const CSRF_HEADER_NAME = 'X-CSRF-Token'
+const CSRF_HEADER_NAME = "X-CSRF-Token";
 
 /** 需要 CSRF 保护的状态变更方法 */
-const MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
+const MUTATION_METHODS = new Set(["POST", "PUT", "PATCH", "DELETE"]);
 
 /**
  * 从 cookie 读取 CSRF token。
@@ -108,16 +116,20 @@ const MUTATION_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE'])
  * cookie 被禁用/环境异常时安全降级返回空串并 console.warn（不静默吞掉）。
  */
 function getCsrfToken(): string {
-  if (typeof document === 'undefined') {
-    console.warn('[useApi] document 不可用，无法读取 CSRF cookie')
-    return ''
+  if (typeof document === "undefined") {
+    console.warn("[useApi] document 不可用，无法读取 CSRF cookie");
+    return "";
   }
-  if (typeof navigator !== 'undefined' && navigator.cookieEnabled === false) {
-    console.warn('[useApi] 浏览器 cookie 已禁用，CSRF token 不可用，状态变更请求可能被服务端拒绝')
-    return ''
+  if (typeof navigator !== "undefined" && navigator.cookieEnabled === false) {
+    console.warn(
+      "[useApi] 浏览器 cookie 已禁用，CSRF token 不可用，状态变更请求可能被服务端拒绝",
+    );
+    return "";
   }
-  const match = document.cookie.match(new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]+)`))
-  return match ? decodeURIComponent(match[1]!) : ''
+  const match = document.cookie.match(
+    new RegExp(`(?:^|;\\s*)${CSRF_COOKIE_NAME}=([^;]+)`),
+  );
+  return match ? decodeURIComponent(match[1]!) : "";
 }
 
 /**
@@ -131,15 +143,19 @@ function getCsrfToken(): string {
  *   已在 /login 或 /bootstrap 时也不再跳转，避免刷新循环。
  */
 function handleUnauthorized(failedPath: string): void {
-  clearAuthState()
+  clearAuthState();
 
-  if (typeof window === 'undefined') return
-  const pathname = window.location.pathname
-  if (failedPath === '/auth/me' || pathname === '/login' || pathname === '/bootstrap') {
-    return
+  if (typeof window === "undefined") return;
+  const pathname = window.location.pathname;
+  if (
+    failedPath === "/auth/me" ||
+    pathname === "/login" ||
+    pathname === "/bootstrap"
+  ) {
+    return;
   }
-  const redirect = encodeURIComponent(pathname + window.location.search)
-  window.location.assign(`/login?redirect=${redirect}`)
+  const redirect = encodeURIComponent(pathname + window.location.search);
+  window.location.assign(`/login?redirect=${redirect}`);
 }
 
 /**
@@ -147,23 +163,23 @@ function handleUnauthorized(failedPath: string): void {
  * 开发环境通过 nitro devProxy 代理，生产环境通过 runtimeConfig.public.apiBase。
  */
 function buildUrl(path: string, params?: Record<string, unknown>): string {
-  const config = useRuntimeConfig()
-  const base = config.public.apiBase as string
-  let url = `${base}${path}`
+  const config = useRuntimeConfig();
+  const base = config.public.apiBase as string;
+  let url = `${base}${path}`;
 
   if (params) {
-    const searchParams = new URLSearchParams()
+    const searchParams = new URLSearchParams();
     for (const [key, value] of Object.entries(params)) {
-      if (value !== undefined && value !== null && value !== '') {
-        searchParams.set(key, String(value))
+      if (value !== undefined && value !== null && value !== "") {
+        searchParams.set(key, String(value));
       }
     }
-    const qs = searchParams.toString()
+    const qs = searchParams.toString();
     if (qs) {
-      url += `?${qs}`
+      url += `?${qs}`;
     }
   }
-  return url
+  return url;
 }
 
 /**
@@ -181,58 +197,62 @@ function buildUrl(path: string, params?: Record<string, unknown>): string {
 export async function apiFetch<T>(
   path: string,
   options: {
-    method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
-    body?: unknown
-    query?: Record<string, unknown>
-  } = {}
+    method?: "GET" | "POST" | "PUT" | "PATCH" | "DELETE";
+    body?: unknown;
+    query?: Record<string, unknown>;
+  } = {},
 ): Promise<T> {
-  const { method = 'GET', body, query } = options
+  const { method = "GET", body, query } = options;
 
   const headers: Record<string, string> = {
-    'Accept': 'application/json'
-  }
+    Accept: "application/json",
+  };
 
   // 状态变更请求注入 CSRF token
   if (MUTATION_METHODS.has(method)) {
-    const csrfToken = getCsrfToken()
+    const csrfToken = getCsrfToken();
     if (csrfToken) {
-      headers[CSRF_HEADER_NAME] = csrfToken
+      headers[CSRF_HEADER_NAME] = csrfToken;
     }
   }
 
   if (body !== undefined) {
-    headers['Content-Type'] = 'application/json'
+    headers["Content-Type"] = "application/json";
   }
 
-  const url = buildUrl(path, query)
+  const url = buildUrl(path, query);
 
   try {
     const response = await $fetch.raw<T>(url, {
       method,
       headers,
       body: body !== undefined ? JSON.stringify(body) : undefined,
-      credentials: 'include'
-    })
+      credentials: "include",
+    });
 
-    return response._data as T
+    return response._data as T;
   } catch (err: unknown) {
     // $fetch 抛出 FetchError，包含 response 和 data
-    const fetchErr = err as { response?: { status?: number; _data?: { error?: string } }; message?: string }
-    const status = fetchErr.response?.status ?? 0
-    const message = fetchErr.response?._data?.error ?? fetchErr.message ?? '网络请求失败'
+    const fetchErr = err as {
+      response?: { status?: number; _data?: { error?: string } };
+      message?: string;
+    };
+    const status = fetchErr.response?.status ?? 0;
+    const message =
+      fetchErr.response?._data?.error ?? fetchErr.message ?? "网络请求失败";
 
     // 受控日志：不记录敏感信息（password/token 不会出现在 API 响应 error message 中）
     if (import.meta.dev) {
-      console.error(`[API] ${method} ${path} → ${status}: ${message}`)
+      console.error(`[API] ${method} ${path} → ${status}: ${message}`);
     }
 
     // 401：清理认证态（含 pkw_user cookie）并跳转登录页；/auth/me 探测除外（守卫负责跳转）
     if (status === 401) {
-      handleUnauthorized(path)
+      handleUnauthorized(path);
     }
 
-    const apiError: ApiError = { error: message, status }
-    throw apiError
+    const apiError: ApiError = { error: message, status };
+    throw apiError;
   }
 }
 
@@ -243,66 +263,76 @@ export async function apiFetch<T>(
 export function useAuthApi() {
   return {
     login: (username: string, password: string) =>
-      apiFetch<LoginResponse>('/auth/login', {
-        method: 'POST',
-        body: { username, password }
+      apiFetch<LoginResponse>("/auth/login", {
+        method: "POST",
+        body: { username, password },
       }),
 
     logout: () =>
-      apiFetch<{ status: string }>('/auth/logout', {
-        method: 'POST'
+      apiFetch<{ status: string }>("/auth/logout", {
+        method: "POST",
       }),
 
-    me: () => apiFetch<CurrentUserResponse>('/auth/me'),
+    me: () => apiFetch<CurrentUserResponse>("/auth/me"),
 
     updateEmail: (req: UpdateEmailRequest) =>
-      apiFetch<CurrentUserResponse>('/auth/me/email', { method: 'PUT', body: req }),
+      apiFetch<CurrentUserResponse>("/auth/me/email", {
+        method: "PUT",
+        body: req,
+      }),
 
     updatePassword: (req: UpdatePasswordRequest) =>
-      apiFetch<{ status: string }>('/auth/me/password', { method: 'PUT', body: req }),
+      apiFetch<{ status: string }>("/auth/me/password", {
+        method: "PUT",
+        body: req,
+      }),
 
     deviceAuthorize: (deviceName: string) =>
-      apiFetch<DeviceAuthorizeResponse>('/auth/device/authorize', {
-        method: 'POST',
-        body: { device_name: deviceName }
+      apiFetch<DeviceAuthorizeResponse>("/auth/device/authorize", {
+        method: "POST",
+        body: { device_name: deviceName },
       }),
 
     revoke: (deviceSessionId?: string) =>
-      apiFetch<{ status: string }>('/auth/revoke', {
-        method: 'POST',
-        body: deviceSessionId ? { device_session_id: deviceSessionId } : {}
+      apiFetch<{ status: string }>("/auth/revoke", {
+        method: "POST",
+        body: deviceSessionId ? { device_session_id: deviceSessionId } : {},
       }),
 
     deviceStart: (deviceName: string) =>
-      apiFetch<DeviceAuthStartResponse>('/auth/device/start', {
-        method: 'POST',
-        body: { device_name: deviceName }
+      apiFetch<DeviceAuthStartResponse>("/auth/device/start", {
+        method: "POST",
+        body: { device_name: deviceName },
       }),
 
     devicePoll: (deviceCode: string) =>
-      apiFetch<DeviceAuthPollResponse>('/auth/device/poll', {
-        method: 'POST',
-        body: { device_code: deviceCode }
+      apiFetch<DeviceAuthPollResponse>("/auth/device/poll", {
+        method: "POST",
+        body: { device_code: deviceCode },
       }),
 
     deviceApprove: (userCode: string) =>
-      apiFetch<{ status: string }>('/auth/device/approve', {
-        method: 'POST',
-        body: { user_code: userCode }
+      apiFetch<{ status: string }>("/auth/device/approve", {
+        method: "POST",
+        body: { user_code: userCode },
       }),
 
     deviceDeny: (userCode: string) =>
-      apiFetch<{ status: string }>('/auth/device/deny', {
-        method: 'POST',
-        body: { user_code: userCode }
+      apiFetch<{ status: string }>("/auth/device/deny", {
+        method: "POST",
+        body: { user_code: userCode },
       }),
 
     deviceInfo: (userCode: string) =>
-      apiFetch<DeviceAuthInfoResponse>('/auth/device/info', { query: { code: userCode } }),
+      apiFetch<DeviceAuthInfoResponse>("/auth/device/info", {
+        query: { code: userCode },
+      }),
 
     listSessions: (params?: PaginationParams) =>
-      apiFetch<ListDeviceSessionsResponse>('/auth/device/sessions', { query: params })
-  }
+      apiFetch<ListDeviceSessionsResponse>("/auth/device/sessions", {
+        query: params,
+      }),
+  };
 }
 
 // ============================================================
@@ -312,19 +342,18 @@ export function useAuthApi() {
 export function useWorkspaceApi() {
   return {
     list: (params?: PaginationParams) =>
-      apiFetch<ListWorkspacesResponse>('/workspaces', { query: params }),
+      apiFetch<ListWorkspacesResponse>("/workspaces", { query: params }),
 
     create: (req: CreateWorkspaceRequest) =>
-      apiFetch<Workspace>('/workspaces', { method: 'POST', body: req }),
+      apiFetch<Workspace>("/workspaces", { method: "POST", body: req }),
 
-    get: (id: string) =>
-      apiFetch<Workspace>(`/workspaces/${id}`),
+    get: (id: string) => apiFetch<Workspace>(`/workspaces/${id}`),
 
     update: (id: string, req: UpdateWorkspaceRequest) =>
-      apiFetch<Workspace>(`/workspaces/${id}`, { method: 'PUT', body: req }),
+      apiFetch<Workspace>(`/workspaces/${id}`, { method: "PUT", body: req }),
 
     archive: (id: string) =>
-      apiFetch<Workspace>(`/workspaces/${id}/archive`, { method: 'POST' }),
+      apiFetch<Workspace>(`/workspaces/${id}/archive`, { method: "POST" }),
 
     stats: (id: string) =>
       apiFetch<WorkspaceStatsResponse>(`/workspaces/${id}/stats`),
@@ -333,20 +362,37 @@ export function useWorkspaceApi() {
       apiFetch<MyMembershipResponse>(`/workspaces/${id}/me/membership`),
 
     listMembers: (id: string, params?: PaginationParams) =>
-      apiFetch<ListMembersResponse>(`/workspaces/${id}/members`, { query: params }),
+      apiFetch<ListMembersResponse>(`/workspaces/${id}/members`, {
+        query: params,
+      }),
 
     listMemberCandidates: (id: string, query: string, limit = 10) =>
-      apiFetch<MemberCandidatesResponse>(`/workspaces/${id}/members/candidates`, { query: { q: query, limit } }),
+      apiFetch<MemberCandidatesResponse>(
+        `/workspaces/${id}/members/candidates`,
+        { query: { q: query, limit } },
+      ),
 
     addMember: (id: string, req: AddMemberRequest) =>
-      apiFetch<Member>(`/workspaces/${id}/members`, { method: 'POST', body: req }),
+      apiFetch<Member>(`/workspaces/${id}/members`, {
+        method: "POST",
+        body: req,
+      }),
 
-    updateMemberRole: (id: string, userId: string, req: UpdateMemberRoleRequest) =>
-      apiFetch<Member>(`/workspaces/${id}/members/${userId}`, { method: 'PUT', body: req }),
+    updateMemberRole: (
+      id: string,
+      userId: string,
+      req: UpdateMemberRoleRequest,
+    ) =>
+      apiFetch<Member>(`/workspaces/${id}/members/${userId}`, {
+        method: "PUT",
+        body: req,
+      }),
 
     removeMember: (id: string, userId: string) =>
-      apiFetch<{ status: string }>(`/workspaces/${id}/members/${userId}`, { method: 'DELETE' })
-  }
+      apiFetch<{ status: string }>(`/workspaces/${id}/members/${userId}`, {
+        method: "DELETE",
+      }),
+  };
 }
 
 // ============================================================
@@ -355,57 +401,121 @@ export function useWorkspaceApi() {
 
 export function useDocumentApi() {
   return {
-    list: (workspaceId: string, params?: PaginationParams & { status?: string; type?: string; include_archived?: boolean }) =>
-      apiFetch<ListDocumentsResponse>(`/workspaces/${workspaceId}/documents`, { query: params }),
+    list: (
+      workspaceId: string,
+      params?: PaginationParams & {
+        status?: string;
+        type?: string;
+        include_archived?: boolean;
+      },
+    ) =>
+      apiFetch<ListDocumentsResponse>(`/workspaces/${workspaceId}/documents`, {
+        query: params,
+      }),
 
     outline: (workspaceId: string, path: string) =>
-      apiFetch<OutlineResponse>(`/workspaces/${workspaceId}/documents/outline`, { query: { path } }),
+      apiFetch<OutlineResponse>(
+        `/workspaces/${workspaceId}/documents/outline`,
+        { query: { path } },
+      ),
 
     read: (workspaceId: string, path: string) =>
-      apiFetch<Document>(`/workspaces/${workspaceId}/documents/read`, { query: { path } }),
+      apiFetch<Document>(`/workspaces/${workspaceId}/documents/read`, {
+        query: { path },
+      }),
 
     section: (workspaceId: string, path: string, sectionPath: string) =>
-      apiFetch<SectionResponse>(`/workspaces/${workspaceId}/documents/section`, { query: { path, section_path: sectionPath } }),
+      apiFetch<SectionResponse>(
+        `/workspaces/${workspaceId}/documents/section`,
+        { query: { path, section_path: sectionPath } },
+      ),
 
     lines: (workspaceId: string, path: string, start: number, end: number) =>
-      apiFetch<LinesResponse>(`/workspaces/${workspaceId}/documents/lines`, { query: { path, start, end } }),
+      apiFetch<LinesResponse>(`/workspaces/${workspaceId}/documents/lines`, {
+        query: { path, start, end },
+      }),
 
     create: (workspaceId: string, req: CreateDocumentRequest) =>
-      apiFetch<Document>(`/workspaces/${workspaceId}/documents`, { method: 'POST', body: req }),
+      apiFetch<Document>(`/workspaces/${workspaceId}/documents`, {
+        method: "POST",
+        body: req,
+      }),
 
     replace: (workspaceId: string, path: string, req: ReplaceDocumentRequest) =>
-      apiFetch<Document>(`/workspaces/${workspaceId}/documents`, { method: 'PUT', query: { path }, body: req }),
+      apiFetch<Document>(`/workspaces/${workspaceId}/documents`, {
+        method: "PUT",
+        query: { path },
+        body: req,
+      }),
 
     patch: (workspaceId: string, path: string, req: PatchDocumentRequest) =>
-      apiFetch<Document>(`/workspaces/${workspaceId}/documents`, { method: 'PATCH', query: { path }, body: req }),
+      apiFetch<Document>(`/workspaces/${workspaceId}/documents`, {
+        method: "PATCH",
+        query: { path },
+        body: req,
+      }),
 
     move: (workspaceId: string, path: string, req: MoveDocumentRequest) =>
-      apiFetch<Document>(`/workspaces/${workspaceId}/documents/move`, { method: 'POST', query: { path }, body: req }),
+      apiFetch<Document>(`/workspaces/${workspaceId}/documents/move`, {
+        method: "POST",
+        query: { path },
+        body: req,
+      }),
 
     archive: (workspaceId: string, path: string, req: ArchiveDocumentRequest) =>
-      apiFetch<Document>(`/workspaces/${workspaceId}/documents/archive`, { method: 'POST', query: { path }, body: req }),
+      apiFetch<Document>(`/workspaces/${workspaceId}/documents/archive`, {
+        method: "POST",
+        query: { path },
+        body: req,
+      }),
 
     restore: (workspaceId: string, path: string, req: ArchiveDocumentRequest) =>
-      apiFetch<Document>(`/workspaces/${workspaceId}/documents/restore`, { method: 'POST', query: { path }, body: req }),
+      apiFetch<Document>(`/workspaces/${workspaceId}/documents/restore`, {
+        method: "POST",
+        query: { path },
+        body: req,
+      }),
 
     purge: (workspaceId: string, path: string) =>
-      apiFetch<{ status: string }>(`/workspaces/${workspaceId}/documents/purge`, { method: 'POST', query: { path } }),
+      apiFetch<{ status: string }>(
+        `/workspaces/${workspaceId}/documents/purge`,
+        { method: "POST", query: { path } },
+      ),
 
     history: (workspaceId: string, path: string, params?: PaginationParams) =>
-      apiFetch<ListRevisionsResponse>(`/workspaces/${workspaceId}/documents/history`, { query: { path, ...params } }),
+      apiFetch<ListRevisionsResponse>(
+        `/workspaces/${workspaceId}/documents/history`,
+        { query: { path, ...params } },
+      ),
 
     revision: (workspaceId: string, path: string, revision: number) =>
-      apiFetch<Revision>(`/workspaces/${workspaceId}/documents/revision`, { query: { path, revision } }),
+      apiFetch<Revision>(`/workspaces/${workspaceId}/documents/revision`, {
+        query: { path, revision },
+      }),
 
-    listSources: (workspaceId: string, path: string, params?: PaginationParams) =>
-      apiFetch<ListSourcesResponse>(`/workspaces/${workspaceId}/documents/sources`, { query: { path, ...params } }),
+    listSources: (
+      workspaceId: string,
+      path: string,
+      params?: PaginationParams,
+    ) =>
+      apiFetch<ListSourcesResponse>(
+        `/workspaces/${workspaceId}/documents/sources`,
+        { query: { path, ...params } },
+      ),
 
     addSource: (workspaceId: string, path: string, req: AddSourceRequest) =>
-      apiFetch<Source>(`/workspaces/${workspaceId}/documents/sources`, { method: 'POST', query: { path }, body: req }),
+      apiFetch<Source>(`/workspaces/${workspaceId}/documents/sources`, {
+        method: "POST",
+        query: { path },
+        body: req,
+      }),
 
     deleteSource: (workspaceId: string, sourceId: string) =>
-      apiFetch<{ status: string }>(`/workspaces/${workspaceId}/documents/sources/${sourceId}`, { method: 'DELETE' })
-  }
+      apiFetch<{ status: string }>(
+        `/workspaces/${workspaceId}/documents/sources/${sourceId}`,
+        { method: "DELETE" },
+      ),
+  };
 }
 
 // ============================================================
@@ -415,11 +525,17 @@ export function useDocumentApi() {
 export function useSearchApi() {
   return {
     search: (workspaceId: string, req: SearchRequest) =>
-      apiFetch<SearchResponse>(`/workspaces/${workspaceId}/search`, { method: 'POST', body: req }),
+      apiFetch<SearchResponse>(`/workspaces/${workspaceId}/search`, {
+        method: "POST",
+        body: req,
+      }),
 
     feedback: (workspaceId: string, req: SearchFeedbackRequest) =>
-      apiFetch<{ status: string }>(`/workspaces/${workspaceId}/search/feedback`, { method: 'POST', body: req })
-  }
+      apiFetch<{ status: string }>(
+        `/workspaces/${workspaceId}/search/feedback`,
+        { method: "POST", body: req },
+      ),
+  };
 }
 
 // ============================================================
@@ -429,70 +545,170 @@ export function useSearchApi() {
 export function useAdminApi() {
   return {
     listUsers: (params?: AdminUserFilterParams) =>
-      apiFetch<ListUsersResponse>('/admin/users', { query: params }),
+      apiFetch<ListUsersResponse>("/admin/users", { query: params }),
 
     createUser: (req: CreateUserRequest) =>
-      apiFetch<AdminUser>('/admin/users', { method: 'POST', body: req }),
+      apiFetch<AdminUser>("/admin/users", { method: "POST", body: req }),
 
     updateUser: (id: string, req: UpdateUserRequest) =>
-      apiFetch<AdminUser>(`/admin/users/${id}`, { method: 'PUT', body: req }),
+      apiFetch<AdminUser>(`/admin/users/${id}`, { method: "PUT", body: req }),
 
     listAllWorkspaces: (params?: AdminWorkspaceFilterParams) =>
-      apiFetch<ListWorkspacesResponse>('/admin/workspaces', { query: params }),
+      apiFetch<ListWorkspacesResponse>("/admin/workspaces", { query: params }),
 
     listAudit: (params?: AdminAuditFilterParams) =>
-      apiFetch<ListAuditResponse>('/admin/audit', { query: params })
-  }
+      apiFetch<ListAuditResponse>("/admin/audit", { query: params }),
+  };
 }
 
 // ============================================================
 // Admin API (search module)
 // ============================================================
 
+export function useTuningApi() {
+  const path = (scope: TuningScope, workspaceId?: string) => {
+    if (scope === "workspace") {
+      if (!workspaceId)
+        throw new Error("workspace tuning API requires workspaceId");
+      return `/workspaces/${workspaceId}/tuning`;
+    }
+    return "/admin/tuning";
+  };
+  return {
+    get: (scope: TuningScope, workspaceId?: string) =>
+      apiFetch<TuningConfig>(path(scope, workspaceId)),
+    updateDraft: (
+      scope: TuningScope,
+      req: UpdateTuningRequest,
+      workspaceId?: string,
+    ) =>
+      apiFetch<TuningConfig>(`${path(scope, workspaceId)}/draft`, {
+        method: "PUT",
+        body: req,
+      }),
+    validate: (
+      scope: TuningScope,
+      req: ValidateTuningRequest,
+      workspaceId?: string,
+    ) =>
+      apiFetch<TuningValidationResponse>(
+        `${path(scope, workspaceId)}/validate`,
+        { method: "POST", body: req },
+      ),
+    recommendations: (scope: TuningScope, workspaceId?: string) =>
+      apiFetch<TuningRecommendationsResponse>(
+        `${path(scope, workspaceId)}/recommendations`,
+      ),
+    publish: (
+      scope: TuningScope,
+      req: PublishTuningRequest,
+      workspaceId?: string,
+    ) =>
+      apiFetch<TuningConfig>(`${path(scope, workspaceId)}/publish`, {
+        method: "POST",
+        body: req,
+      }),
+    rollback: (
+      scope: TuningScope,
+      req: RollbackTuningRequest,
+      workspaceId?: string,
+    ) =>
+      apiFetch<TuningConfig>(`${path(scope, workspaceId)}/rollback`, {
+        method: "POST",
+        body: req,
+      }),
+    releaseOverride: (
+      scope: TuningScope,
+      req: PublishTuningRequest,
+      workspaceId?: string,
+    ) =>
+      apiFetch<TuningConfig>(`${path(scope, workspaceId)}/override`, {
+        method: "DELETE",
+        body: req,
+      }),
+  };
+}
+
 export function useSearchAdminApi() {
   return {
     listProfiles: (params?: PaginationParams & { status?: string }) =>
-      apiFetch<ListProfilesResponse>('/admin/search-profiles', { query: params }),
+      apiFetch<ListProfilesResponse>("/admin/search-profiles", {
+        query: params,
+      }),
 
     createProfile: (req: CreateProfileRequest) =>
-      apiFetch<SearchProfile>('/admin/search-profiles', { method: 'POST', body: req }),
+      apiFetch<SearchProfile>("/admin/search-profiles", {
+        method: "POST",
+        body: req,
+      }),
 
     // 新建版本：基于现有 profile 派生新 draft 版本，未提供的字段由服务端继承源 profile。
     createProfileVersion: (id: string, req: CreateProfileVersionRequest) =>
-      apiFetch<SearchProfile>(`/admin/search-profiles/${id}/versions`, { method: 'POST', body: req }),
+      apiFetch<SearchProfile>(`/admin/search-profiles/${id}/versions`, {
+        method: "POST",
+        body: req,
+      }),
 
     // 归档：保留记录不物理删除，归档后可通过 rollback 重新激活。
     archiveProfile: (id: string) =>
-      apiFetch<{ status: string }>(`/admin/search-profiles/${id}/archive`, { method: 'POST' }),
+      apiFetch<{ status: string }>(`/admin/search-profiles/${id}/archive`, {
+        method: "POST",
+      }),
 
     activateProfile: (id: string) =>
-      apiFetch<{ status: string }>(`/admin/search-profiles/${id}/activate`, { method: 'POST' }),
+      apiFetch<{ status: string }>(`/admin/search-profiles/${id}/activate`, {
+        method: "POST",
+      }),
 
     rollbackProfile: (id: string) =>
-      apiFetch<{ status: string }>(`/admin/search-profiles/${id}/rollback`, { method: 'POST' }),
+      apiFetch<{ status: string }>(`/admin/search-profiles/${id}/rollback`, {
+        method: "POST",
+      }),
 
     listCandidates: (params?: PaginationParams & { status?: string }) =>
-      apiFetch<{ candidates: unknown[]; total: number; limit: number; offset: number }>('/admin/search-profiles/candidates', { query: params }),
+      apiFetch<{
+        candidates: unknown[];
+        total: number;
+        limit: number;
+        offset: number;
+      }>("/admin/search-profiles/candidates", { query: params }),
 
     confirmCandidate: (id: string) =>
-      apiFetch<{ status: string }>(`/admin/search-profiles/candidates/${id}/confirm`, { method: 'POST' }),
+      apiFetch<{ status: string }>(
+        `/admin/search-profiles/candidates/${id}/confirm`,
+        { method: "POST" },
+      ),
 
     listDatasets: (params?: PaginationParams & { status?: string }) =>
-      apiFetch<ListDatasetsResponse>('/admin/evaluation/datasets', { query: params }),
+      apiFetch<ListDatasetsResponse>("/admin/evaluation/datasets", {
+        query: params,
+      }),
 
     createDataset: (req: CreateDatasetRequest) =>
-      apiFetch<EvaluationDataset>('/admin/evaluation/datasets', { method: 'POST', body: req }),
+      apiFetch<EvaluationDataset>("/admin/evaluation/datasets", {
+        method: "POST",
+        body: req,
+      }),
 
     addItem: (datasetId: string, req: AddItemRequest) =>
-      apiFetch<{ id: string }>(`/admin/evaluation/datasets/${datasetId}/items`, { method: 'POST', body: req }),
+      apiFetch<{ id: string }>(
+        `/admin/evaluation/datasets/${datasetId}/items`,
+        { method: "POST", body: req },
+      ),
 
     /** GET /admin/evaluation/datasets/{id}/items — 评测条目分页列表 */
     listItems: (datasetId: string, params?: PaginationParams) =>
-      apiFetch<ListItemsResponse>(`/admin/evaluation/datasets/${datasetId}/items`, { query: params }),
+      apiFetch<ListItemsResponse>(
+        `/admin/evaluation/datasets/${datasetId}/items`,
+        { query: params },
+      ),
 
     /** DELETE /admin/evaluation/datasets/{id}/items/{itemId} — 删除单条评测条目（CSRF + system_admin） */
     deleteItem: (datasetId: string, itemId: string) =>
-      apiFetch<{ status: string }>(`/admin/evaluation/datasets/${datasetId}/items/${itemId}`, { method: 'DELETE' }),
+      apiFetch<{ status: string }>(
+        `/admin/evaluation/datasets/${datasetId}/items/${itemId}`,
+        { method: "DELETE" },
+      ),
 
     /**
      * DELETE /admin/evaluation/datasets/{id} — 软删（归档）数据集。
@@ -500,33 +716,50 @@ export function useSearchAdminApi() {
      * 归档为 API 层终态，无 restore 端点；归档后 RunEvaluation/AddItem 返回 409。
      */
     deleteDataset: (datasetId: string) =>
-      apiFetch<{ status: string }>(`/admin/evaluation/datasets/${datasetId}`, { method: 'DELETE' }),
+      apiFetch<{ status: string }>(`/admin/evaluation/datasets/${datasetId}`, {
+        method: "DELETE",
+      }),
 
     runEvaluation: (req: RunEvaluationRequest) =>
-      apiFetch<{ status: string; job_id: string; dataset_id: string; profile_id: string }>('/admin/evaluation/run', { method: 'POST', body: req }),
+      apiFetch<{
+        status: string;
+        job_id: string;
+        dataset_id: string;
+        profile_id: string;
+      }>("/admin/evaluation/run", { method: "POST", body: req }),
 
     listEvaluationResults: (datasetId: string, params?: PaginationParams) =>
-      apiFetch<ListEvaluationResultsResponse>('/admin/evaluation/results', { query: { dataset_id: datasetId, ...params } }),
+      apiFetch<ListEvaluationResultsResponse>("/admin/evaluation/results", {
+        query: { dataset_id: datasetId, ...params },
+      }),
 
     listJobs: (params?: PaginationParams & { status?: string }) =>
-      apiFetch<ListJobsResponse>('/admin/jobs', { query: params }),
+      apiFetch<ListJobsResponse>("/admin/jobs", { query: params }),
 
     retryJob: (id: string) =>
-      apiFetch<{ status: string }>(`/admin/jobs/${id}/retry`, { method: 'POST' }),
+      apiFetch<{ status: string }>(`/admin/jobs/${id}/retry`, {
+        method: "POST",
+      }),
 
     rebuildIndex: (req: { workspace_id?: string; index_name?: string }) =>
-      apiFetch<{ status: string }>('/admin/jobs/rebuild', { method: 'POST', body: req }),
+      apiFetch<{ status: string }>("/admin/jobs/rebuild", {
+        method: "POST",
+        body: req,
+      }),
 
     // Settings 管理（Phase6 WP3）
     listSettings: () =>
-      apiFetch<ListSettingsResponse>('/admin/config/settings'),
+      apiFetch<ListSettingsResponse>("/admin/config/settings"),
 
     updateSetting: (key: string, req: UpdateSettingRequest) =>
-      apiFetch<UpdateSettingResponse>(`/admin/config/settings/${key}`, { method: 'PUT', body: req }),
+      apiFetch<UpdateSettingResponse>(`/admin/config/settings/${key}`, {
+        method: "PUT",
+        body: req,
+      }),
 
     getRuntimeStatus: () =>
-      apiFetch<RuntimeStatusResponse>('/admin/config/runtime')
-  }
+      apiFetch<RuntimeStatusResponse>("/admin/config/runtime"),
+  };
 }
 
 // ============================================================
@@ -542,13 +775,12 @@ export function useSearchAdminApi() {
 export function useBootstrapApi() {
   return {
     /** GET /api/bootstrap — 查询 Bootstrap 是否可用 */
-    getStatus: () =>
-      apiFetch<BootstrapStatusResponse>('/bootstrap'),
+    getStatus: () => apiFetch<BootstrapStatusResponse>("/bootstrap"),
 
     /** POST /api/bootstrap — 创建首个 system_admin（仅 users 表为空时可用） */
     createAdmin: (req: BootstrapRequest) =>
-      apiFetch<BootstrapResponse>('/bootstrap', { method: 'POST', body: req })
-  }
+      apiFetch<BootstrapResponse>("/bootstrap", { method: "POST", body: req }),
+  };
 }
 
 // ============================================================
@@ -571,19 +803,24 @@ export function useBootstrapApi() {
 export function useProviderApi() {
   return {
     /** GET /api/admin/providers — 列出所有 Provider 状态和非敏感配置 */
-    list: () =>
-      apiFetch<ListProvidersResponse>('/admin/providers'),
+    list: () => apiFetch<ListProvidersResponse>("/admin/providers"),
 
     /** GET /api/admin/providers/{type} — 获取单个 Provider 状态和非敏感配置 */
-    get: (type: 'embedding' | 'reranker') =>
+    get: (type: "embedding" | "reranker") =>
       apiFetch<ProviderConfigDTO>(`/admin/providers/${type}`),
 
     /** PUT /api/admin/providers/{type} — 加密写入 Provider 配置并热更新 */
-    put: (type: 'embedding' | 'reranker', req: PutProviderRequest) =>
-      apiFetch<PutProviderResponse>(`/admin/providers/${type}`, { method: 'PUT', body: req }),
+    put: (type: "embedding" | "reranker", req: PutProviderRequest) =>
+      apiFetch<PutProviderResponse>(`/admin/providers/${type}`, {
+        method: "PUT",
+        body: req,
+      }),
 
     /** POST /api/admin/providers/{type}/test — 临时测试 Provider 连通性，不持久化 */
-    test: (type: 'embedding' | 'reranker', req: TestProviderRequest) =>
-      apiFetch<TestProviderResponse>(`/admin/providers/${type}/test`, { method: 'POST', body: req })
-  }
+    test: (type: "embedding" | "reranker", req: TestProviderRequest) =>
+      apiFetch<TestProviderResponse>(`/admin/providers/${type}/test`, {
+        method: "POST",
+        body: req,
+      }),
+  };
 }

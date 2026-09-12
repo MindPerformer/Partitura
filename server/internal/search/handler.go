@@ -14,11 +14,13 @@
 package search
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
+	"strings"
 
 	"partitura/server/internal/auth"
 	"partitura/server/internal/es"
@@ -33,9 +35,10 @@ import (
 // Handler 是搜索 HTTP handler。
 // 引入动机：design/04-WEB-API.md §Search 要求搜索和反馈 API。
 type Handler struct {
-	pipeline    *pipeline.Pipeline
-	profileRepo profile.Repository
-	metricsRepo job.SearchMetricsRepo
+	pipeline        *pipeline.Pipeline
+	profileRepo     profile.Repository
+	metricsRepo     job.SearchMetricsRepo
+	profileResolver func(context.Context, string) (*profile.ProfileRecord, types.SearchProfileConfig, error)
 }
 
 // AuditRepo 定义审计记录接口（复用 audit.Repository 的子集）。
@@ -44,11 +47,13 @@ type Handler struct {
 
 // NewHandler 创建搜索 handler。
 func NewHandler(pipe *pipeline.Pipeline, profileRepo profile.Repository, metricsRepo job.SearchMetricsRepo) *Handler {
-	return &Handler{
-		pipeline:    pipe,
-		profileRepo: profileRepo,
-		metricsRepo: metricsRepo,
-	}
+	return &Handler{pipeline: pipe, profileRepo: profileRepo, metricsRepo: metricsRepo}
+}
+
+// WithProfileResolver 注入 workspace effective profile 解析器。
+func (h *Handler) WithProfileResolver(resolve func(context.Context, string) (*profile.ProfileRecord, types.SearchProfileConfig, error)) *Handler {
+	h.profileResolver = resolve
+	return h
 }
 
 // searchRequest 是搜索 API 的请求体。
@@ -89,8 +94,14 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	const maxQueryRunes = 4096
+	req.Query = strings.TrimSpace(req.Query)
 	if req.Query == "" {
-		writeSearchError(w, http.StatusBadRequest, "query 不能为空")
+		writeSearchError(w, http.StatusBadRequest, "query 不能为空或仅包含空白")
+		return
+	}
+	if len([]rune(req.Query)) > maxQueryRunes {
+		writeSearchError(w, http.StatusBadRequest, fmt.Sprintf("query 超长，最多允许 %d 个字符", maxQueryRunes))
 		return
 	}
 
@@ -131,8 +142,18 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// 获取 active profile
-	profileRecord, err := h.profileRepo.GetActiveProfile(r.Context())
+	// 获取 workspace effective profile；未注入 resolver 时使用全局 active profile。
+	var profileRecord *profile.ProfileRecord
+	var profileConfig types.SearchProfileConfig
+	var err error
+	if h.profileResolver != nil {
+		profileRecord, profileConfig, err = h.profileResolver(r.Context(), wsc.WorkspaceID)
+	} else {
+		profileRecord, err = h.profileRepo.GetActiveProfile(r.Context())
+		if err == nil {
+			profileConfig = profileRecord.ToConfig()
+		}
+	}
 	if err != nil {
 		slog.Error("获取 active profile 失败", "error", err)
 		// 无 active profile 时返回 degraded
@@ -144,8 +165,6 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 		writeSearchJSON(w, http.StatusOK, resp)
 		return
 	}
-
-	profileConfig := profileRecord.ToConfig()
 
 	// 执行搜索管线
 	//
@@ -221,11 +240,11 @@ func (h *Handler) Search(w http.ResponseWriter, r *http.Request) {
 
 // feedbackRequest 是搜索反馈 API 的请求体。
 type feedbackRequest struct {
-	FeedbackType string `json:"feedback_type"`
-	Query        string `json:"query"`
-	DocumentID   string `json:"document_id"`
+	FeedbackType string          `json:"feedback_type"`
+	Query        string          `json:"query"`
+	DocumentID   string          `json:"document_id"`
 	Detail       json.RawMessage `json:"detail,omitempty"`
-	SearchID     string `json:"search_id"`
+	SearchID     string          `json:"search_id"`
 }
 
 // Feedback 处理 POST /api/workspaces/{wid}/search/feedback。

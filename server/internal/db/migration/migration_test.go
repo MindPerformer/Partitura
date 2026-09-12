@@ -616,10 +616,10 @@ func TestIntegration_M001SchemaForeignKeys(t *testing.T) {
 	// workspace_members.workspace_id → workspaces.id
 	// workspace_members.user_id → users.id
 	expectedFKs := []struct {
-		tableName      string
-		columnName     string
-		refTableName   string
-		refColumnName  string
+		tableName     string
+		columnName    string
+		refTableName  string
+		refColumnName string
 	}{
 		{"sessions", "user_id", "users", "id"},
 		{"device_sessions", "user_id", "users", "id"},
@@ -719,9 +719,9 @@ func TestIntegration_M001WorkspaceRetentionFields(t *testing.T) {
 
 	// 验证 workspaces 表有 revision retention 和 document size 配置字段
 	expectedCols := map[string]string{
-		"revision_retention_days":  "int",
-		"revision_max_count":       "int",
-		"max_document_size_bytes":  "int",
+		"revision_retention_days": "int",
+		"revision_max_count":      "int",
+		"max_document_size_bytes": "int",
 	}
 
 	for col, expectedType := range expectedCols {
@@ -780,12 +780,12 @@ func TestLoadMigrations_SortedByVersion(t *testing.T) {
 
 	// 故意以乱序写入文件
 	files := map[string]string{
-		"M003_third_up.sql":      "CREATE TABLE t3();",
-		"M003_third_down.sql":    "DROP TABLE t3;",
-		"M001_first_up.sql":      "CREATE TABLE t1();",
-		"M001_first_down.sql":    "DROP TABLE t1;",
-		"M002_second_up.sql":     "CREATE TABLE t2();",
-		"M002_second_down.sql":   "DROP TABLE t2;",
+		"M003_third_up.sql":    "CREATE TABLE t3();",
+		"M003_third_down.sql":  "DROP TABLE t3;",
+		"M001_first_up.sql":    "CREATE TABLE t1();",
+		"M001_first_down.sql":  "DROP TABLE t1;",
+		"M002_second_up.sql":   "CREATE TABLE t2();",
+		"M002_second_down.sql": "DROP TABLE t2;",
 	}
 
 	for name, content := range files {
@@ -822,7 +822,7 @@ func TestLoadMigrations_SortedByVersion(t *testing.T) {
 // TestLoadMigrations_ProjectDir_NoM005 验证项目迁移目录中不存在 M005 文件。
 // 引入动机：F1 修复——M005 保留给 Phase 6 system_settings，evaluation_results 已并入 M004。
 // Phase 4 新增 M006 device_authorizations，允许版本 6 存在。
-// Phase 6 新增 M007 scheduler_runs，允许版本 7 存在；M008 device_auth_completed；M009 settings；M010 provider_secrets。
+// Phase 6 新增 M007 scheduler_runs，允许版本 7 存在；M008 device_auth_completed；M009 settings；M010 provider_secrets；M011 pg_trgm_fuzzy_indexes；M012 job/document 查询索引；M013 tuning overrides。
 func TestLoadMigrations_ProjectDir_NoM005(t *testing.T) {
 	migrationsDir := findProjectMigrationsDir(t)
 	migrations, err := LoadMigrations(migrationsDir)
@@ -836,15 +836,15 @@ func TestLoadMigrations_ProjectDir_NoM005(t *testing.T) {
 		}
 	}
 
-	// 验证最高版本为 11（M011 pg_trgm_fuzzy_indexes）
+	// 验证最高版本为 M013（tuning overrides）
 	maxVersion := 0
 	for _, m := range migrations {
 		if m.Version > maxVersion {
 			maxVersion = m.Version
 		}
 	}
-	if maxVersion != 11 {
-		t.Errorf("最高迁移版本应为 11（M011），实际 %d", maxVersion)
+	if maxVersion != 13 {
+		t.Errorf("最高迁移版本应为 13（M013），实际 %d", maxVersion)
 	}
 }
 

@@ -45,7 +45,7 @@ func (m *mockProfileRepo) GetActiveProfile(ctx context.Context) (*profile.Profil
 	}
 	return m.activeProfile, nil
 }
-func (m *mockProfileRepo) ActivateProfile(ctx context.Context, id string) error { return nil }
+func (m *mockProfileRepo) ActivateProfile(ctx context.Context, id string) error   { return nil }
 func (m *mockProfileRepo) DeactivateProfile(ctx context.Context, id string) error { return nil }
 
 // ArchiveProfile 补齐 profile.Repository 接口；搜索 handler 不涉及归档，返回 nil。
@@ -115,7 +115,9 @@ func (c *fakeSearchESClient) GetIndexDimensions(ctx context.Context, indexName s
 	return 0, nil
 }
 
-func (c *fakeSearchESClient) UpdateAlias(ctx context.Context, actions []es.AliasAction) error { return nil }
+func (c *fakeSearchESClient) UpdateAlias(ctx context.Context, actions []es.AliasAction) error {
+	return nil
+}
 
 func (c *fakeSearchESClient) GetAliasIndex(ctx context.Context, alias string) (string, error) {
 	return "", nil
@@ -372,6 +374,25 @@ func TestSearch_EmptyQuery_Returns400(t *testing.T) {
 
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("空 query 应返回 400，实际 %d", w.Code)
+	}
+}
+
+func TestSearch_WhitespaceQuery_Returns400(t *testing.T) {
+	handler := newTestHandler(&mockProfileRepo{})
+	w := httptest.NewRecorder()
+	handler.Search(w, makeSearchRequest(`{"query":"  \t\n"}`))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("空白 query 应返回 400，实际 %d", w.Code)
+	}
+}
+
+func TestSearch_OverlongQuery_Returns400(t *testing.T) {
+	handler := newTestHandler(&mockProfileRepo{})
+	w := httptest.NewRecorder()
+	query := strings.Repeat("中", 4097)
+	handler.Search(w, makeSearchRequest(`{"query":"`+query+`"}`))
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("超长 query 应返回 400，实际 %d", w.Code)
 	}
 }
 

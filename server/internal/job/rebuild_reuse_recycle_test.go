@@ -67,11 +67,25 @@ func (c *singleDocumentConn) Prepare(query string) (driver.Stmt, error) {
 func (c *singleDocumentConn) Close() error { return nil }
 
 func (c *singleDocumentConn) Begin() (driver.Tx, error) {
-	return nil, errors.New("测试用单文档 connector 不支持事务")
+	return singleDocumentTx{}, nil
 }
 
+// singleDocumentTx 是测试连接的轻量事务替身。
+// 生产 fencing 通过 database/sql Tx 执行 SELECT ... FOR UPDATE；测试只需提供
+// 正常 Commit/Rollback 生命周期，不能因为 fake 不支持事务而绕过真正的 ES 失败路径。
+type singleDocumentTx struct{}
+
+func (singleDocumentTx) Commit() error   { return nil }
+func (singleDocumentTx) Rollback() error { return nil }
+
 func (c *singleDocumentConn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	return &singleDocumentRows{values: singleDocumentValues(c.doc)}, nil
+	if strings.Contains(query, "SELECT revision_number, content_hash") {
+		return &singleDocumentRows{
+			columns: []string{"revision_number", "content_hash"},
+			values:  []driver.Value{int64(c.doc.RevisionNumber), c.doc.ContentHash},
+		}, nil
+	}
+	return &singleDocumentRows{columns: emptyDocumentColumns, values: singleDocumentValues(c.doc)}, nil
 }
 
 func (c *singleDocumentConn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
@@ -89,11 +103,12 @@ func singleDocumentValues(doc DocumentForIndex) []driver.Value {
 
 // singleDocumentRows 是恰好一行的结果集：第一次 Next 返回该行，之后返回 io.EOF。
 type singleDocumentRows struct {
-	values []driver.Value
-	read   bool
+	columns []string
+	values  []driver.Value
+	read    bool
 }
 
-func (r *singleDocumentRows) Columns() []string { return emptyDocumentColumns }
+func (r *singleDocumentRows) Columns() []string { return r.columns }
 func (r *singleDocumentRows) Close() error      { return nil }
 
 func (r *singleDocumentRows) Next(dest []driver.Value) error {

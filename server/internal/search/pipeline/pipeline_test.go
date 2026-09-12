@@ -11,6 +11,7 @@ import (
 	"context"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"partitura/server/internal/es"
@@ -20,6 +21,7 @@ import (
 // fakeESClient 是测试用的可控 ES 客户端。
 // 引入动机：pipeline 测试需要可控的 ES 客户端，不依赖真实 ES。
 type fakeESClient struct {
+	mu         sync.RWMutex
 	indices    map[string]bool
 	aliasIndex string
 	docs       map[string]map[string]map[string]interface{}
@@ -154,6 +156,8 @@ func (c *fakeESClient) DeleteByQuery(ctx context.Context, indexName string, quer
 }
 
 func (c *fakeESClient) Search(ctx context.Context, indexName string, query map[string]interface{}) (*es.SearchResponse, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
 	c.searchedIndices = append(c.searchedIndices, indexName)
 	c.lastQuery = query
 	resp := &es.SearchResponse{}
@@ -288,27 +292,23 @@ func testProfile() types.SearchProfileConfig {
 	}
 }
 
-func TestSearch_ESUnavailable_DegradedResponse(t *testing.T) {
+func TestSearch_DoesNotPingESOnHotPath(t *testing.T) {
 	client := newFakeESClient()
-	client.SetPingOK(false) // ES 不可用
+	client.SetPingOK(false)
 
 	pipe := NewPipeline(client, nil, nil)
-
 	output, err := pipe.Search(context.Background(), SearchInput{
 		WorkspaceID: "ws-1",
 		Query:       "test",
 		Profile:     testProfile(),
 		Limit:       10,
+		Mode:        "lexical",
 	})
 	if err != nil {
-		t.Fatalf("ES 不可用时 Search 不应返回错误: %v", err)
+		t.Fatalf("搜索不应返回错误: %v", err)
 	}
-
-	if !output.Degraded {
-		t.Error("ES 不可用时应返回 degraded=true")
-	}
-	if output.DegradationReason != "elasticsearch_unavailable" {
-		t.Errorf("降级原因应为 elasticsearch_unavailable，得到 %s", output.DegradationReason)
+	if output.Degraded {
+		t.Fatalf("lexical 搜索不应因未调用 Ping 而降级: %s", output.DegradationReason)
 	}
 }
 
@@ -505,6 +505,7 @@ func TestSearch_LimitClampedTo100(t *testing.T) {
 // 需要回归测试锁定正确字段（field/query_vector）。
 type capturingESClient struct {
 	*fakeESClient
+	mu        sync.RWMutex
 	lastQuery map[string]interface{}
 	// knnErr 非 nil 时，仅对包含 knn 子句的查询（vector 检索）返回该错误，
 	// BM25/其他查询正常放行——用于验证 hybrid 模式 vector 失败回退 lexical。
@@ -512,7 +513,9 @@ type capturingESClient struct {
 }
 
 func (c *capturingESClient) Search(ctx context.Context, indexName string, query map[string]interface{}) (*es.SearchResponse, error) {
+	c.mu.Lock()
 	c.lastQuery = query
+	c.mu.Unlock()
 	if c.knnErr != nil {
 		if _, err := mustExtractKNN(query); err == nil {
 			return nil, c.knnErr
@@ -1449,8 +1452,8 @@ func TestSearch_EndToEnd_DocAggregationAndSnippet(t *testing.T) {
 	// d1 两 chunk 的 content 是"开头套话"/"其他段"，d2 是"另一个文档"。
 	// 给 d1 高分、d2 极低分（归一化 0.05/0.9≈0.056 < 0.15 → 裁剪）。
 	rrProvider := &scoringReranker{scoreByContentSubstr: map[string]float64{
-		"开头套话":   0.9,
-		"其他段":    0.6,
+		"开头套话":  0.9,
+		"其他段":   0.6,
 		"另一个文档": 0.05,
 	}}
 

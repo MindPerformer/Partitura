@@ -26,6 +26,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
 
 	types "partitura/server/internal/search/types"
@@ -158,60 +159,56 @@ func (r *PGRepository) EnqueueInTx(ctx context.Context, tx *sql.Tx, jobType stri
 // Claim 使用 SKIP LOCKED 获取一个待执行任务。
 // 引入动机：design/05-OPERATIONS.md §Background Jobs 要求 SKIP LOCKED。
 func (r *PGRepository) Claim(ctx context.Context, workerID string) (*Job, error) {
+	// 保持 string 参数以兼容现有 Repository/Worker 调用方，但在进入事务前
+	// 显式校验并规范化 UUID；locked_by 列是 UUID，非法 worker ID 必须立即失败，
+	// 避免把契约错误推迟到数据库执行阶段。
+	parsedWorkerID, err := uuid.Parse(workerID)
+	if err != nil {
+		return nil, fmt.Errorf("无效 worker ID（必须是 UUID）: %w", err)
+	}
+	workerID = parsedWorkerID.String()
+
 	tx, err := r.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, fmt.Errorf("开启 claim 事务: %w", err)
 	}
-
-	// 无条件 Rollback 确保任意 return 路径都释放事务，避免 idle in transaction 泄漏。
-	// Commit 成功后 Rollback 返回 sql.ErrTxDone，属于安全无副作用操作，直接忽略。
-	// 此修复解决原先 defer 检查外层 err 时，json.Unmarshal 使用 := 遮蔽外层 err
-	// 导致 JSON 解析错误返回时 defer 不触发 Rollback 的事务泄漏问题。
 	defer func() {
 		if rbErr := tx.Rollback(); rbErr != nil && rbErr != sql.ErrTxDone {
 			slog.Error("claim 事务回滚失败", "error", rbErr)
 		}
 	}()
 
-	// SKIP LOCKED 获取一个 pending 任务
+	// 在单条 UPDATE ... FROM 语句中完成选取和状态更新，避免原先 SELECT + UPDATE 的往返。
 	row := tx.QueryRowContext(ctx,
-		`SELECT id, type, payload, attempt_count, max_attempts
-		 FROM jobs
-		 WHERE status = 'pending'
-		 ORDER BY created_at ASC
-		 FOR UPDATE SKIP LOCKED
-		 LIMIT 1`,
+		`WITH candidate AS (
+			SELECT id
+			FROM jobs
+			WHERE status = 'pending'
+			ORDER BY created_at ASC
+			FOR UPDATE SKIP LOCKED
+			LIMIT 1
+		)
+		UPDATE jobs AS j
+		SET status = 'running', locked_by = $1, locked_at = now(),
+		    started_at = now(), attempt_count = j.attempt_count + 1, updated_at = now()
+		FROM candidate
+		WHERE j.id = candidate.id
+		RETURNING j.id, j.type, j.payload, j.attempt_count, j.max_attempts`,
+		workerID,
 	)
 
 	var j Job
 	var payloadBytes []byte
-	err = row.Scan(&j.ID, &j.Type, &payloadBytes, &j.AttemptCount, &j.MaxAttempts)
-	if err != nil {
+	if err = row.Scan(&j.ID, &j.Type, &payloadBytes, &j.AttemptCount, &j.MaxAttempts); err != nil {
 		if err == sql.ErrNoRows {
-			return nil, nil // 无待执行任务，defer 会 Rollback
+			return nil, nil
 		}
-		return nil, fmt.Errorf("查询待执行 job: %w", err)
+		return nil, fmt.Errorf("claim 待执行 job: %w", err)
 	}
-
-	// payload JSON 损坏时记录日志并返回错误，不标记 job 完成、不 panic。
-	// defer 无条件 Rollback 确保事务释放，行锁随之释放。
-	if err := json.Unmarshal(payloadBytes, &j.Payload); err != nil {
+	if err = json.Unmarshal(payloadBytes, &j.Payload); err != nil {
 		slog.Error("解析 job payload 失败", "job_id", j.ID, "error", err)
 		return nil, fmt.Errorf("解析 job payload: %w", err)
 	}
-
-	// 标记为 running
-	_, err = tx.ExecContext(ctx,
-		`UPDATE jobs
-		 SET status = 'running', locked_by = $1, locked_at = now(),
-		     started_at = now(), attempt_count = attempt_count + 1, updated_at = now()
-		 WHERE id = $2`,
-		workerID, j.ID,
-	)
-	if err != nil {
-		return nil, mapDBError(err, "标记 job 为 running")
-	}
-
 	if err = tx.Commit(); err != nil {
 		return nil, fmt.Errorf("提交 claim 事务: %w", err)
 	}
@@ -271,24 +268,19 @@ func (r *PGRepository) List(ctx context.Context, statusFilter string, limit, off
 		whereClause = " WHERE " + joinStrings(conditions, " AND ")
 	}
 
-	var total int
-	countQuery := "SELECT COUNT(*) FROM jobs" + whereClause
-	err := r.db.QueryRowContext(ctx, countQuery, args...).Scan(&total)
-	if err != nil {
-		return nil, mapDBError(err, "查询 job 总数")
-	}
-
 	listQuery := fmt.Sprintf(
 		`SELECT id, type, payload, status, COALESCE(locked_by::text, ''),
 			attempt_count, max_attempts, COALESCE(last_error, ''),
 			to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
 			to_char(updated_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'),
 			COALESCE(to_char(started_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
-			COALESCE(to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), '')
+			COALESCE(to_char(completed_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS"Z"'), ''),
+			COUNT(*) OVER ()
 		 FROM jobs%s ORDER BY created_at DESC LIMIT $%d OFFSET $%d`,
 		whereClause, argIdx, argIdx+1,
 	)
 	args = append(args, limit, offset)
+	var total int
 
 	rows, err := r.db.QueryContext(ctx, listQuery, args...)
 	if err != nil {
@@ -303,12 +295,17 @@ func (r *PGRepository) List(ctx context.Context, statusFilter string, limit, off
 	for rows.Next() {
 		var j Job
 		var payloadBytes []byte
+		var rowTotal int
 		if err := rows.Scan(
 			&j.ID, &j.Type, &payloadBytes, &j.Status, &j.LockedBy,
 			&j.AttemptCount, &j.MaxAttempts, &j.LastError,
 			&j.CreatedAt, &j.UpdatedAt, &j.StartedAt, &j.CompletedAt,
+			&rowTotal,
 		); err != nil {
 			return nil, fmt.Errorf("扫描 job 行: %w", err)
+		}
+		if len(jobs) == 0 {
+			total = rowTotal
 		}
 		if len(payloadBytes) > 0 {
 			j.Payload = make(map[string]interface{})
@@ -323,6 +320,13 @@ func (r *PGRepository) List(ctx context.Context, statusFilter string, limit, off
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历 job 结果集: %w", err)
+	}
+	// 仅当分页窗口为空时补做 COUNT，确保 offset 超出末页时仍保持 Total 契约。
+	if len(jobs) == 0 {
+		countQuery := "SELECT COUNT(*) FROM jobs" + whereClause
+		if err := r.db.QueryRowContext(ctx, countQuery, args[:len(args)-2]...).Scan(&total); err != nil {
+			return nil, mapDBError(err, "查询 job 总数")
+		}
 	}
 
 	return &ListResult{Jobs: jobs, Total: total}, nil

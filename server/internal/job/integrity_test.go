@@ -42,13 +42,13 @@ const jobAdvisoryLockKey int64 = 9527
 // 引入动机：F2 要求使用完整可控 es.Client fake，实际调用 RepairIssue，
 // 验证各问题类型的最小修复操作。此 fake 记录所有操作以便测试断言。
 type fakeESClient struct {
-	indices       map[string]bool
-	aliasIndex    string
-	docs          map[string]map[string]map[string]interface{} // index -> docID -> body
-	pingOK        bool
+	indices            map[string]bool
+	aliasIndex         string
+	docs               map[string]map[string]map[string]interface{} // index -> docID -> body
+	pingOK             bool
 	deleteByQueryCalls []deleteByQueryCall
 	bulkIndexCalls     []bulkIndexCall
-	searchCalls         []searchCall
+	searchCalls        []searchCall
 	// indexDims 记录各索引的 embedding 维度，供 GetIndexDimensions 返回。
 	// 引入动机：维度自愈测试需要 fake 表达"某索引 dims=1024/4096"，
 	// 未登记维度的索引返回 0，表示"无已知维度"（与真实 ES 无 embedding 字段一致）。
@@ -209,7 +209,7 @@ func (c *fakeESClient) DeleteByQuery(ctx context.Context, indexName string, quer
 		return c.deleteByQueryErr
 	}
 	if c.docs[indexName] != nil {
-		// 简化：按 document_id term 删除匹配文档
+		// 支持 document_id term 删除，以及重索引后清理尾部 chunk 的 bool(term + range) 查询。
 		if term, ok := query["term"].(map[string]interface{}); ok {
 			if docID, ok := term["document_id"].(string); ok {
 				for id := range c.docs[indexName] {
@@ -217,6 +217,38 @@ func (c *fakeESClient) DeleteByQuery(ctx context.Context, indexName string, quer
 						if did, ok := body["document_id"].(string); ok && did == docID {
 							delete(c.docs[indexName], id)
 						}
+					}
+				}
+				return nil
+			}
+		}
+		if boolQuery, ok := query["bool"].(map[string]interface{}); ok {
+			if must, ok := boolQuery["must"].([]interface{}); ok && len(must) == 2 {
+				var docID string
+				var minChunk int
+				for _, clause := range must {
+					m, _ := clause.(map[string]interface{})
+					if t, ok := m["term"].(map[string]interface{}); ok {
+						docID, _ = t["document_id"].(string)
+					}
+					if r, ok := m["range"].(map[string]interface{}); ok {
+						if ci, ok := r["chunk_index"].(map[string]interface{}); ok {
+							switch value := ci["gte"].(type) {
+							case int:
+								minChunk = value
+							case float64:
+								minChunk = int(value)
+							}
+						}
+					}
+				}
+				for id, body := range c.docs[indexName] {
+					if body == nil || body["document_id"] != docID {
+						continue
+					}
+					chunkIndex, _ := body["chunk_index"].(int)
+					if chunkIndex >= minChunk {
+						delete(c.docs[indexName], id)
 					}
 				}
 				return nil
@@ -387,7 +419,7 @@ func buildFakeAggregationResponse(aggs interface{}, matching []fakeDocEntry) *es
 								if v, ok := d[maxField]; ok {
 									var fv float64
 									switch n := v.(type) {
-								 case int:
+									case int:
 										fv = float64(n)
 									case float64:
 										fv = n
@@ -735,10 +767,10 @@ func TestRepairIssue_RevisionMismatch(t *testing.T) {
 	_ = fakeES.CreateIndex(ctx, "test_index", nil)
 
 	issue := IntegrityIssue{
-		Type:       "revision_mismatch",
-		DocumentID: docID,
+		Type:        "revision_mismatch",
+		DocumentID:  docID,
 		WorkspaceID: wsID,
-		Detail:     "ES revision 与 PG revision 不匹配",
+		Detail:      "ES revision 与 PG revision 不匹配",
 	}
 
 	err := RepairIssue(ctx, db, fakeES, "test_index", issue, nil, nil)
@@ -775,10 +807,10 @@ func TestRepairIssue_HashMismatch(t *testing.T) {
 	_ = fakeES.CreateIndex(ctx, "test_index", nil)
 
 	issue := IntegrityIssue{
-		Type:       "hash_mismatch",
-		DocumentID: docID,
+		Type:        "hash_mismatch",
+		DocumentID:  docID,
 		WorkspaceID: wsID,
-		Detail:     "ES content_hash 与 PG 不匹配",
+		Detail:      "ES content_hash 与 PG 不匹配",
 	}
 
 	err := RepairIssue(ctx, db, fakeES, "test_index", issue, nil, nil)
@@ -812,10 +844,10 @@ func TestRepairIssue_ChunkCountMismatch(t *testing.T) {
 	_ = fakeES.CreateIndex(ctx, "test_index", nil)
 
 	issue := IntegrityIssue{
-		Type:       "chunk_count_mismatch",
-		DocumentID: docID,
+		Type:        "chunk_count_mismatch",
+		DocumentID:  docID,
 		WorkspaceID: wsID,
-		Detail:     "ES chunk count 与 PG 期望不匹配",
+		Detail:      "ES chunk count 与 PG 期望不匹配",
 	}
 
 	err := RepairIssue(ctx, db, fakeES, "test_index", issue, nil, nil)
@@ -876,13 +908,13 @@ func TestCheckIntegrity_StaleDetection(t *testing.T) {
 			Body: map[string]interface{}{
 				"document_id":  docID,
 				"workspace_id": wsID,
-				"path":          "stale_test_doc",
-				"title":         "Stale Test",
-				"content":       "# Stale\n\nContent.\n",
-				"revision":      1,
-				"content_hash":  "old_hash",
-				"is_special":    false,
-				"status":        "active",
+				"path":         "stale_test_doc",
+				"title":        "Stale Test",
+				"content":      "# Stale\n\nContent.\n",
+				"revision":     1,
+				"content_hash": "old_hash",
+				"is_special":   false,
+				"status":       "active",
 			},
 		},
 	})
@@ -940,13 +972,13 @@ func TestCheckIntegrity_RevisionMismatch_HigherESRevision(t *testing.T) {
 			Body: map[string]interface{}{
 				"document_id":  docID,
 				"workspace_id": wsID,
-				"path":          "rev_high_es",
-				"title":         "Rev High ES",
-				"content":       "# Rev\n\nContent.\n",
-				"revision":      5,
-				"content_hash":  "some_hash",
-				"is_special":    false,
-				"status":        "active",
+				"path":         "rev_high_es",
+				"title":        "Rev High ES",
+				"content":      "# Rev\n\nContent.\n",
+				"revision":     5,
+				"content_hash": "some_hash",
+				"is_special":   false,
+				"status":       "active",
 			},
 		},
 	})
@@ -1068,12 +1100,12 @@ func TestHandleRebuildIndex_LexicalFailure_NoAliasSwitch(t *testing.T) {
 
 	fakeRepo := &fakeProfileRepo{
 		profile: &ProfileForJob{
-			ID:              "test-profile",
-			ESIndexName:     "test_fail_index",
-			ChunkTargetSize: 512,
-			ChunkOverlap:    64,
+			ID:                  "test-profile",
+			ESIndexName:         "test_fail_index",
+			ChunkTargetSize:     512,
+			ChunkOverlap:        64,
 			EmbeddingDimensions: 1024,
-			Analyzer:       "standard",
+			Analyzer:            "standard",
 		},
 	}
 
@@ -1120,20 +1152,20 @@ func TestHandleRebuildIndex_RepairFailure_NoAliasSwitch(t *testing.T) {
 	// 使用 fake ES client，BulkIndex 成功但 DeleteByQuery 在第二次调用时失败
 	// （模拟 repair 时 DeleteByQuery 失败）
 	failingES := &failingDeleteByQueryESClient{
-		fakeESClient:      newFakeESClient(),
-		failAfterNCalls:   2, // 前两次成功（rebuild 时的 delete + bulk），第三次失败（repair 时的 delete）
+		fakeESClient:           newFakeESClient(),
+		failAfterNCalls:        2, // 前两次成功（rebuild 时的 delete + bulk），第三次失败（repair 时的 delete）
 		deleteByQueryCallCount: 0,
 	}
 	_ = failingES.CreateIndex(ctx, "test_repair_fail", nil)
 
 	fakeRepo := &fakeProfileRepo{
 		profile: &ProfileForJob{
-			ID:              "test-profile",
-			ESIndexName:     "test_repair_fail",
-			ChunkTargetSize: 512,
-			ChunkOverlap:    64,
+			ID:                  "test-profile",
+			ESIndexName:         "test_repair_fail",
+			ChunkTargetSize:     512,
+			ChunkOverlap:        64,
 			EmbeddingDimensions: 1024,
-			Analyzer:       "standard",
+			Analyzer:            "standard",
 		},
 	}
 
@@ -1266,7 +1298,7 @@ func (c *failingBulkESClient) BulkIndex(ctx context.Context, indexName string, d
 // failingDeleteByQueryESClient 是 DeleteByQuery 在第 N 次调用后返回错误的 fake ES client。
 type failingDeleteByQueryESClient struct {
 	*fakeESClient
-	failAfterNCalls      int
+	failAfterNCalls        int
 	deleteByQueryCallCount int
 }
 

@@ -43,6 +43,7 @@ import (
 	"partitura/server/internal/search"
 	"partitura/server/internal/search/pipeline"
 	"partitura/server/internal/settings"
+	"partitura/server/internal/tuning"
 	"partitura/server/internal/workspace"
 
 	"github.com/google/uuid"
@@ -256,10 +257,11 @@ func runServer(ctx context.Context, runner *migration.Runner, cfg *config.Config
 
 	// Evaluation Repository（C2：Evaluation API 完整实现）
 	evalRepo := evaluation.NewPGRepository(database)
+	tuningRepo := tuning.NewPGRepository(database, profileRepo)
 	evalResultRepo := evaluation.NewPGResultRepository(database)
 
 	// 搜索 handler
-	searchHandler := search.NewHandler(pipe, profileRepo, metricsRepo)
+	searchHandler := search.NewHandler(pipe, profileRepo, metricsRepo).WithProfileResolver(tuningRepo.ResolveProfile)
 
 	// Admin handler
 	adminSearchHandler := admin.NewHandler(profileRepo, jobRepo, auditRepo, evalRepo, evalResultRepo)
@@ -309,6 +311,10 @@ func runServer(ctx context.Context, runner *migration.Runner, cfg *config.Config
 	settingsRepo := settings.NewPGRepository(database)
 	settingsHandler := admin.NewSettingsHandler(settingsRepo, auditRepo, cfg, healthCollector)
 	admin.RegisterSettingsRoutes(mux, settingsHandler, repo, authCfg)
+
+	// Search tuning：全局与 workspace-scoped query-time overrides。
+	tuningHandler := tuning.NewHandlerWithMetrics(tuningRepo, profileRepo, auditRepo, tuningRepo, pipe)
+	tuning.RegisterRoutes(mux, tuningHandler, wsRepo, repo, authCfg)
 
 	// 全局 middleware 包装：RequestID → Logging → mux
 	// 引入动机：design/06-IMPLEMENTATION.md Phase 1 要求 middleware (auth, request_id, slog)。

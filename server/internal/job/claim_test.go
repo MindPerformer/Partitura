@@ -22,6 +22,19 @@ import (
 	types "partitura/server/internal/search/types"
 )
 
+// TestClaim_InvalidWorkerID 验证 worker ID 契约在进入数据库事务前 fail-fast。
+// 保持 Claim 的 string 参数兼容现有调用方，同时拒绝无法写入 UUID 列的值。
+func TestClaim_InvalidWorkerID(t *testing.T) {
+	repo := NewPGRepository(nil)
+	claimed, err := repo.Claim(context.Background(), "test-worker")
+	if err == nil {
+		t.Fatal("非法 worker ID 应返回错误")
+	}
+	if claimed != nil {
+		t.Fatalf("非法 worker ID 不应返回 job: %+v", claimed)
+	}
+}
+
 // TestClaim_NonObjectPayload 验证 Claim 在 payload 为合法 JSONB 但非 JSON 对象时
 // 返回错误且事务已释放。
 //
