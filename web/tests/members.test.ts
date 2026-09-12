@@ -105,14 +105,28 @@ describe('members.vue — 添加成员候选选择', () => {
     await vi.advanceTimersByTimeAsync(300)
     await flushPromises()
 
-    // 点击候选项
+    // 点击候选项（真实浏览器：pointerdown 触发 reka select，附带 blur 关闭下拉）
     const items = Array.from(document.querySelectorAll('[role="option"], [data-slot="item"]'))
-    const opt = items.find(el => el.textContent?.includes('bob'))
+    const opt = items.find(el => el.textContent?.includes('bob')) as HTMLElement | undefined
     expect(opt, '应渲染候选 bob').toBeTruthy()
-    ;(opt as HTMLElement).dispatchEvent(new MouseEvent('click', { bubbles: true }))
+    opt!.dispatchEvent(new PointerEvent('pointerdown', { bubbles: true }))
+    opt!.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }))
+    opt!.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }))
+    opt!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     await flushPromises()
-    await vi.advanceTimersByTimeAsync(50)
+
+    // 模拟真实行为：点击候选后 input blur（reka 触发 onOpenChange(false)）
+    input!.dispatchEvent(new FocusEvent('blur', { bubbles: true }))
+    await vi.advanceTimersByTimeAsync(200)
     await flushPromises()
+
+    // 选中提示应出现（证明 selectedCandidate 未被清空）
+    const selText = document.querySelector('[data-slot="content"]')?.textContent ?? ''
+    const selLabels = labelsOf('workspace.selectedCandidate')
+    expect(
+      selLabels.some(l => selText.includes(l.split('{')[0]!.trim()) || selText.includes('bob')),
+      '应显示「已选择」提示（selectedCandidate 仍有效）'
+    ).toBe(true)
 
     // 提交表单
     const form = document.querySelector<HTMLFormElement>('[data-slot="content"] form')
