@@ -81,6 +81,42 @@ PostgreSQL 恢复后，Elasticsearch 索引可能不一致。需要触发索引�
 
 参见 `index-rebuild.md`。
 
+## PostgreSQL 大版本升级（17 → 18）
+
+`postgres:18` 镜像采用版本化数据目录布局：`PGDATA` 为 `/var/lib/postgresql/18/docker`，
+数据卷挂载在父目录 `/var/lib/postgresql`。这与 17 时代的 `/var/lib/postgresql/data` 布局不同，
+因此**不能只换镜像标签**——PG 主版本的数据文件格式互不兼容，必须经 pg_dump 逻辑备份迁移。
+
+升级步骤（逻辑备份 + 恢复路径）：
+
+```bash
+# 1. 在 PG 17 容器上导出全量备份（升级前执行）
+docker compose exec -T postgres pg_dump -U partitura partitura > pg17_backup_$(date +%Y%m%d_%H%M%S).sql
+
+# 2. 停止全部服务
+docker compose down
+
+# 3. 替换/清空旧数据卷（17 格式的数据文件 18 无法读取）
+docker volume rm partitura_pgdata
+
+# 4. 拉取并启动 PG 18（compose 中已配置 PGDATA=/var/lib/postgresql/18/docker）
+docker compose up -d postgres
+
+# 5. 等待 healthy 后恢复数据
+docker compose exec -T postgres psql -U partitura partitura < pg17_backup_YYYYMMDD_HHMMSS.sql
+
+# 6. 启动其余服务并验证
+docker compose up -d
+docker compose run --rm server -migrate-status
+curl http://localhost/readyz
+```
+
+回滚：保留 `pg17_backup_*.sql` 文件即可随时用相同步骤恢复到 17。
+
+> 说明：`pg_upgrade --link` 就地升级同样可行，但需要先把旧卷数据重排到
+> `17/docker` 子目录并手动执行 pg_upgrade，操作复杂度高于 dump/restore；
+> 对本项目的单机 Compose 部署，dump/restore 是推荐路径。
+
 ## 安全注意事项
 
 - 备份文件包含全部业务数据，需妥善保管

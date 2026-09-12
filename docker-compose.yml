@@ -18,15 +18,23 @@
 services:
   # === PostgreSQL — 业务真相源 ===
   postgres:
-    image: postgres:17-alpine
+    image: postgres:18-alpine
     restart: unless-stopped
     stop_grace_period: 30s
     environment:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      # PG 18 镜像改为版本化数据目录布局：PGDATA 必须显式指向
+      # <挂载根>/<PG_MAJOR>/docker，卷挂载在父目录 /var/lib/postgresql。
+      # 引入动机：官方镜像为 pg_upgrade --link 就地大版本升级设计此布局；
+      # 沿用旧的 /var/lib/postgresql/data 挂载会让 18 在容器匿名层初始化新集群，
+      # 导致原 named volume 中的 17 数据不可见（等效数据丢失）。
+      # 注意：从 PG 17 升级存量数据不能仅换镜像，须先 pg_dump 备份再恢复，
+      # 见 operations/backup-restore.md 的大版本升级一节。
+      PGDATA: /var/lib/postgresql/18/docker
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - pgdata:/var/lib/postgresql
     networks:
       - internal
     healthcheck:
@@ -39,8 +47,8 @@ services:
 
   # === Elasticsearch — 可重建搜索索引 ===
   elasticsearch:
-    # 固定安全可用的 8.x 版本
-    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    # 固定安全可用的 9.x 版本
+    image: docker.elastic.co/elasticsearch/elasticsearch:9.5.3
     restart: unless-stopped
     stop_grace_period: 30s
     environment:

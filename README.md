@@ -10,8 +10,8 @@ Partitura 是一个企业级 Project Knowledge Workspace，支持多用户、多
 |------|--------|------|
 | server | Go | REST API、Job Worker、Scheduler |
 | web | Nuxt 4 + Nuxt UI 4 | 前端 SSR |
-| postgres | PostgreSQL 17 | 业务真相源 |
-| elasticsearch | Elasticsearch 8.17 | 可重建搜索索引 |
+| postgres | PostgreSQL 18 | 业务真相源 |
+| elasticsearch | Elasticsearch 9.5 | 可重建搜索索引 |
 
 **核心原则**：PostgreSQL 是业务真相源。Elasticsearch 是可重建的搜索索引，数据丢失后可从 PostgreSQL 完整重建。
 

@@ -122,7 +122,7 @@ func findProjectMigrationsDir(t *testing.T) string {
 // 格式：postgres://user:password@host:port/dbname?sslmode=disable
 // 或：host=localhost port=5432 user=test password=test dbname=testdb sslmode=disable
 // 可用 Docker 启动临时 PostgreSQL：
-//   docker run --rm -d -p 5432:5432 -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=testdb --name pg-test postgres:16
+//   docker run --rm -d -p 5432:5432 -e POSTGRES_USER=test -e POSTGRES_PASSWORD=test -e POSTGRES_DB=testdb --name pg-test postgres:18
 
 // testDB 返回测试用数据库连接，如果未设置 TEST_DATABASE_URL 则跳过测试。
 // 使用跨进程 advisory lock + 完整 reset 隔离，不依赖测试执行顺序。
